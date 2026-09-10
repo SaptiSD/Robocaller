@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoboCall AI</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128222;</text></svg>">
+</head>
+<body>
+<div class="shell">
+
+  <nav class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">&#9742;</div>
+      <div>
+        <div class="brand-name">RoboCall AI</div>
+        <div class="brand-sub">Phase 1 &middot; read-only calls</div>
+      </div>
+    </div>
+
+    <button class="nav-item" data-view="dashboard"><span class="nav-icon">&#9673;</span> Dashboard</button>
+    <button class="nav-item" data-view="campaigns"><span class="nav-icon">&#9776;</span> Campaigns <span class="nav-count" id="nav-campaigns"></span></button>
+    <button class="nav-item" data-view="new"><span class="nav-icon">&#43;</span> New campaign</button>
+    <button class="nav-item" data-view="calls"><span class="nav-icon">&#9783;</span> Call log</button>
+    <button class="nav-item" data-view="dnc"><span class="nav-icon">&#8856;</span> Do not call <span class="nav-count" id="nav-dnc"></span></button>
+    <div class="nav-spacer"></div>
+    <button class="nav-item" data-view="settings"><span class="nav-icon">&#9881;</span> Settings</button>
+    <button class="nav-item" id="theme-toggle"><span class="nav-icon">&#9681;</span> Theme</button>
+  </nav>
+
+  <main class="main">
+
+    <!-- ================= DASHBOARD ================= -->
+    <section id="view-dashboard" class="view">
+      <div class="page-head">
+        <div>
+          <h1>Dashboard</h1>
+          <div class="sub">Outbound calls placed by this machine.</div>
+        </div>
+        <div class="spacer"></div>
+        <div class="btn-row">
+          <button id="btn-pause">Pause all calling</button>
+          <button class="primary" data-view-jump="new">New campaign</button>
+        </div>
+      </div>
+
+      <div id="setup-banner"></div>
+
+      <div class="tiles" id="tiles"></div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head">
+          <h2>Call outcomes</h2>
+          <div class="spacer"></div>
+          <span class="hint" id="outcome-total"></span>
+        </div>
+        <div id="outcome-chart"></div>
+      </div>
+
+      <div class="grid-2" style="margin-top:14px">
+        <div class="card">
+          <div class="card-head"><h2>Test call</h2></div>
+          <p class="hint" style="margin-bottom:12px">
+            Ring your own phone and hear exactly what a recipient hears.
+            On a Twilio trial the number must be verified in the console first.
+          </p>
+          <div class="field">
+            <label for="test-phone">Number to call</label>
+            <input type="text" id="test-phone" placeholder="+1 617 555 0142">
+          </div>
+          <div class="field">
+            <label for="test-message">Message <span class="hint" style="display:inline">(blank uses a stock test script)</span></label>
+            <textarea id="test-message" rows="3" placeholder="Hi, this is a test of the RoboCall dashboard."></textarea>
+          </div>
+          <div class="btn-row">
+            <button class="primary" id="btn-test-call">Call me now</button>
+            <span id="test-status" class="hint"></span>
+          </div>
+        </div>
+
+        <div>
+          <div class="card">
+            <div class="card-head"><h2>Engine</h2></div>
+            <div id="engine-status"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Next scheduled runs</h2></div>
+            <div id="upcoming"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Activity</h2></div>
+            <div class="feed" id="feed"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= CAMPAIGNS ================= -->
+    <section id="view-campaigns" class="view hidden">
+      <div class="page-head">
+        <div>
+          <h1>Campaigns</h1>
+          <div class="sub">Each campaign owns its own recipient list and schedule.</div>
+        </div>
+        <div class="spacer"></div>
+        <button class="primary" data-view-jump="new">New campaign</button>
+      </div>
+      <div id="campaign-list"></div>
+    </section>
+
+    <!-- ================= CAMPAIGN DETAIL ================= -->
+    <section id="view-detail" class="view hidden">
+      <div class="page-head">
+        <div>
+          <button class="link" data-view-jump="campaigns" style="padding-left:0">&larr; All campaigns</button>
+          <h1 id="detail-name">Campaign</h1>
+          <div class="sub" id="detail-sub"></div>
+        </div>
+      </div>
+      <div id="detail-body"></div>
+    </section>
+
+    <!-- ================= NEW CAMPAIGN ================= -->
+    <section id="view-new" class="view hidden">
+      <div class="page-head">
+        <div>
+          <h1>New campaign</h1>
+          <div class="sub">A furniture store announcing a Memorial Day sale, for example.</div>
+        </div>
+      </div>
+
+      <form id="campaign-form" autocomplete="off">
+        <div class="card">
+          <div class="card-head"><h2>1 &middot; What to say</h2></div>
+
+          <div class="field">
+            <label for="c-name">Campaign name</label>
+            <input type="text" id="c-name" required placeholder="Memorial Day sale announcement">
+          </div>
+
+          <div class="field">
+            <label for="c-brief">Brief <span class="hint" style="display:inline">&mdash; describe the call, Claude drafts the script</span></label>
+            <div class="btn-row" style="align-items:stretch">
+              <input type="text" id="c-brief" style="flex:1;min-width:220px"
+                     placeholder="Memorial Day sale, 40% off all sofas, Friday through Monday, at our Danvers showroom">
+              <button type="button" id="btn-draft">Draft with AI</button>
+            </div>
+            <div class="hint" id="draft-status"></div>
+          </div>
+
+          <div class="field">
+            <label for="c-message">Message the voice will read</label>
+            <textarea id="c-message" class="mono" rows="6" required
+              placeholder="Write for the ear. Short sentences. Spell out numbers and dates."></textarea>
+            <div class="hint" id="script-meter"></div>
+          </div>
+
+          <div class="field">
+            <label>What the recipient actually hears</label>
+            <div class="campaign-msg" id="script-preview">&mdash;</div>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="c-voice">Voice</label>
+              <select id="c-voice"></select>
+            </div>
+            <div class="field">
+              <label for="c-amd">If an answering machine picks up</label>
+              <select id="c-amd">
+                <option value="voicemail">Wait for the beep, leave the message</option>
+                <option value="off">Start talking immediately</option>
+                <option value="live_only">Hang up (needs webhook mode)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>2 &middot; Who to call</h2></div>
+          <div class="field">
+            <label for="c-contacts">Phone numbers <span class="hint" style="display:inline">&mdash; one per line, optionally <code>number, name</code></span></label>
+            <textarea id="c-contacts" class="mono" rows="6" placeholder="+1 617 555 0142, Dana Whitfield&#10;617-555-0199&#10;(415) 555 0100"></textarea>
+            <div class="hint" id="contacts-meter"></div>
+          </div>
+          <div class="field">
+            <label class="check">
+              <input type="checkbox" id="c-consent-have">
+              <span>
+                <b>These people gave prior express written consent</b> to receive automated
+                marketing calls.
+                <span class="hint">
+                  Required by the TCPA for pre-recorded marketing calls to mobiles &mdash;
+                  $500&ndash;$1,500 per call in statutory damages without it. Numbers without
+                  this flag are queued but never dialled.
+                </span>
+              </span>
+            </label>
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label class="check">
+              <input type="checkbox" id="c-require-consent" checked>
+              <span>Refuse to dial any number that isn't marked as consented
+                <span class="hint">Leave this on unless you are calling your own test numbers.</span>
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>3 &middot; When to call</h2></div>
+          <div class="field-row">
+            <div class="field">
+              <label for="c-frequency">Frequency</label>
+              <select id="c-frequency">
+                <option value="once">Once</option>
+                <option value="daily">Every day</option>
+                <option value="weekly">Every week</option>
+                <option value="hourly">Every hour (testing only)</option>
+              </select>
+            </div>
+            <div class="field" id="wrap-time">
+              <label for="c-time">Time of day</label>
+              <input type="time" id="c-time" value="10:00">
+            </div>
+            <div class="field hidden" id="wrap-weekday">
+              <label for="c-weekday">Day</label>
+              <select id="c-weekday">
+                <option value="0">Monday</option><option value="1">Tuesday</option>
+                <option value="2">Wednesday</option><option value="3">Thursday</option>
+                <option value="4">Friday</option><option value="5">Saturday</option>
+                <option value="6">Sunday</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="c-timezone">Schedule timezone</label>
+              <select id="c-timezone"></select>
+            </div>
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label class="check">
+              <input type="checkbox" id="c-start-now">
+              <span>Start calling as soon as I save
+                <span class="hint">Otherwise it waits for the first scheduled slot.</span></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="btn-row" style="margin-top:16px">
+          <button type="submit" class="primary">Create campaign</button>
+          <button type="button" data-view-jump="campaigns">Cancel</button>
+          <span id="form-status" class="hint"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- ================= CALL LOG ================= -->
+    <section id="view-calls" class="view hidden">
+      <div class="page-head">
+        <div>
+          <h1>Call log</h1>
+          <div class="sub">Every attempt, with the Twilio call SID and outcome.</div>
+        </div>
+        <div class="spacer"></div>
+        <button id="btn-refresh-calls">Refresh</button>
+      </div>
+      <div class="card"><div class="table-wrap" id="calls-table"></div></div>
+    </section>
+
+    <!-- ================= DO NOT CALL ================= -->
+    <section id="view-dnc" class="view hidden">
+      <div class="page-head">
+        <div>
+          <h1>Do not call</h1>
+          <div class="sub">Checked before every dial, across all campaigns. Opt-outs land here automatically.</div>
+        </div>
+      </div>
+      <div class="banner warn">
+        <span>&#9888;</span>
+        <span>This list is <b>yours only</b>. It is not the National Do Not Call Registry &mdash;
+          scrubbing against that is a separate subscription (telemarketing.donotcall.gov) and is
+          legally required before calling anyone who did not opt in.</span>
+      </div>
+      <div class="card">
+        <div class="field">
+          <label for="dnc-input">Add numbers</label>
+          <textarea id="dnc-input" class="mono" rows="3" placeholder="One per line"></textarea>
+        </div>
+        <button class="primary" id="btn-add-dnc">Add to list</button>
+      </div>
+      <div class="card"><div class="table-wrap" id="dnc-table"></div></div>
+    </section>
+
+    <!-- ================= SETTINGS ================= -->
+    <section id="view-settings" class="view hidden">
+      <div class="page-head">
+        <div>
+          <h1>Settings</h1>
+          <div class="sub">Stored locally in SQLite. Nothing is sent anywhere but Twilio and Anthropic.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Twilio</h2></div>
+        <p class="hint" style="margin-bottom:14px">
+          Sign up at <a href="https://twilio.com/try-twilio" target="_blank" rel="noopener">twilio.com/try-twilio</a>,
+          buy a voice-capable number (about $1.15/month), and paste the credentials from the console here.
+        </p>
+        <div class="field-row">
+          <div class="field">
+            <label for="s-sid">Account SID</label>
+            <input type="text" id="s-sid" placeholder="AC...">
+          </div>
+          <div class="field">
+            <label for="s-token">Auth token</label>
+            <input type="password" id="s-token" placeholder="leave blank to keep the saved one">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="s-from">Call from this number</label>
+            <input type="text" id="s-from" placeholder="+1 978 555 0130">
+            <div class="hint" id="from-options"></div>
+          </div>
+          <div class="field">
+            <label for="s-test">My test number</label>
+            <input type="text" id="s-test" placeholder="your own mobile">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="btn-verify">Test connection</button>
+          <span id="verify-status" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Caller identity</h2></div>
+        <p class="hint" style="margin-bottom:14px">
+          Prepended and appended to every script automatically. A pre-recorded marketing call
+          must identify who is calling and offer a way out.
+        </p>
+        <div class="field-row">
+          <div class="field">
+            <label for="s-business">Business name</label>
+            <input type="text" id="s-business" placeholder="Hartwell Furniture">
+          </div>
+          <div class="field">
+            <label for="s-callback">Opt-out callback number</label>
+            <input type="text" id="s-callback" placeholder="+1 617 555 0142">
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Calling rules</h2></div>
+        <div class="field-row">
+          <div class="field">
+            <label for="s-window-start">Don't call before</label>
+            <input type="time" id="s-window-start">
+            <div class="hint">Local time where the recipient lives, from their area code.</div>
+          </div>
+          <div class="field">
+            <label for="s-window-end">Don't call after</label>
+            <input type="time" id="s-window-end">
+            <div class="hint">Federal limit is 8am&ndash;9pm; several states are stricter.</div>
+          </div>
+          <div class="field">
+            <label for="s-cpm">Calls per minute</label>
+            <input type="number" id="s-cpm" min="1" max="120">
+            <div class="hint">Pacing. Blasting a list gets the number flagged as spam.</div>
+          </div>
+          <div class="field">
+            <label for="s-ring">Ring for (seconds)</label>
+            <input type="number" id="s-ring" min="10" max="60">
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>AI script writer</h2></div>
+        <div class="field" style="margin-bottom:0">
+          <label for="s-anthropic">Anthropic API key <span class="hint" style="display:inline">&mdash; optional</span></label>
+          <input type="password" id="s-anthropic" placeholder="sk-ant-... (leave blank to keep the saved one)">
+          <div class="hint">Powers the "Draft with AI" button. Everything else works without it.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Delivery mode</h2></div>
+        <div class="field">
+          <label for="s-base-url">Public base URL <span class="hint" style="display:inline">&mdash; optional</span></label>
+          <input type="text" id="s-base-url" placeholder="https://your-tunnel.ngrok-free.app">
+          <div class="hint">
+            Blank = <b>direct mode</b>: the script travels with the call and nothing needs to be
+            reachable from the internet. Set it (e.g. an ngrok tunnel) for <b>webhook mode</b>,
+            which adds press-9-to-opt-out, hanging up on voicemail, and live status callbacks.
+          </div>
+        </div>
+        <div id="mode-status"></div>
+      </div>
+
+      <div class="btn-row" style="margin-top:16px">
+        <button class="primary" id="btn-save-settings">Save settings</button>
+        <span id="settings-status" class="hint"></span>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="card-head"><h3>Where data lives</h3></div>
+        <div class="hint" id="db-path"></div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="tooltip"></div>
+<div id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
