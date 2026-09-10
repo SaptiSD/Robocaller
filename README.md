@@ -21,12 +21,20 @@ Open <http://localhost:8000>. Everything is configured from the Settings page.
 Verify the whole engine without touching Twilio:
 
 ```bash
-python smoke_test.py
+python smoke_test.py && python pressure_test.py
 ```
 
-74 checks against a fake Twilio — phone parsing, timezone resolution, calling
-windows, schedule arithmetic across a DST change, consent and do-not-call
-screening, pacing, and the HTTP API. No credentials, no real calls.
+**203 checks against a fake Twilio.** No credentials, no real calls.
+
+`smoke_test.py` (74) walks the happy path: phone parsing, timezone resolution,
+calling windows, schedule arithmetic across a DST change, consent and
+do-not-call screening, pacing, and the HTTP API.
+
+`pressure_test.py` (129) tries to break it: eight threads racing the same queue,
+every Twilio error a first-run account actually hits (20003, 21210, 21219,
+21606, 21217, 20429), forged webhook signatures, a provider that throws mid-dial,
+schema drift from an older database, malformed phone numbers and times, TwiML
+injection, and the API's rejection paths.
 
 ---
 
@@ -183,6 +191,31 @@ hear from you. Pointing it at a purchased list is how companies get sued.
 
 ---
 
+## Deploying it
+
+**This app is a FastAPI/uvicorn server, not a Streamlit app.** Streamlit
+Community Cloud only knows how to run `streamlit run <file>`, so it cannot host
+this — the only thing it could start is the retired prototype in
+`_legacy_streamlit/`. Use a host that runs a long-lived Python process: Render,
+Railway and Fly.io all do, and all have a free tier.
+
+Two things must be settled before this is on a public URL:
+
+1. **There is no authentication.** Every route is open. Anyone who finds the URL
+   can queue calls against your Twilio balance and read your contact lists. On
+   `localhost` that is fine; on the internet it is not. This needs to be added
+   before the first public deploy.
+2. **SQLite on an ephemeral filesystem is lost on every redeploy.** Free tiers on
+   Render and Fly.io reset the disk when the container restarts. Either attach a
+   persistent volume and point `ROBOCALL_DB` at it, or move to Postgres.
+
+The upside of deploying is real, though: a public HTTPS URL is exactly what
+**webhook mode** needs. Set `PUBLIC_BASE_URL` to the deployed origin and the
+system gains press-9-to-opt-out, hanging up on voicemail, and live status
+callbacks — the three things direct mode cannot do.
+
+---
+
 ## Layout
 
 | File | Role |
@@ -195,7 +228,8 @@ hear from you. Pointing it at a purchased list is how companies get sued.
 | `db.py` | SQLite persistence |
 | `config.py` | Settings resolution (database over environment) |
 | `web/` | The dashboard — plain HTML/CSS/JS, no build step |
-| `smoke_test.py` | 74 checks against a fake Twilio |
+| `smoke_test.py` | 74 happy-path checks against a fake Twilio |
+| `pressure_test.py` | 129 adversarial checks - concurrency, Twilio errors, forged webhooks |
 | `_legacy_streamlit/` | The previous Streamlit prototype, kept for reference |
 
 **Where data lives:** `%LOCALAPPDATA%\RoboCallAI\robocall.db`, deliberately

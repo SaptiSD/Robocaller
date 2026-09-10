@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import compliance
 import config
 import db
+from telephony import CallResult
 
 log = logging.getLogger("robocall.dispatcher")
 
@@ -52,6 +53,27 @@ def _zone(name: str) -> ZoneInfo:
         return ZoneInfo("America/New_York")
 
 
+def parse_hhmm(text: object, fallback: tuple[int, int] = (10, 0)) -> tuple[int, int]:
+    """Read a "HH:MM" string, falling back rather than raising.
+
+    The range check matters as much as the parse: "99:99" splits and converts to
+    ints perfectly happily, and only blows up later inside `datetime.replace`,
+    where it would take down the dispatcher tick on every pass.
+    """
+    try:
+        hh, mm = str(text or "").split(":")
+        hour, minute = int(hh), int(mm)
+    except (ValueError, AttributeError):
+        return fallback
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return hour, minute
+    return fallback
+
+
+def valid_hhmm(text: object) -> bool:
+    return parse_hhmm(text, (-1, -1)) != (-1, -1)
+
+
 def compute_next_run(campaign: dict, after: datetime) -> datetime | None:
     """The next moment this campaign should fire, strictly after `after` (UTC).
 
@@ -66,12 +88,7 @@ def compute_next_run(campaign: dict, after: datetime) -> datetime | None:
 
     tz = _zone(campaign.get("timezone"))
     local = after.astimezone(tz)
-    try:
-        hh, mm = str(campaign.get("call_time") or "10:00").split(":")
-        hour, minute = int(hh), int(mm)
-    except ValueError:
-        hour, minute = 10, 0
-
+    hour, minute = parse_hhmm(campaign.get("call_time"))
     candidate = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     if frequency == "daily":
@@ -163,7 +180,7 @@ def enqueue_single(phone: str, script: str = "", voice: str = "") -> int:
     It has no campaign, so the script and voice ride on the task row itself.
     """
     now = db.to_utc(db.utcnow())
-    return db.execute(
+    return db.insert(
         "INSERT INTO call_tasks (campaign_id, contact_id, phone, run_key, token, "
         "script_override, voice_override, state, status, scheduled_for, created_at, "
         "updated_at) VALUES (NULL, NULL, ?, 'manual', ?, ?, ?, 'pending', '', ?, ?, ?)",
@@ -296,14 +313,21 @@ def dispatch_pending(
         if not phone.supports(amd):
             amd = "voicemail"
 
-        result = phone.place_call(
-            to_number=task["phone"],
-            script=script,
-            voice=task["voice_override"] or task["voice"] or "",
-            amd=amd,
-            token=task["token"],
-            ring_seconds=ring_seconds,
-        )
+        try:
+            result = phone.place_call(
+                to_number=task["phone"],
+                script=script,
+                voice=task["voice_override"] or task["voice"] or "",
+                amd=amd,
+                token=task["token"],
+                ring_seconds=ring_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The task is already claimed. Letting this escape would abandon it in
+            # 'dialing' forever and abort every other call in the batch, so one
+            # unreachable provider is recorded as one failed call.
+            log.exception("placing a call to %s raised", task["phone"])
+            result = CallResult(False, error=f"{type(exc).__name__}: {exc}")
 
         if result.ok:
             db.execute(

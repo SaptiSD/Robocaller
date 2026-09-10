@@ -251,10 +251,14 @@ def create_campaign(body: CampaignIn) -> dict:
         raise HTTPException(400, " ".join(problems))
     if body.timezone not in dispatcher.KNOWN_TIMEZONES:
         raise HTTPException(400, f"Unknown timezone '{body.timezone}'.")
+    if not dispatcher.valid_hhmm(body.call_time):
+        raise HTTPException(400, f"'{body.call_time}' is not a valid time of day (HH:MM).")
+    if not 0 <= body.weekday <= 6:
+        raise HTTPException(400, "Weekday must be 0 (Monday) through 6 (Sunday).")
 
     now = db.utcnow()
     payload = body.model_dump()
-    campaign_id = db.execute(
+    campaign_id = db.insert(
         "INSERT INTO campaigns (name, message, voice, frequency, call_time, weekday, "
         "timezone, state, amd, require_consent, created_at, next_run_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
@@ -290,6 +294,20 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
         fields["require_consent"] = 1 if fields["require_consent"] else 0
     if fields.get("state") not in (None, *db.CAMPAIGN_STATES):
         raise HTTPException(400, f"State must be one of {db.CAMPAIGN_STATES}.")
+    if "frequency" in fields and fields["frequency"] not in db.FREQUENCIES:
+        raise HTTPException(400, f"Frequency must be one of {db.FREQUENCIES}.")
+    if "amd" in fields and fields["amd"] not in telephony.AMD_MODES:
+        raise HTTPException(400, f"Answering-machine mode must be one of {telephony.AMD_MODES}.")
+    if "timezone" in fields and fields["timezone"] not in dispatcher.KNOWN_TIMEZONES:
+        raise HTTPException(400, f"Unknown timezone '{fields['timezone']}'.")
+    if "call_time" in fields and not dispatcher.valid_hhmm(fields["call_time"]):
+        raise HTTPException(400, f"'{fields['call_time']}' is not a valid time of day (HH:MM).")
+    if "weekday" in fields and not 0 <= fields["weekday"] <= 6:
+        raise HTTPException(400, "Weekday must be 0 (Monday) through 6 (Sunday).")
+    if "message" in fields:
+        problems = compliance.validate_script(fields["message"])
+        if problems:
+            raise HTTPException(400, " ".join(problems))
 
     sets = ", ".join(f"{k} = ?" for k in fields)
     db.execute(f"UPDATE campaigns SET {sets} WHERE id = ?", (*fields.values(), campaign_id))
@@ -555,8 +573,10 @@ def _validate(request: Request, form: dict) -> None:
 
 
 def _task_for(token: str) -> dict:
+    # `amd` is needed by the voice webhook to decide whether to hang up on a
+    # machine; a test call has no campaign, so every joined column can be NULL.
     task = db.query_one(
-        "SELECT t.*, c.message, c.voice FROM call_tasks t "
+        "SELECT t.*, c.message, c.voice, c.amd FROM call_tasks t "
         "LEFT JOIN campaigns c ON c.id = t.campaign_id WHERE t.token = ?",
         (token,),
     )
@@ -573,7 +593,7 @@ async def twiml_for_call(token: str, request: Request) -> Response:
 
     # 'Live answers only' - drop the call if a machine picked up.
     answered_by = str(form.get("AnsweredBy", ""))
-    if task["amd"] == "live_only" and answered_by.startswith("machine"):
+    if task.get("amd") == "live_only" and answered_by.startswith("machine"):
         db.execute(
             "UPDATE call_tasks SET answered_by = ?, status = 'machine-skipped', "
             "updated_at = ? WHERE id = ?",
@@ -582,7 +602,7 @@ async def twiml_for_call(token: str, request: Request) -> Response:
         return Response(telephony.build_twiml("", hangup_first=True), media_type="text/xml")
 
     script = compliance.build_script(
-        task["message"] or "",
+        task.get("script_override") or task.get("message") or "",
         business_name=config.get("business_name"),
         callback_number=config.get("callback_number"),
     )
@@ -590,7 +610,8 @@ async def twiml_for_call(token: str, request: Request) -> Response:
     script += " To be removed from this list, press 9 now."
     xml = telephony.build_twiml(
         script,
-        voice=task["voice"] or telephony.DEFAULT_VOICE,
+        voice=task.get("voice_override") or task.get("voice")
+              or telephony.DEFAULT_VOICE,
         optout_url=f"{base}/twilio/optout/{token}" if base else "",
     )
     return Response(xml, media_type="text/xml")

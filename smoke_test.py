@@ -205,7 +205,7 @@ def make_campaign(**overrides) -> int:
         "require_consent": 1,
         **overrides,
     }
-    return db.execute(
+    return db.insert(
         "INSERT INTO campaigns (name, message, voice, frequency, call_time, weekday, "
         "timezone, state, amd, require_consent, created_at, next_run_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
@@ -216,7 +216,7 @@ def make_campaign(**overrides) -> int:
 
 
 def add_contact(campaign_id: int, phone: str, consent: int = 1) -> None:
-    db.execute(
+    db.insert(
         "INSERT INTO contacts (campaign_id, phone, name, consent, created_at) "
         "VALUES (?, ?, '', ?, ?)",
         (campaign_id, compliance.normalize(phone), consent, db.now_str()),

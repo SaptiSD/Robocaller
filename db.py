@@ -87,10 +87,6 @@ CREATE TABLE IF NOT EXISTS call_tasks (
     updated_at    TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_state ON call_tasks (state, scheduled_for);
-CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON call_tasks (campaign_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_tasks_token ON call_tasks (token);
-
 CREATE TABLE IF NOT EXISTS suppression (
     phone      TEXT PRIMARY KEY,
     reason     TEXT NOT NULL DEFAULT '',
@@ -103,6 +99,14 @@ CREATE TABLE IF NOT EXISTS events (
     level   TEXT NOT NULL DEFAULT 'info',
     message TEXT NOT NULL
 );
+"""
+
+# Applied after the column migration: an index naming a column that an older
+# database is missing would otherwise fail before that column can be added.
+_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_tasks_state ON call_tasks (state, scheduled_for);
+CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON call_tasks (campaign_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_token ON call_tasks (token);
 """
 
 
@@ -232,6 +236,7 @@ def init() -> tuple[Path | None, list[str]]:
         conn = connect()
         conn.executescript(_SCHEMA)
         added = _add_missing_columns(conn)
+        conn.executescript(_INDEXES)
         conn.commit()
     return archived, added
 
@@ -273,11 +278,28 @@ def query_one(sql: str, params: Iterable[Any] = ()) -> dict | None:
 
 
 def execute(sql: str, params: Iterable[Any] = ()) -> int:
+    """Run a statement. Returns the number of rows it changed.
+
+    Deliberately NOT `lastrowid or rowcount`: sqlite3 leaves `lastrowid` set from
+    the previous INSERT on the connection, so an UPDATE that matched nothing
+    would report a change anyway. Callers that branch on "did this row change?"
+    - the dispatcher's claim, above all - would then be wrong in whichever
+    direction the stale value happened to point. Use `insert()` for new row ids.
+    """
     with _lock:
         conn = connect()
         cur = conn.execute(sql, tuple(params))
         conn.commit()
-        return cur.lastrowid or cur.rowcount
+        return cur.rowcount
+
+
+def insert(sql: str, params: Iterable[Any] = ()) -> int:
+    """Run an INSERT and return the new row's id."""
+    with _lock:
+        conn = connect()
+        cur = conn.execute(sql, tuple(params))
+        conn.commit()
+        return int(cur.lastrowid or 0)
 
 
 def executemany(sql: str, seq: Iterable[Iterable[Any]]) -> None:
@@ -297,7 +319,7 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str) -> None:
-    execute(
+    insert(
         "INSERT INTO settings (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
@@ -311,7 +333,7 @@ def all_settings() -> dict[str, str]:
 # --- events -----------------------------------------------------------------
 
 def log_event(message: str, level: str = "info") -> None:
-    execute(
+    insert(
         "INSERT INTO events (ts, level, message) VALUES (?, ?, ?)",
         (now_str(), level, message[:500]),
     )
@@ -328,7 +350,7 @@ def recent_events(limit: int = 50) -> list[dict]:
 # --- suppression ------------------------------------------------------------
 
 def suppress(phone: str, reason: str = "manual") -> None:
-    execute(
+    insert(
         "INSERT INTO suppression (phone, reason, created_at) VALUES (?, ?, ?) "
         "ON CONFLICT(phone) DO UPDATE SET reason = excluded.reason",
         (phone, reason, now_str()),
