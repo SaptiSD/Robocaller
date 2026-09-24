@@ -1,4 +1,4 @@
-"""End-to-end test against a fake Twilio. No credentials, no real calls.
+"""End-to-end test against a fake Telnyx. No credentials, no real calls.
 
     python smoke_test.py
 
@@ -17,6 +17,20 @@ from pathlib import Path
 # Point at a scratch database BEFORE importing anything that opens one.
 _tmp = Path(tempfile.mkdtemp(prefix="robocall-test-"))
 os.environ["ROBOCALL_DB"] = str(_tmp / "test.db")
+
+# Tests must never see the real .env. Without this, a fully configured Telnyx
+# account turns `python smoke_test.py` into a live, billed call to whatever
+# TEST_DESTINATION_NUMBER happens to be - which is the developer's own mobile.
+# python-dotenv does not overwrite variables that are already set, so blanking
+# them here makes config.py's load_dotenv() a no-op for anything that costs
+# money or reaches the network.
+for _leak in (
+    "TELNYX_API_KEY", "TELNYX_TEXML_APP_ID", "TELNYX_FROM_NUMBER",
+    "TELNYX_PUBLIC_KEY", "TEST_DESTINATION_NUMBER", "PUBLIC_BASE_URL",
+    "ANTHROPIC_API_KEY", "BUSINESS_NAME", "CALLBACK_NUMBER",
+):
+    os.environ[_leak] = ""
+
 
 import compliance  # noqa: E402
 import config  # noqa: E402
@@ -64,7 +78,7 @@ class FakeTelephony:
         self.placed.append(
             {"to": to_number, "script": script, "voice": voice, "amd": amd, "token": token}
         )
-        return telephony.CallResult(True, sid=f"CA{len(self.placed):032d}")
+        return telephony.CallResult(True, sid=f"v3:{len(self.placed):032d}")
 
     def fetch_call(self, sid):
         return {"status": "completed", "answered_by": "human", "duration": 17}, ""
@@ -145,12 +159,15 @@ def test_scripts() -> None:
     check("empty scripts are rejected", compliance.validate_script("") != [])
     check("overlong scripts are rejected", compliance.validate_script("word " * 500) != [])
 
-    xml = telephony.build_twiml("Sale & clearance <today>", voice="Polly.Joanna-Neural")
-    check("TwiML escapes XML", "&amp;" in xml and "&lt;today&gt;" in xml)
-    check("TwiML pauses before speaking", '<Pause length="1"/>' in xml)
+    xml = telephony.build_texml("Sale & clearance <today>", voice="Polly.Joanna-Neural")
+    check("TeXML escapes XML", "&amp;" in xml and "&lt;today&gt;" in xml)
+    check("TeXML pauses before speaking", '<Pause length="1"/>' in xml)
     check("unknown voices fall back", 'voice="Polly.Joanna-Neural"' in
-          telephony.build_twiml("hi", voice="Polly.Nonexistent"))
-    gathered = telephony.build_twiml("hi", optout_url="https://x.test/optout/abc")
+          telephony.build_texml("hi", voice="Polly.Nonexistent"))
+    check("every offered voice is one Telnyx can actually render",
+          all(v.startswith(("Polly.", "Telnyx.")) for v in telephony.VOICE_IDS),
+          str(sorted(telephony.VOICE_IDS)))
+    gathered = telephony.build_texml("hi", optout_url="https://x.test/optout/abc")
     check("opt-out wraps the message in a Gather", "<Gather" in gathered)
 
 
@@ -254,7 +271,7 @@ def test_queue() -> None:
     check("answering-machine mode is passed through", fake.placed[0]["amd"] == "voicemail")
 
     task = db.query_one("SELECT * FROM call_tasks WHERE state = 'dialing'")
-    check("a Twilio SID is recorded", bool(task and task["sid"].startswith("CA")))
+    check("a Telnyx SID is recorded", bool(task and task["sid"].startswith("v3:")))
 
     dispatcher.sync_open_calls(now=midday)
     task = db.query_one("SELECT * FROM call_tasks WHERE id = ?", (task["id"],))
@@ -384,7 +401,7 @@ def test_api() -> None:
 
         res = client.get("/api/settings")
         check("secrets are never sent to the browser",
-              res.json()["settings"].get("twilio_auth_token") == "")
+              res.json()["settings"].get("telnyx_api_key") == "")
 
         res = client.delete(f"/api/campaigns/{campaign_id}")
         check("a campaign can be deleted", res.status_code == 200)

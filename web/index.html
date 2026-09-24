@@ -25,6 +25,7 @@
     <button class="nav-item" data-view="calls"><span class="nav-icon">&#9783;</span> Call log</button>
     <button class="nav-item" data-view="dnc"><span class="nav-icon">&#8856;</span> Do not call <span class="nav-count" id="nav-dnc"></span></button>
     <div class="nav-spacer"></div>
+    <button class="nav-item" data-view="docs"><span class="nav-icon">&#9636;</span> Documents <span class="nav-count" id="nav-docs"></span></button>
     <button class="nav-item" data-view="settings"><span class="nav-icon">&#9881;</span> Settings</button>
     <button class="nav-item" id="theme-toggle"><span class="nav-icon">&#9681;</span> Theme</button>
   </nav>
@@ -63,7 +64,7 @@
           <div class="card-head"><h2>Test call</h2></div>
           <p class="hint" style="margin-bottom:12px">
             Ring your own phone and hear exactly what a recipient hears.
-            On a Twilio trial the number must be verified in the console first.
+Telnyx bills each call against your account balance.
           </p>
           <div class="field">
             <label for="test-phone">Number to call</label>
@@ -182,7 +183,12 @@
           <div class="field">
             <label for="c-contacts">Phone numbers <span class="hint" style="display:inline">&mdash; one per line, optionally <code>number, name</code></span></label>
             <textarea id="c-contacts" class="mono" rows="6" placeholder="+1 617 555 0142, Dana Whitfield&#10;617-555-0199&#10;(415) 555 0100"></textarea>
-            <div class="hint" id="contacts-meter"></div>
+            <div class="btn-row" style="margin-top:8px">
+              <button type="button" id="btn-import-csv">Import a CSV file</button>
+              <button type="button" id="btn-clear-contacts" class="link">Clear</button>
+              <span class="hint" id="contacts-meter"></span>
+            </div>
+            <input type="file" id="c-contacts-file" accept=".csv,.txt,text/csv,text/plain" multiple hidden>
           </div>
           <div class="field">
             <label class="check">
@@ -260,7 +266,7 @@
       <div class="page-head">
         <div>
           <h1>Call log</h1>
-          <div class="sub">Every attempt, with the Twilio call SID and outcome.</div>
+          <div class="sub">Every attempt, with the Telnyx call SID and outcome.</div>
         </div>
         <div class="spacer"></div>
         <button id="btn-refresh-calls">Refresh</button>
@@ -292,29 +298,56 @@
       <div class="card"><div class="table-wrap" id="dnc-table"></div></div>
     </section>
 
+    <!-- ================= DOCUMENTS ================= -->
+    <section id="view-docs" class="view hidden">
+      <div class="page-head">
+        <div>
+          <h1>Documents</h1>
+          <div class="sub">The PDFs in the project's <span class="mono">docs</span> folder. Click one to read it here.</div>
+        </div>
+        <div class="spacer"></div>
+        <button id="btn-refresh-docs">Refresh</button>
+      </div>
+      <div class="card"><div class="table-wrap" id="docs-table"></div></div>
+      <div class="card hidden" id="doc-viewer">
+        <div class="page-head">
+          <div>
+            <h2 id="doc-title" style="margin:0"></h2>
+            <div class="sub" id="doc-sub"></div>
+          </div>
+          <div class="spacer"></div>
+          <a id="doc-newtab" class="button" target="_blank" rel="noopener">Open in a new tab</a>
+          <button id="btn-close-doc">Close</button>
+        </div>
+        <iframe id="doc-frame" class="doc-frame" title="Document preview"></iframe>
+      </div>
+    </section>
+
     <!-- ================= SETTINGS ================= -->
     <section id="view-settings" class="view hidden">
       <div class="page-head">
         <div>
           <h1>Settings</h1>
-          <div class="sub">Stored locally in SQLite. Nothing is sent anywhere but Twilio and Anthropic.</div>
+          <div class="sub">Stored locally in SQLite. Nothing is sent anywhere but Telnyx and Anthropic.</div>
         </div>
       </div>
 
       <div class="card">
-        <div class="card-head"><h2>Twilio</h2></div>
+        <div class="card-head"><h2>Telnyx</h2></div>
         <p class="hint" style="margin-bottom:14px">
-          Sign up at <a href="https://twilio.com/try-twilio" target="_blank" rel="noopener">twilio.com/try-twilio</a>,
-          buy a voice-capable number (about $1.15/month), and paste the credentials from the console here.
+          In the <a href="https://portal.telnyx.com" target="_blank" rel="noopener">Telnyx portal</a>:
+          create an API key under <b>API Keys</b>, create a <b>TeXML Application</b> under
+          Voice, and buy a voice-capable number (about $1/month plus $1 up front).
+          The number must be assigned to that same application.
         </p>
         <div class="field-row">
           <div class="field">
-            <label for="s-sid">Account SID</label>
-            <input type="text" id="s-sid" placeholder="AC...">
+            <label for="s-api-key">API key</label>
+            <input type="password" id="s-api-key" placeholder="leave blank to keep the saved one">
           </div>
           <div class="field">
-            <label for="s-token">Auth token</label>
-            <input type="password" id="s-token" placeholder="leave blank to keep the saved one">
+            <label for="s-app-id">TeXML application ID</label>
+            <input type="text" id="s-app-id" placeholder="2345678901234567890">
           </div>
         </div>
         <div class="field-row">

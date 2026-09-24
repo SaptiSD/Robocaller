@@ -20,9 +20,10 @@ log = logging.getLogger("robocall.config")
 # key -> (env var, default). Anything marked secret is masked when read back out
 # over the API.
 DEFAULTS: dict[str, tuple[str, str]] = {
-    "twilio_account_sid": ("TWILIO_ACCOUNT_SID", ""),
-    "twilio_auth_token": ("TWILIO_AUTH_TOKEN", ""),
-    "twilio_from_number": ("TWILIO_FROM_NUMBER", ""),
+    "telnyx_api_key": ("TELNYX_API_KEY", ""),
+    "telnyx_app_id": ("TELNYX_TEXML_APP_ID", ""),
+    "telnyx_from_number": ("TELNYX_FROM_NUMBER", ""),
+    "telnyx_public_key": ("TELNYX_PUBLIC_KEY", ""),
     "public_base_url": ("PUBLIC_BASE_URL", ""),
     "anthropic_api_key": ("ANTHROPIC_API_KEY", ""),
     "test_number": ("TEST_DESTINATION_NUMBER", ""),
@@ -35,7 +36,7 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "dispatch_paused": ("", "0"),
 }
 
-SECRET_KEYS = {"twilio_auth_token", "anthropic_api_key"}
+SECRET_KEYS = {"telnyx_api_key", "anthropic_api_key"}
 
 
 def get(key: str) -> str:
@@ -71,8 +72,8 @@ def public_view() -> dict[str, object]:
             out[f"{key}_set"] = bool(value)
         else:
             out[key] = value
-    out["twilio_ready"] = bool(
-        get("twilio_account_sid") and get("twilio_auth_token") and get("twilio_from_number")
+    out["telnyx_ready"] = bool(
+        get("telnyx_api_key") and get("telnyx_app_id") and get("telnyx_from_number")
     )
     out["delivery_mode"] = "webhook" if get("public_base_url") else "direct"
     return out
@@ -85,15 +86,15 @@ def telephony():
     """The Telephony client for the current credentials, or None if incomplete.
 
     Cached on the credential tuple: the dispatcher asks for this several times a
-    minute, and building a Twilio client each time throws away connection pooling
+    minute, and building a Telnyx client each time throws away connection pooling
     for no reason. Changing any credential in Settings changes the key, so the
     next call transparently rebuilds.
     """
     global _client_cache
     key = (
-        get("twilio_account_sid").strip(),
-        get("twilio_auth_token").strip(),
-        get("twilio_from_number").strip(),
+        get("telnyx_api_key").strip(),
+        get("telnyx_app_id").strip(),
+        get("telnyx_from_number").strip(),
         get("public_base_url").strip(),
     )
     if not all(key[:3]):
@@ -107,7 +108,7 @@ def telephony():
     try:
         client = Telephony(*key)
     except Exception as exc:  # noqa: BLE001 - malformed credentials must not 500
-        log.warning("could not build a Twilio client: %s", exc)
+        log.warning("could not build a Telnyx client: %s", exc)
         _client_cache = None
         return None
     _client_cache = (key, client)

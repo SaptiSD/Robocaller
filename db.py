@@ -27,8 +27,8 @@ CAMPAIGN_STATES = ("draft", "active", "paused", "finished")
 # Task lifecycle:
 #   pending   - queued, waiting for its turn in the dispatcher
 #   deferred  - outside the recipient's legal calling window, retry later
-#   dialing   - handed to Twilio, awaiting a final status
-#   done      - a final Twilio status landed (completed / busy / no-answer / ...)
+#   dialing   - handed to Telnyx, awaiting a final status
+#   done      - a final Telnyx status landed (completed / busy / no-answer / ...)
 #   skipped   - never dialed (suppressed number, no consent, campaign deleted)
 TASK_STATES = ("pending", "deferred", "dialing", "done", "skipped")
 
