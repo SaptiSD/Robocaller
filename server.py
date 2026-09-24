@@ -1,6 +1,6 @@
 """RoboCall AI - web server.
 
-FastAPI serves the dashboard, a small JSON API, and the Twilio webhooks. The
+FastAPI serves the dashboard, a small JSON API, and the Telnyx webhooks. The
 dispatcher runs as a daemon thread in this process, so calls go out whether or
 not a browser is open - closing the tab does not stop a campaign.
 
@@ -8,11 +8,15 @@ Run it:  python -m uvicorn server:app --port 8000
 """
 from __future__ import annotations
 
+import base64
 import csv
 import logging
+import time
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
@@ -30,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("robocall")
 
 WEB_DIR = Path(__file__).parent / "web"
+DOCS_DIR = Path(__file__).parent / "docs"
 _engine: dispatcher.Dispatcher | None = None
 
 
@@ -185,9 +190,26 @@ def require_campaign(campaign_id: int) -> dict:
 
 # --- dashboard --------------------------------------------------------------
 
+class NoCacheStatic(StaticFiles):
+    """Serve the dashboard without letting the browser hold on to a stale copy.
+
+    There is no build step here and no fingerprinted filenames, so an edited
+    app.js keeps the same URL. Browsers will then happily reuse the cached copy
+    and the dashboard runs code you have already changed - which looks exactly
+    like a bug in the new code, and costs an hour before you think of the cache.
+    `no-cache` still permits a conditional request, so the usual answer is a
+    cheap 304 rather than the file again.
+    """
+
+    async def get_response(self, path: str, scope):  # noqa: ANN001
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/overview")
@@ -440,7 +462,7 @@ def test_call(body: TestCallIn) -> dict:
     if not phone:
         raise HTTPException(400, "Set a test number on the Settings page first.")
     if config.telephony() is None:
-        raise HTTPException(400, "Twilio isn't configured yet - fill in Settings.")
+        raise HTTPException(400, "Telnyx isn't configured yet - fill in Settings.")
 
     task_id = dispatcher.enqueue_single(phone, body.message.strip(), body.voice)
     # Restricted to this one task: pressing "Call me now" must never also dial
@@ -507,7 +529,7 @@ def save_settings(body: SettingsIn) -> dict:
     for key in config.SECRET_KEYS:
         if key in values and not values[key].strip():
             values.pop(key)
-    for key in ("test_number", "callback_number", "twilio_from_number"):
+    for key in ("test_number", "callback_number", "telnyx_from_number"):
         if values.get(key):
             values[key] = compliance.normalize(values[key]) or values[key]
     config.set_many(values)
@@ -518,7 +540,7 @@ def save_settings(body: SettingsIn) -> dict:
 def verify_settings() -> dict:
     phone = config.telephony()
     if phone is None:
-        raise HTTPException(400, "Enter the Account SID, Auth Token and From number first.")
+        raise HTTPException(400, "Enter the Telnyx API key, TeXML application ID and From number first.")
     ok, detail = phone.verify()
     numbers, error = phone.owned_numbers() if ok else ([], "")
     from_ok, from_detail = phone.check_from_number() if ok else (False, "")
@@ -552,24 +574,109 @@ def remove_suppression(phone: str) -> dict:
     return {"ok": True}
 
 
-# --- Twilio webhooks (webhook mode only) ------------------------------------
+# --- documents --------------------------------------------------------------
 
-def _validate(request: Request, form: dict) -> None:
-    """Reject anything that isn't actually from Twilio.
+def _document(name: str) -> Path:
+    """Resolve a requested filename to a PDF that really is inside docs/.
+
+    `name` arrives from the URL, so it is treated as hostile: a bare filename is
+    required, the suffix is checked, and the resolved path has to still be a
+    direct child of DOCS_DIR. That last check is the one that matters - it
+    defeats `..`, absolute paths and symlinks pointing out of the folder, which
+    the string checks alone would not.
+    """
+    if name != Path(name).name or not name.lower().endswith(".pdf"):
+        raise HTTPException(404, "No such document.")
+    path = (DOCS_DIR / name).resolve()
+    if path.parent != DOCS_DIR.resolve() or not path.is_file():
+        raise HTTPException(404, "No such document.")
+    return path
+
+
+@app.get("/api/documents")
+def list_documents() -> list[dict]:
+    """The PDFs sitting in docs/, newest first."""
+    if not DOCS_DIR.is_dir():
+        return []
+    out = []
+    for path in DOCS_DIR.glob("*.pdf"):
+        stat = path.stat()
+        out.append({
+            "name": path.name,
+            # Filenames are written as words joined by hyphens, so this reads
+            # back as a title without needing to open the file.
+            "title": path.stem.replace("-", " "),
+            "bytes": stat.st_size,
+            "modified": db.to_utc(datetime.fromtimestamp(stat.st_mtime, timezone.utc)),
+            "url": f"/docs/{path.name}",
+        })
+    out.sort(key=lambda d: d["modified"], reverse=True)
+    return out
+
+
+@app.get("/docs/{name}")
+def get_document(name: str) -> FileResponse:
+    path = _document(name)
+    # `inline` so the browser's own PDF viewer renders it in the iframe rather
+    # than offering it as a download.
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{path.name}"'},
+    )
+
+
+# --- Telnyx webhooks (webhook mode only) ------------------------------------
+
+# Telnyx signs with Ed25519 over "{timestamp}|{raw body}" and rejects nothing on
+# its own end, so the freshness window is ours to enforce. Five minutes is what
+# Telnyx's own examples use.
+SIGNATURE_TOLERANCE_SECONDS = 5 * 60
+
+
+def _validate(request: Request, body: bytes) -> None:
+    """Reject anything that isn't actually from Telnyx.
 
     These endpoints can add a number to the do-not-call list, so they are not
-    left open. Signature checking is skipped only when the auth token is absent.
+    left open. Two independent gates cover them: the unguessable per-call token
+    already in the path, and - once a public key is configured in Settings -
+    Telnyx's signature over the raw body. Signature checking is skipped only
+    when no public key has been entered, which mirrors how this behaved on
+    Twilio when the auth token was absent.
     """
-    from twilio.request_validator import RequestValidator
-
-    token = config.get("twilio_auth_token")
-    if not token:
+    public_key = config.get("telnyx_public_key").strip()
+    if not public_key:
         return
-    signature = request.headers.get("X-Twilio-Signature", "")
-    base = config.get("public_base_url").rstrip("/")
-    url = f"{base}{request.url.path}" if base else str(request.url)
-    if not RequestValidator(token).validate(url, form, signature):
-        raise HTTPException(403, "Bad Twilio signature.")
+
+    signature = request.headers.get("telnyx-signature-ed25519", "")
+    timestamp = request.headers.get("telnyx-timestamp", "")
+    if not signature or not timestamp:
+        raise HTTPException(403, "Missing Telnyx signature headers.")
+
+    try:
+        age = abs(time.time() - float(timestamp))
+    except ValueError as exc:
+        raise HTTPException(403, "Malformed Telnyx timestamp.") from exc
+    if age > SIGNATURE_TOLERANCE_SECONDS:
+        raise HTTPException(403, "Telnyx signature is too old.")
+
+    try:
+        key = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key))
+        key.verify(base64.b64decode(signature), b"%s|%s" % (timestamp.encode(), body))
+    except Exception as exc:  # noqa: BLE001 - any failure here means "not Telnyx"
+        raise HTTPException(403, "Bad Telnyx signature.") from exc
+
+
+async def _signed_form(request: Request) -> dict:
+    """The POST body as a dict, once its signature has been checked.
+
+    The raw bytes have to be read before the form is parsed, because the
+    signature covers exactly those bytes. Starlette replays the cached body into
+    `form()`, so reading it first costs nothing.
+    """
+    body = await request.body()
+    _validate(request, body)
+    return dict(await request.form())
 
 
 def _task_for(token: str) -> dict:
@@ -585,10 +692,9 @@ def _task_for(token: str) -> dict:
     return task
 
 
-@app.post("/twilio/voice/{token}")
-async def twiml_for_call(token: str, request: Request) -> Response:
-    form = dict(await request.form())
-    _validate(request, form)
+@app.post("/telnyx/voice/{token}")
+async def texml_for_call(token: str, request: Request) -> Response:
+    form = await _signed_form(request)
     task = _task_for(token)
 
     # 'Live answers only' - drop the call if a machine picked up.
@@ -599,7 +705,7 @@ async def twiml_for_call(token: str, request: Request) -> Response:
             "updated_at = ? WHERE id = ?",
             (answered_by, db.now_str(), task["id"]),
         )
-        return Response(telephony.build_twiml("", hangup_first=True), media_type="text/xml")
+        return Response(telephony.build_texml("", hangup_first=True), media_type="text/xml")
 
     script = compliance.build_script(
         task.get("script_override") or task.get("message") or "",
@@ -608,19 +714,18 @@ async def twiml_for_call(token: str, request: Request) -> Response:
     )
     base = config.get("public_base_url").rstrip("/")
     script += " To be removed from this list, press 9 now."
-    xml = telephony.build_twiml(
+    xml = telephony.build_texml(
         script,
         voice=task.get("voice_override") or task.get("voice")
               or telephony.DEFAULT_VOICE,
-        optout_url=f"{base}/twilio/optout/{token}" if base else "",
+        optout_url=f"{base}/telnyx/optout/{token}" if base else "",
     )
     return Response(xml, media_type="text/xml")
 
 
-@app.post("/twilio/optout/{token}")
+@app.post("/telnyx/optout/{token}")
 async def handle_optout(token: str, request: Request) -> Response:
-    form = dict(await request.form())
-    _validate(request, form)
+    form = await _signed_form(request)
     task = _task_for(token)
 
     if str(form.get("Digits", "")) == "9":
@@ -638,10 +743,9 @@ async def handle_optout(token: str, request: Request) -> Response:
     return Response("<Response><Hangup/></Response>", media_type="text/xml")
 
 
-@app.post("/twilio/status/{token}")
+@app.post("/telnyx/status/{token}")
 async def handle_status(token: str, request: Request) -> Response:
-    form = dict(await request.form())
-    _validate(request, form)
+    form = await _signed_form(request)
     task = _task_for(token)
     dispatcher.record_status(
         task["id"],
@@ -672,4 +776,4 @@ def api_not_found(rest: str) -> JSONResponse:
     raise HTTPException(404, f"No such API endpoint: /api/{rest}")
 
 
-app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+app.mount("/", NoCacheStatic(directory=str(WEB_DIR), html=True), name="web")

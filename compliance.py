@@ -215,7 +215,7 @@ def window_check(
 
 # --- script hygiene ---------------------------------------------------------
 
-MAX_MESSAGE_CHARS = 3000  # Twilio caps an inline TwiML payload at 4000 chars.
+MAX_MESSAGE_CHARS = 3000  # Keeps the inline TeXML document comfortably small.
 
 
 def build_script(

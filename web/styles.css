@@ -260,6 +260,24 @@ button.small { padding: 4px 9px; font-size: 12px; }
 button.link { border: 0; background: none; color: var(--accent); padding: 2px 4px; }
 .btn-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
+/* An anchor that has to look like a button - used where the target must be a
+   real link, so middle-click and "open in new tab" keep working. */
+a.button {
+  display: inline-block; text-decoration: none;
+  font: inherit; font-weight: 500; cursor: pointer;
+  padding: 7px 14px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+}
+a.button:hover { background: var(--surface-2); }
+
+/* The embedded PDF reader. Tall enough to read a page without scrolling the
+   dashboard underneath it, and capped so it never outgrows the viewport. */
+.doc-frame {
+  width: 100%; height: 78vh; min-height: 420px;
+  margin-top: 12px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--surface-2);
+}
+
 /* --- tables -------------------------------------------------------------- */
 
 .table-wrap { overflow-x: auto; }

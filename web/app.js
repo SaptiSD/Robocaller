@@ -100,7 +100,8 @@ function show(view) {
   window.location.hash = view;
 
   const loader = { dashboard: loadDashboard, campaigns: loadCampaigns,
-                   calls: loadCalls, dnc: loadDnc, settings: loadSettings }[view];
+                   calls: loadCalls, dnc: loadDnc, docs: loadDocs,
+                   settings: loadSettings }[view];
   // An unhandled rejection here would leave the page showing stale data with no
   // hint that anything went wrong.
   if (loader) loader().catch((err) => toast(err.message, true));
@@ -110,10 +111,10 @@ function show(view) {
 
 function setupBanner(data) {
   const s = data.settings;
-  if (!s.twilio_ready) {
+  if (!s.telnyx_ready) {
     return `<div class="banner bad"><span>&#9888;</span><span>
-      <b>Twilio isn't connected yet</b>, so no call can go out.
-      Add your Account SID, Auth Token and a voice-capable From number on the
+      <b>Telnyx isn't connected yet</b>, so no call can go out.
+      Add your API key, TeXML application ID and a voice-capable From number on the
       <button class="link" data-view-jump="settings" style="padding:0">Settings page</button>.
     </span></div>`;
   }
@@ -225,7 +226,7 @@ async function loadDashboard() {
         <span class="hint" style="display:inline">last tick ${esc(fmtWhen(e.last_tick))}</span></div>
       <div class="hint">Mode: <b>${esc(data.settings.delivery_mode)}</b> &middot;
         ${data.settings.delivery_mode === "webhook"
-          ? "Twilio fetches scripts from this server; opt-out keypresses work."
+          ? "Telnyx fetches scripts from this server; opt-out keypresses work."
           : "Scripts ride along with each call; nothing needs to be internet-reachable."}</div>
       <div class="hint">Calling window ${esc(data.settings.window_start)}&ndash;${esc(data.settings.window_end)}
         local to each recipient, ${esc(data.settings.calls_per_minute)} calls/minute.</div>
@@ -357,12 +358,62 @@ async function openCampaign(id) {
 
 // --- call log ---------------------------------------------------------------
 
+// --- documents --------------------------------------------------------------
+
+function fmtBytes(n) {
+  if (!n) return "—";
+  return n < 1024 * 1024 ? Math.round(n / 1024) + " KB"
+                         : (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function docsTable(rows) {
+  if (!rows.length) {
+    return `<div class="empty">No PDFs in the <span class="mono">docs</span> folder yet.
+      Build them with <span class="mono">python docs/build_report.py</span>.</div>`;
+  }
+  return `<table>
+    <thead><tr><th>Document</th><th>File</th><th>Size</th><th>Updated</th><th></th></tr></thead>
+    <tbody>${rows.map((r) => `
+      <tr>
+        <td class="name"><b>${esc(r.title)}</b></td>
+        <td class="hint" style="font-family:var(--mono);font-size:11px">${esc(r.name)}</td>
+        <td class="num hint">${esc(fmtBytes(r.bytes))}</td>
+        <td class="hint when">${esc(fmtWhen(r.modified))}</td>
+        <td class="row-actions">
+          <button data-doc="${esc(r.name)}" data-doc-title="${esc(r.title)}">Read</button>
+        </td>
+      </tr>`).join("")}
+    </tbody></table>`;
+}
+
+async function loadDocs() {
+  const rows = await api("/documents");
+  $("#docs-table").innerHTML = docsTable(rows);
+  $("#nav-docs").textContent = rows.length || "";
+}
+
+function openDoc(name, title) {
+  // Cache-bust, so rebuilding a PDF and pressing Read again shows the new one
+  // rather than whatever the browser's PDF viewer is still holding.
+  $("#doc-frame").src = `/docs/${encodeURIComponent(name)}?t=${Date.now()}`;
+  $("#doc-newtab").href = `/docs/${encodeURIComponent(name)}`;
+  $("#doc-title").textContent = title || name;
+  $("#doc-sub").textContent = name;
+  $("#doc-viewer").classList.remove("hidden");
+  $("#doc-viewer").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function closeDoc() {
+  $("#doc-viewer").classList.add("hidden");
+  $("#doc-frame").src = "about:blank";  // stop the PDF plugin rendering offscreen
+}
+
 function callsTable(rows, withCampaign = true) {
   if (!rows.length) return `<div class="empty">No calls yet.</div>`;
   return `<table>
     <thead><tr>
       <th>When</th>${withCampaign ? "<th>Campaign</th>" : ""}<th>Number</th>
-      <th>Status</th><th>Length</th><th>Twilio SID</th><th>Detail</th>
+      <th>Status</th><th>Length</th><th>Telnyx SID</th><th>Detail</th>
     </tr></thead>
     <tbody>${rows.map((r) => `
       <tr>
@@ -405,10 +456,10 @@ async function loadSettings() {
   if (data.timezones && data.timezones.length) TIMEZONES = data.timezones;
   fillFormOptions();
 
-  $("#s-sid").value = data.settings.twilio_account_sid || "";
-  $("#s-token").placeholder = data.settings.twilio_auth_token_set
-    ? "saved — leave blank to keep it" : "paste your auth token";
-  $("#s-from").value = data.settings.twilio_from_number || "";
+  $("#s-api-key").placeholder = data.settings.telnyx_api_key_set
+    ? "saved — leave blank to keep it" : "paste your Telnyx API key";
+  $("#s-app-id").value = data.settings.telnyx_app_id || "";
+  $("#s-from").value = data.settings.telnyx_from_number || "";
   $("#s-test").value = data.settings.test_number || "";
   $("#s-business").value = data.settings.business_name || "";
   $("#s-callback").value = data.settings.callback_number || "";
@@ -441,9 +492,9 @@ function fillVoices() {
 
 async function saveSettings() {
   const values = {
-    twilio_account_sid: $("#s-sid").value.trim(),
-    twilio_auth_token: $("#s-token").value.trim(),
-    twilio_from_number: $("#s-from").value.trim(),
+    telnyx_api_key: $("#s-api-key").value.trim(),
+    telnyx_app_id: $("#s-app-id").value.trim(),
+    telnyx_from_number: $("#s-from").value.trim(),
     test_number: $("#s-test").value.trim(),
     business_name: $("#s-business").value.trim(),
     callback_number: $("#s-callback").value.trim(),
@@ -495,9 +546,64 @@ function schedulePreview() {
   }, 400);
 }
 
+// Mirror of compliance.normalize, so the meter can tell you what the server will
+// accept before you submit a list of ten thousand rows.
+function normalizePhone(raw) {
+  const text = (raw || "").trim();
+  if (!text) return "";
+  const digits = text.replace(/\D/g, "");
+  if (!digits) return "";
+  if (text.startsWith("+")) return digits.length >= 8 && digits.length <= 15 ? "+" + digits : "";
+  if (digits.length === 10) return "+1" + digits;
+  if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
+  return "";
+}
+
 function countContacts() {
-  const lines = $("#c-contacts").value.split("\n").filter((l) => l.trim()).length;
-  $("#contacts-meter").textContent = lines ? `${lines} line${lines === 1 ? "" : "s"}` : "";
+  const meter = $("#contacts-meter");
+  const seen = new Set();
+  let usable = 0, dupes = 0, bad = 0;
+
+  for (let line of $("#c-contacts").value.split("\n")) {
+    line = line.trim();
+    if (!line || /^(phone|number|#)/i.test(line)) continue;
+    // Same rule as the server: first field that parses as a number wins.
+    const phone = line.split(",").map(normalizePhone).find(Boolean) || "";
+    if (!phone) { bad++; continue; }
+    if (seen.has(phone)) { dupes++; continue; }
+    seen.add(phone);
+    usable++;
+  }
+
+  if (!usable && !dupes && !bad) return (meter.textContent = "");
+  const parts = [`<b>${usable}</b> number${usable === 1 ? "" : "s"} to call`];
+  if (dupes) parts.push(`${dupes} duplicate${dupes === 1 ? "" : "s"} ignored`);
+  if (bad) parts.push(`<span style="color:var(--critical)">${bad} line${bad === 1 ? "" : "s"} not a phone number</span>`);
+  meter.innerHTML = parts.join(" · ");
+}
+
+// Read one or more CSV/text files in the browser and append their rows to the
+// box. The server already parses "number", "number,name" and "name,number", so
+// the file never has to leave the page as anything but pasted text.
+async function importContactFiles(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+
+  let text = "";
+  for (const file of list) {
+    try {
+      text += (await file.text()).replace(/\r\n?/g, "\n").trim() + "\n";
+    } catch (err) {
+      return toast(`Could not read ${file.name}.`, true);
+    }
+  }
+
+  const box = $("#c-contacts");
+  const before = box.value.split("\n").filter((l) => l.trim()).length;
+  box.value = (box.value.trim() ? box.value.trim() + "\n" : "") + text.trim();
+  const added = box.value.split("\n").filter((l) => l.trim()).length - before;
+  countContacts();
+  toast(`Loaded ${added} row(s) from ${list.length} file${list.length === 1 ? "" : "s"}.`);
 }
 
 async function draftScript() {
@@ -560,6 +666,9 @@ async function handleClick(event) {
 
   const nav = event.target.closest(".nav-item[data-view]");
   if (nav) return show(nav.dataset.view);
+
+  const doc = event.target.closest("[data-doc]");
+  if (doc) return openDoc(doc.dataset.doc, doc.dataset.docTitle);
 
   const open = event.target.closest("[data-open]");
   if (open) return openCampaign(Number(open.dataset.open));
@@ -641,7 +750,7 @@ async function testCall() {
   } finally { btn.disabled = false; }
 }
 
-async function verifyTwilio() {
+async function verifyTelnyx() {
   const btn = $("#btn-verify");
   btn.disabled = true;
   $("#verify-status").innerHTML = `<span class="spinner"></span> checking…`;
@@ -659,7 +768,7 @@ async function verifyTwilio() {
       ? "Voice-capable numbers on this account: " +
         voiceNumbers.map((n) =>
           `<button type="button" class="link small" data-pick="${esc(n.phone_number)}">${esc(n.phone_number)}</button>`).join(" ")
-      : r.ok ? "No voice-capable numbers on this account yet - buy one in the Twilio console." : "";
+      : r.ok ? "No voice-capable numbers on this account yet - buy one in the Telnyx portal." : "";
   } catch (err) {
     $("#verify-status").innerHTML = `<span style="color:var(--critical)">${esc(err.message)}</span>`;
   } finally { btn.disabled = false; }
@@ -686,13 +795,32 @@ $("#theme-toggle").addEventListener("click", () => {
 });
 
 $("#btn-test-call").addEventListener("click", testCall);
-$("#btn-verify").addEventListener("click", verifyTwilio);
+$("#btn-verify").addEventListener("click", verifyTelnyx);
 $("#btn-save-settings").addEventListener("click", saveSettings);
 $("#btn-draft").addEventListener("click", draftScript);
 $("#btn-refresh-calls").addEventListener("click", loadCalls);
+$("#btn-refresh-docs").addEventListener("click", () => {
+  loadDocs().catch((err) => toast(err.message, true));
+});
+$("#btn-close-doc").addEventListener("click", closeDoc);
 $("#campaign-form").addEventListener("submit", submitCampaign);
 $("#c-message").addEventListener("input", schedulePreview);
 $("#c-contacts").addEventListener("input", countContacts);
+$("#btn-import-csv").addEventListener("click", () => $("#c-contacts-file").click());
+$("#c-contacts-file").addEventListener("change", (e) => {
+  importContactFiles(e.target.files);
+  e.target.value = "";  // so picking the same file twice fires again
+});
+$("#btn-clear-contacts").addEventListener("click", () => {
+  $("#c-contacts").value = "";
+  countContacts();
+});
+$("#c-contacts").addEventListener("dragover", (e) => e.preventDefault());
+$("#c-contacts").addEventListener("drop", (e) => {
+  if (!e.dataTransfer?.files?.length) return;
+  e.preventDefault();
+  importContactFiles(e.dataTransfer.files);
+});
 $("#c-frequency").addEventListener("change", (e) => {
   $("#wrap-weekday").classList.toggle("hidden", e.target.value !== "weekly");
   $("#wrap-time").classList.toggle("hidden", e.target.value === "hourly");
@@ -716,6 +844,13 @@ applyTheme();
 bindTooltip();
 fillFormOptions();
 loadSettings().then(() => show(window.location.hash.slice(1) || "dashboard"));
+
+// show() writes the hash, so a view can be linked to and the back button works.
+// Guarding on currentView stops show()'s own write from bouncing back through here.
+window.addEventListener("hashchange", () => {
+  const view = window.location.hash.slice(1) || "dashboard";
+  if (view !== currentView) show(view);
+});
 pollTimer = setInterval(() => {
   if (currentView === "dashboard") loadDashboard();
   if (currentView === "calls") loadCalls();

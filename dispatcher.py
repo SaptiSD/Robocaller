@@ -6,9 +6,9 @@ Runs as a daemon thread inside the web server and ticks every few seconds:
      `call_tasks` row per contact, and their next run rolls forward.
   2. dispatch    - pending tasks are rate-limited, screened against the
      suppression list and the recipient's local calling window, and handed to
-     Twilio.
-  3. sync        - tasks Twilio is still working on get polled for an outcome.
-     (In webhook mode Twilio pushes these instead, and this becomes a backstop.)
+     Telnyx.
+  3. sync        - tasks Telnyx is still working on get polled for an outcome.
+     (In webhook mode Telnyx pushes these instead, and this becomes a backstop.)
 
 Splitting materialize from dispatch is what makes pacing and quiet-hours
 deferral possible: a task that can't be called right now is simply left in the
@@ -31,7 +31,7 @@ from telephony import CallResult
 log = logging.getLogger("robocall.dispatcher")
 
 TICK_SECONDS = 5
-SYNC_EVERY_TICKS = 4          # poll Twilio for outcomes every ~20s
+SYNC_EVERY_TICKS = 4          # poll Telnyx for outcomes every ~20s
 MAX_ATTEMPTS = 1              # phase 1 does not retry busy / no-answer
 DEFER_GRACE = timedelta(minutes=1)
 
@@ -309,9 +309,16 @@ def dispatch_pending(
             business_name=business,
             callback_number=callback,
         )
-        amd = task["amd"] or "voicemail"
+        # A task with no campaign is the dashboard's "call me now" button: a
+        # person is holding the phone, waiting for it to ring. Answering-machine
+        # detection is exactly wrong there - it withholds the script until it has
+        # decided whether a greeting has finished, and a live "hello" is routinely
+        # classified as a machine, so the whole detection window burns down and
+        # the call hangs up having said nothing at all.
+        default_amd = "voicemail" if task["campaign_id"] else "off"
+        amd = task["amd"] or default_amd
         if not phone.supports(amd):
-            amd = "voicemail"
+            amd = default_amd
 
         try:
             result = phone.place_call(
@@ -373,11 +380,11 @@ def sync_open_calls(now: datetime | None = None) -> int:
         )
         updated += 1
 
-    # A call Twilio never told us about (or that we lost track of) shouldn't sit
+    # A call Telnyx never told us about (or that we lost track of) shouldn't sit
     # in 'dialing' forever.
     db.execute(
         "UPDATE call_tasks SET state = 'done', status = 'unknown', "
-        "error = 'no final status from Twilio', updated_at = ? "
+        "error = 'no final status from Telnyx', updated_at = ? "
         "WHERE state = 'dialing' AND updated_at < ?",
         (db.to_utc(now), cutoff),
     )
@@ -385,7 +392,7 @@ def sync_open_calls(now: datetime | None = None) -> int:
 
 
 def record_status(task_id: int, status: str, answered_by: str = "", duration: int = 0) -> None:
-    """Apply a Twilio call status, from either polling or a webhook."""
+    """Apply a Telnyx call status, from either polling or a webhook."""
     from telephony import FINAL_STATUSES
 
     if not status:
