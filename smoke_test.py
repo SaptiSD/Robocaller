@@ -404,6 +404,14 @@ def test_api() -> None:
         check("contacts carry a resolved timezone",
               {r["timezone"] for r in rows} == {"America/New_York", "America/Los_Angeles"})
 
+        res = client.post(f"/api/campaigns/{campaign_id}/contacts",
+                          json={"raw": "617-555-0170", "consented": False})
+        check("re-importing an existing contact succeeds", res.status_code == 200, res.text[:200])
+        rows = client.get(f"/api/campaigns/{campaign_id}/contacts").json()
+        check("re-importing does not duplicate the contact", len(rows) == 2, str(len(rows)))
+        check("re-importing without consent keeps the consent on file",
+              all(r["consent"] == 1 for r in rows), str([r["consent"] for r in rows]))
+
         res = client.post("/api/script/preview", json={"message": "Sale on Friday."})
         check("the preview reports duration", res.json()["seconds"] > 0)
 

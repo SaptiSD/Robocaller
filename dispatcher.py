@@ -459,10 +459,14 @@ def record_status(task_id: int, status: str, answered_by: str = "", duration: in
     if not status:
         return
     state = "done" if status in FINAL_STATUSES else "dialing"
+    duration = int(duration or 0)
+    # CASE rather than SQLite's two-argument MAX(), which Postgres doesn't have
+    # (its MAX is aggregate-only); GREATEST is the reverse problem.
     db.execute(
         "UPDATE call_tasks SET state = ?, status = ?, answered_by = COALESCE(NULLIF(?, ''), "
-        "answered_by), duration = MAX(duration, ?), updated_at = ? WHERE id = ?",
-        (state, status, answered_by, int(duration or 0), db.to_utc(db.utcnow()), task_id),
+        "answered_by), duration = CASE WHEN ? > duration THEN ? ELSE duration END, "
+        "updated_at = ? WHERE id = ?",
+        (state, status, answered_by, duration, duration, db.to_utc(db.utcnow()), task_id),
     )
 
 

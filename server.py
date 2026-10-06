@@ -449,7 +449,9 @@ def _add_contacts(campaign_id: int, raw: str, consented: bool) -> tuple[int, lis
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(campaign_id, phone) DO UPDATE SET "
             "name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE contacts.name END, "
-            "consent = MAX(contacts.consent, excluded.consent)",
+            # Never downgrade consent. CASE, not MAX(a, b): Postgres has no scalar MAX.
+            "consent = CASE WHEN excluded.consent > contacts.consent "
+            "THEN excluded.consent ELSE contacts.consent END",
             [
                 (campaign_id, phone, name, 1 if consented else 0, db.now_str())
                 for phone, name in good
