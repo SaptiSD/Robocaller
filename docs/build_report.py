@@ -35,6 +35,13 @@ REPORTS = {
         "RoboCall AI — Project Report",
         "What the project is, how it is built, and where it stands",
     ),
+    "brief": (
+        "story_brief",
+        "RoboCall-AI-Requirements-Check.pdf",
+        "RoboCall AI - Requirements Check",
+        "RoboCall AI — Requirements Check",
+        "Every item in the brief, and where it lives in the product",
+    ),
     "guide": (
         "story_guide",
         "RoboCall-AI-User-Guide.pdf",

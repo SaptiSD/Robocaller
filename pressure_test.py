@@ -10,6 +10,7 @@ against a live account.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import sqlite3
 import sys
@@ -33,10 +34,31 @@ for _leak in (
 ):
     os.environ[_leak] = ""
 
+# DATABASE_URL is blanked separately, and the reason is worth spelling out: these
+# suites create, mutate and delete rows freely. Inheriting a production Postgres
+# URL from .env would run all of that against live campaign and do-not-call data.
+# Point ROBOCALL_TEST_DATABASE_URL at a scratch database to exercise the Postgres
+# path on purpose; anything else runs on the throwaway SQLite file above.
+os.environ["DATABASE_URL"] = os.environ.get("ROBOCALL_TEST_DATABASE_URL", "")
+
 
 import compliance  # noqa: E402
 import config  # noqa: E402
 import db  # noqa: E402
+
+atexit.register(db.close_pool)
+
+# A SQLite run gets a brand-new temp file every time; a Postgres run reuses the
+# schema, so state carries over and assumptions about an empty database quietly
+# stop holding. Drop it first to put the two backends on equal footing.
+# Guarded on PG_SCHEMA so this can never target `public`.
+if db.IS_PG and db.PG_SCHEMA:
+    import psycopg as _psycopg
+
+    with _psycopg.connect(db.DATABASE_URL, autocommit=True) as _boot:
+        _boot.execute(f"DROP SCHEMA IF EXISTS {db.PG_SCHEMA} CASCADE")
+    print(f"postgres backend: schema {db.PG_SCHEMA} reset")
+
 import dispatcher  # noqa: E402
 import telephony  # noqa: E402
 
@@ -482,6 +504,12 @@ def test_lifecycle() -> None:
 
 def test_schema_migration() -> None:
     section("schema drift")
+    if db.IS_PG:
+        # This exercises the SQLite *file* migration path: an old database at a
+        # given path, reopened. Postgres has no equivalent, and its own column
+        # migration is covered by init() running against a live schema.
+        print("  skip (SQLite-only path)")
+        return
     path = _tmp / "old.db"
     conn = sqlite3.connect(str(path))
     # A database created before script_override / voice_override existed.
@@ -669,6 +697,134 @@ def test_webhooks() -> None:
 
 # --- 9. the API's guard rails ----------------------------------------------
 
+def test_campaign_window() -> None:
+    """A recurring campaign must stop on its own at the end timestamp, and must
+    not dial before the start one. Without this an hourly campaign runs until
+    somebody notices the bill."""
+    section("the campaign window (begins / ends)")
+    db.init()
+    install(FakeTelephony())
+
+    hour = timedelta(hours=1)
+
+    # --- ends_at retires the campaign -------------------------------------
+    cid = fresh_campaign(frequency="hourly", n=1)
+    db.execute("UPDATE campaigns SET ends_at = ? WHERE id = ?",
+               (db.to_utc(MIDDAY + 2 * hour + timedelta(minutes=30)), cid))
+    row = db.query_one("SELECT * FROM campaigns WHERE id = ?", (cid,))
+
+    nxt = dispatcher.compute_next_run(row, MIDDAY)
+    check("a run inside the window is scheduled", nxt == MIDDAY + hour, str(nxt))
+    nxt = dispatcher.compute_next_run(row, MIDDAY + hour)
+    check("the last run inside the window is scheduled",
+          nxt == MIDDAY + 2 * hour, str(nxt))
+    check("a run that would fall past the end is refused",
+          dispatcher.compute_next_run(row, MIDDAY + 2 * hour) is None)
+
+    # Drive the real loop across the window and count what actually fired.
+    fired = 0
+    for tick in range(6):
+        fired += dispatcher.materialize_due_campaigns(MIDDAY + tick * hour)
+    state = db.query_one("SELECT state, runs, next_run_at FROM campaigns WHERE id = ?", (cid,))
+    check("an hourly campaign bounded at +2.5h fires exactly 3 times",
+          fired == 3, f"fired {fired}")
+    check("...and then retires itself", state["state"] == "finished", state["state"])
+    check("...leaving no next run queued", state["next_run_at"] is None)
+
+    # --- the sweep catches a window shortened after the fact ---------------
+    cid2 = fresh_campaign(frequency="daily", n=1)
+    db.execute("UPDATE campaigns SET ends_at = ? WHERE id = ?",
+               (db.to_utc(MIDDAY - hour), cid2))
+    dispatcher.materialize_due_campaigns(MIDDAY)
+    after = db.query_one("SELECT state FROM campaigns WHERE id = ?", (cid2,))
+    check("an end date moved into the past retires the campaign at once",
+          after["state"] == "finished", after["state"])
+
+    # --- starts_at defers the first run ------------------------------------
+    later = MIDDAY + timedelta(days=3)
+    payload = {"frequency": "daily", "call_time": "10:00", "weekday": 0,
+               "timezone": "America/New_York", "starts_at": db.to_utc(later)}
+    first = dispatcher.first_run_at(payload, False, MIDDAY)
+    check("a future start pushes the first run past it", first > later, str(first))
+    check("start_now still respects a future start",
+          dispatcher.first_run_at(payload, True, MIDDAY) == later)
+
+    # A start date names a moment the operator chose. If a slot lands exactly on
+    # it, that slot counts - otherwise "begins Monday 10:00, daily at 10:00"
+    # silently skips Monday.
+    on_slot = MIDDAY + timedelta(days=5)          # 12:00 ET, matching call_time
+    exact = {"frequency": "daily", "call_time": "12:00", "weekday": 0,
+             "timezone": "America/New_York", "starts_at": db.to_utc(on_slot)}
+    check("a start landing exactly on a slot fires that slot, not the next one",
+          dispatcher.first_run_at(exact, False, MIDDAY) == on_slot,
+          str(dispatcher.first_run_at(exact, False, MIDDAY)))
+    check("an hourly campaign starts on its start moment",
+          dispatcher.first_run_at({**exact, "frequency": "hourly"}, False, MIDDAY)
+          == on_slot)
+    check("a start past that day's slot waits for the next one",
+          dispatcher.first_run_at(
+              {**exact, "starts_at": db.to_utc(on_slot + hour)}, False, MIDDAY)
+          == on_slot + timedelta(days=1))
+    # Recurrence must stay strict, or a campaign re-fires the slot it just ran.
+    check("recurrence never repeats the slot it just fired",
+          dispatcher.compute_next_run(exact, on_slot) == on_slot + timedelta(days=1),
+          str(dispatcher.compute_next_run(exact, on_slot)))
+
+    check("an end already in the past means no first run at all",
+          dispatcher.first_run_at(
+              {**payload, "starts_at": None, "ends_at": db.to_utc(MIDDAY - hour)},
+              False, MIDDAY) is None)
+    check("an end before the first slot means no first run at all",
+          dispatcher.first_run_at(
+              {"frequency": "weekly", "call_time": "10:00", "weekday": 0,
+               "timezone": "America/New_York",
+               "ends_at": db.to_utc(MIDDAY + timedelta(hours=2))},
+              False, MIDDAY) is None)
+
+    # --- an open-ended campaign still recurs forever, deliberately ---------
+    open_ended = {"frequency": "daily", "call_time": "10:00", "weekday": 0,
+                  "timezone": "America/New_York"}
+    check("a campaign with no end date keeps recurring",
+          dispatcher.compute_next_run(open_ended, MIDDAY + timedelta(days=400))
+          is not None)
+
+    # --- the API surface ----------------------------------------------------
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        return
+    import server
+
+    with TestClient(server.app) as client:
+        base = {"name": "W", "message": "Hello there, this is a test.",
+                "frequency": "daily", "call_time": "10:00",
+                "timezone": "America/New_York"}
+        res = client.post("/api/campaigns", json={
+            **base, "starts_at": "2026-06-01T10:00", "ends_at": "2026-05-01T10:00"})
+        check("an end before the start is refused", res.status_code == 400)
+        check("...and says so", "after the start" in res.json().get("error", ""),
+              res.json().get("error", ""))
+
+        res = client.post("/api/campaigns", json={**base, "ends_at": "2020-01-01T10:00"})
+        check("an end already in the past is refused", res.status_code == 400)
+
+        res = client.post("/api/campaigns", json={**base, "ends_at": "not a date"})
+        check("an unparseable timestamp is refused", res.status_code == 400)
+
+        res = client.post("/api/campaigns", json={**base, "ends_at": "2030-01-01T10:00"})
+        check("a well-formed window is accepted", res.status_code == 200,
+              str(res.json())[:100])
+        if res.status_code == 200:
+            cid3 = res.json()["campaign"]["id"]
+            stored = db.query_one("SELECT ends_at FROM campaigns WHERE id = ?", (cid3,))
+            # 10:00 America/New_York in January is 15:00 UTC, not 10:00 UTC.
+            check("the window is stored in UTC, read in the campaign's timezone",
+                  stored["ends_at"] == "2030-01-01 15:00:00", str(stored["ends_at"]))
+
+        res = client.post("/api/campaigns", json={**base, "ends_at": ""})
+        check("a blank end date is allowed", res.status_code == 200)
+
+
 def test_documents() -> None:
     """The docs viewer serves files off disk, so its path handling is a
     directory-traversal target - .env sits one level up from docs/."""
@@ -805,6 +961,7 @@ def main() -> int:
     test_schema_migration()
     test_hostile_input()
     test_webhooks()
+    test_campaign_window()
     test_documents()
     test_api_guards()
     print(f"\n{PASS} passed, {FAIL} failed")

@@ -68,6 +68,16 @@ function fmtWhen(utcString, tz) {
   return abs;
 }
 
+function fmtDay(utcString, tz) {
+  if (!utcString) return "—";
+  const d = new Date(utcString.replace(" ", "T") + "Z");
+  if (isNaN(d)) return utcString;
+  const opts = { month: "short", day: "numeric", year: "numeric" };
+  if (tz) opts.timeZone = tz;
+  try { return d.toLocaleDateString(undefined, opts); }
+  catch { return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); }
+}
+
 function fmtTime(utcString) {
   if (!utcString) return "";
   const d = new Date(utcString.replace(" ", "T") + "Z");
@@ -259,10 +269,15 @@ async function loadDashboard() {
 function campaignCard(c) {
   const stateClass = { active: "good", paused: "warning", finished: "muted", draft: "muted" }[c.state] || "muted";
   const done = c.calls_total ? Math.round((c.calls_completed / c.calls_total) * 100) : 0;
-  const schedule = c.frequency === "once" ? "One time"
+  let schedule = c.frequency === "once" ? "One time"
     : c.frequency === "hourly" ? "Every hour"
     : c.frequency === "daily" ? `Every day at ${c.call_time}`
     : `Every ${["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][c.weekday] || "Mon"} at ${c.call_time}`;
+  // The window is the difference between a campaign that stops and one that
+  // does not, so it belongs on the card rather than behind an Open click.
+  if (c.starts_at) schedule += ` · from ${fmtDay(c.starts_at, c.timezone)}`;
+  if (c.ends_at) schedule += ` · until ${fmtDay(c.ends_at, c.timezone)}`;
+  else if (c.frequency !== "once" && c.state === "active") schedule += " · no end date";
 
   return `<div class="campaign">
     <div class="campaign-top">
@@ -639,6 +654,8 @@ async function submitCampaign(event) {
     weekday: Number($("#c-weekday").value || 0),
     timezone: $("#c-timezone").value,
     require_consent: $("#c-require-consent").checked,
+    starts_at: $("#c-starts-at").value,
+    ends_at: $("#c-ends-at").value,
     start_now: $("#c-start-now").checked,
     contacts: $("#c-contacts").value,
     contacts_consented: $("#c-consent-have").checked,
@@ -653,6 +670,7 @@ async function submitCampaign(event) {
     $("#campaign-form").reset();
     $("#script-preview").textContent = "—";
     $("#c-require-consent").checked = true;
+    refreshWindowWarning();
     fillFormOptions();
     show("campaigns");
   } catch (err) { toast(err.message, true); }
@@ -821,10 +839,24 @@ $("#c-contacts").addEventListener("drop", (e) => {
   e.preventDefault();
   importContactFiles(e.dataTransfer.files);
 });
+// A campaign with no end date keeps dialling and keeps billing, so say so
+// rather than letting someone discover it from an invoice. Only recurring
+// frequencies can run away; a one-off is bounded by definition.
+function refreshWindowWarning() {
+  const freq = $("#c-frequency").value;
+  const recurring = freq !== "once";
+  const open_ended = recurring && !$("#c-ends-at").value;
+  $("#window-warning").classList.toggle("hidden", !open_ended);
+  $("#window-warning-freq").textContent =
+    { hourly: "hour", daily: "day", weekly: "week" }[freq] || "run";
+}
+
 $("#c-frequency").addEventListener("change", (e) => {
   $("#wrap-weekday").classList.toggle("hidden", e.target.value !== "weekly");
   $("#wrap-time").classList.toggle("hidden", e.target.value === "hourly");
+  refreshWindowWarning();
 });
+$("#c-ends-at").addEventListener("input", refreshWindowWarning);
 
 $("#btn-pause").addEventListener("click", async () => {
   const paused = $("#btn-pause").textContent.startsWith("Pause");

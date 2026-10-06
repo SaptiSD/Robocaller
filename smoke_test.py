@@ -8,6 +8,7 @@ through FastAPI's test client.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import sys
 import tempfile
@@ -31,10 +32,31 @@ for _leak in (
 ):
     os.environ[_leak] = ""
 
+# DATABASE_URL is blanked separately, and the reason is worth spelling out: these
+# suites create, mutate and delete rows freely. Inheriting a production Postgres
+# URL from .env would run all of that against live campaign and do-not-call data.
+# Point ROBOCALL_TEST_DATABASE_URL at a scratch database to exercise the Postgres
+# path on purpose; anything else runs on the throwaway SQLite file above.
+os.environ["DATABASE_URL"] = os.environ.get("ROBOCALL_TEST_DATABASE_URL", "")
+
 
 import compliance  # noqa: E402
 import config  # noqa: E402
 import db  # noqa: E402
+
+atexit.register(db.close_pool)
+
+# A SQLite run gets a brand-new temp file every time; a Postgres run reuses the
+# schema, so state carries over and assumptions about an empty database quietly
+# stop holding. Drop it first to put the two backends on equal footing.
+# Guarded on PG_SCHEMA so this can never target `public`.
+if db.IS_PG and db.PG_SCHEMA:
+    import psycopg as _psycopg
+
+    with _psycopg.connect(db.DATABASE_URL, autocommit=True) as _boot:
+        _boot.execute(f"DROP SCHEMA IF EXISTS {db.PG_SCHEMA} CASCADE")
+    print(f"postgres backend: schema {db.PG_SCHEMA} reset")
+
 import dispatcher  # noqa: E402
 import telephony  # noqa: E402
 

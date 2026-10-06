@@ -1,23 +1,54 @@
-"""SQLite persistence for the robocalling prototype.
+"""Persistence for the robocalling prototype. SQLite by default, Postgres if asked.
+
+Set DATABASE_URL and every query runs against Postgres (Supabase, or anything
+else that speaks the wire protocol); leave it unset and the app uses a local
+SQLite file. Nothing above this module knows which: all SQL goes through the
+five helpers at the bottom, and they translate the two dialects apart.
+
+That translation is deliberately narrow - placeholders, the identity column, and
+how a new row's id comes back. Everything else in the schema is written to be
+valid in both, which is why you will see `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`
+in the callers rather than SQLite's shorter `SUM(cond)`.
 
 All timestamps are stored as naive UTC strings ("YYYY-MM-DD HH:MM:SS") so they
 sort lexicographically and never depend on the machine's local timezone. Convert
 at the edges with `to_utc` / `from_utc`.
 
-The database deliberately lives OUTSIDE the project folder. The source tree is
-in Dropbox, and Dropbox replaces files it is syncing - including a SQLite file
-an app currently has open - which silently rolls back or destroys data. Override
-the location with the ROBOCALL_DB environment variable, but keep it off any
-synced drive.
+In SQLite mode the database deliberately lives OUTSIDE the project folder. The
+source tree is in Dropbox, and Dropbox replaces files it is syncing - including a
+SQLite file an app currently has open - which silently rolls back or destroys
+data. Override the location with ROBOCALL_DB, but keep it off any synced drive.
 """
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+# Read once at import. Flipping backends mid-process would leave the open
+# connection and the schema pointing at different databases.
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+IS_PG = bool(DATABASE_URL)
+
+# Optional Postgres schema to put the app's tables in. Blank means `public`.
+#
+# This is set per connection rather than through the URL's `options=-csearch_path`
+# because Supabase's pooler silently drops that startup parameter - the
+# connection comes up on `public` regardless, and a run you believed was isolated
+# writes straight into live data instead. Setting it after connecting is the only
+# form the pooler honours.
+PG_SCHEMA = (os.getenv("ROBOCALL_PG_SCHEMA") or "").strip()
+if PG_SCHEMA and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", PG_SCHEMA):
+    raise ValueError(f"ROBOCALL_PG_SCHEMA must be a plain identifier, got {PG_SCHEMA!r}")
+
+# Tables whose primary key is a generated `id`. Postgres only returns a new row
+# id if the INSERT asks for it, and asking on a table without that column is an
+# error - so `insert()` needs to know which is which.
+_ID_TABLES = {"campaigns", "contacts", "call_tasks", "events"}
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -51,6 +82,13 @@ CREATE TABLE IF NOT EXISTS campaigns (
     amd          TEXT NOT NULL DEFAULT 'voicemail',
     require_consent INTEGER NOT NULL DEFAULT 1,
     created_at   TEXT NOT NULL,
+    -- The window a recurring campaign is allowed to run in, both UTC and both
+    -- optional. starts_at holds the first run back until a chosen moment;
+    -- ends_at retires the campaign once it passes. Without ends_at an hourly or
+    -- daily campaign recurs forever, which on a dialler means it keeps calling
+    -- and keeps billing long after anyone remembers setting it up.
+    starts_at    TEXT,
+    ends_at      TEXT,
     next_run_at  TEXT,
     last_run_at  TEXT,
     runs         INTEGER NOT NULL DEFAULT 0
@@ -126,8 +164,11 @@ _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
 
 
+_pool: Any = None  # psycopg_pool.ConnectionPool, built lazily in PG mode
+
+
 def connect() -> sqlite3.Connection:
-    """One shared connection, guarded by `_lock`.
+    """One shared SQLite connection, guarded by `_lock`.
 
     The API server and the dispatcher thread both write, so every call goes
     through the lock rather than relying on SQLite's own busy handling.
@@ -139,6 +180,74 @@ def connect() -> sqlite3.Connection:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA foreign_keys=ON")
     return _conn
+
+
+def pool():
+    """The Postgres connection pool.
+
+    A pool rather than one shared connection: the dispatcher thread and the
+    request handlers run overlapping statements, and a single Postgres
+    connection cannot interleave them the way SQLite's can under a lock.
+    """
+    global _pool
+    if _pool is None:
+        from psycopg_pool import ConnectionPool
+
+        def configure(conn):
+            if PG_SCHEMA:
+                conn.execute(f"SET search_path TO {PG_SCHEMA}, public")
+
+        _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=8,
+                               kwargs={"autocommit": True}, open=True,
+                               timeout=20, configure=configure)
+    return _pool
+
+
+def close_pool() -> None:
+    """Shut the pool down.
+
+    Python 3.14 raises from the pool's own finaliser if it is still open at
+    interpreter exit, which buries whatever the program was actually reporting
+    under a traceback. Closing it deliberately keeps the output readable.
+    """
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+_STRINGS = re.compile(r"'(?:[^']|'')*'")
+
+
+def translate(sql: str) -> str:
+    """Rewrite SQLite-flavoured SQL for Postgres. A no-op in SQLite mode.
+
+    Only the placeholder style differs in the statements this app issues, and
+    `?` is swapped for `%s` outside string literals - a literal containing a
+    question mark would otherwise be silently corrupted. psycopg also treats a
+    bare `%` as the start of a placeholder, so any literal percent (the LIKE
+    patterns) has to be doubled.
+    """
+    if not IS_PG:
+        return sql
+
+    out, last = [], 0
+    for match in _STRINGS.finditer(sql):
+        out.append(sql[last:match.start()].replace("?", "%s"))
+        out.append(match.group(0).replace("%", "%%"))
+        last = match.end()
+    out.append(sql[last:].replace("?", "%s"))
+    return "".join(out)
+
+
+def _pg_schema(sql: str) -> str:
+    """The DDL with SQLite's identity spelling swapped for the Postgres one.
+
+    Everything else in `_SCHEMA` - TEXT, INTEGER, REFERENCES, ON DELETE CASCADE,
+    UNIQUE, CREATE INDEX IF NOT EXISTS - is already valid in both.
+    """
+    return sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                       "INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY")
 
 
 def archive_incompatible() -> Path | None:
@@ -229,8 +338,60 @@ def _add_missing_columns(conn: sqlite3.Connection) -> list[str]:
     return added
 
 
+def _add_missing_columns_pg(conn) -> list[str]:
+    """The Postgres half of the column migration.
+
+    Same job as `_add_missing_columns`, reading the live shape from
+    information_schema instead of PRAGMA. Postgres will not add a NOT NULL
+    column without a default either, so the same relaxation applies.
+    """
+    added: list[str] = []
+    for table, columns in _expected_shape().items():
+        # Against the search path rather than a hardcoded 'public': the tests run
+        # in their own schema, and hardcoding it made this find no columns at all
+        # and silently skip every migration.
+        present = {
+            r[0] for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = %s "
+                "AND table_schema = ANY(current_schemas(false))", (table,)
+            ).fetchall()
+        }
+        if not present:
+            continue
+        for name, (col_type, notnull, default) in columns.items():
+            if name in present:
+                continue
+            clause = f"{name} {col_type}"
+            if notnull and default is not None:
+                clause += " NOT NULL"
+            if default is not None:
+                clause += f" DEFAULT {default}"
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {clause}")
+            added.append(f"{table}.{name}")
+    return added
+
+
 def init() -> tuple[Path | None, list[str]]:
-    """Prepare the database. Returns (archived legacy file, columns added)."""
+    """Prepare the database. Returns (archived legacy file, columns added).
+
+    The archive step is SQLite-only - it exists to move an incompatible *file*
+    aside, which has no Postgres equivalent.
+    """
+    if IS_PG:
+        if PG_SCHEMA:
+            # On its own connection, before the pool's configure hook tries to
+            # SET search_path to a schema that does not exist yet.
+            import psycopg
+
+            with psycopg.connect(DATABASE_URL, autocommit=True) as boot:
+                boot.execute(f"CREATE SCHEMA IF NOT EXISTS {PG_SCHEMA}")
+        with pool().connection() as conn:
+            conn.execute(_pg_schema(_SCHEMA))
+            added = _add_missing_columns_pg(conn)
+            conn.execute(_INDEXES)
+        return None, added
+
     archived = archive_incompatible()
     with _lock:
         conn = connect()
@@ -267,7 +428,17 @@ def now_str() -> str:
 
 # --- generic helpers --------------------------------------------------------
 
+def _pg_rows(sql: str, params: tuple) -> list[dict]:
+    from psycopg.rows import dict_row
+
+    with pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(translate(sql), params)
+        return cur.fetchall()
+
+
 def query(sql: str, params: Iterable[Any] = ()) -> list[dict]:
+    if IS_PG:
+        return _pg_rows(sql, tuple(params))
     with _lock:
         return [dict(r) for r in connect().execute(sql, tuple(params)).fetchall()]
 
@@ -286,6 +457,10 @@ def execute(sql: str, params: Iterable[Any] = ()) -> int:
     - the dispatcher's claim, above all - would then be wrong in whichever
     direction the stale value happened to point. Use `insert()` for new row ids.
     """
+    if IS_PG:
+        with pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(translate(sql), tuple(params))
+            return cur.rowcount
     with _lock:
         conn = connect()
         cur = conn.execute(sql, tuple(params))
@@ -293,8 +468,29 @@ def execute(sql: str, params: Iterable[Any] = ()) -> int:
         return cur.rowcount
 
 
+_INSERT_TABLE = re.compile(r"INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
+
+
 def insert(sql: str, params: Iterable[Any] = ()) -> int:
-    """Run an INSERT and return the new row's id."""
+    """Run an INSERT and return the new row's id.
+
+    SQLite hands back `lastrowid` for free. Postgres only returns an id if the
+    statement asks for it, and asking on a table that has no `id` column - the
+    settings and suppression upserts - is an error, so the clause is added only
+    for the tables that have one.
+    """
+    if IS_PG:
+        target = _INSERT_TABLE.search(sql)
+        wants_id = bool(target) and target.group(1).lower() in _ID_TABLES
+        statement = translate(sql)
+        if wants_id and "RETURNING" not in statement.upper():
+            statement += " RETURNING id"
+        with pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(statement, tuple(params))
+            if not wants_id:
+                return 0
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
     with _lock:
         conn = connect()
         cur = conn.execute(sql, tuple(params))
@@ -303,9 +499,14 @@ def insert(sql: str, params: Iterable[Any] = ()) -> int:
 
 
 def executemany(sql: str, seq: Iterable[Iterable[Any]]) -> None:
+    rows = [tuple(p) for p in seq]
+    if IS_PG:
+        with pool().connection() as conn, conn.cursor() as cur:
+            cur.executemany(translate(sql), rows)
+        return
     with _lock:
         conn = connect()
-        conn.executemany(sql, [tuple(p) for p in seq])
+        conn.executemany(sql, rows)
         conn.commit()
 
 

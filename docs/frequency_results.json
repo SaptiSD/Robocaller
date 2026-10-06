@@ -1,0 +1,83 @@
+{
+  "generated": "2026-09-27 18:31:20",
+  "cost_per_call": 0.01,
+  "rows": [
+    {
+      "label": "Hourly, bounded to 6 hours",
+      "frequency": "hourly",
+      "window": "6 hours",
+      "recipients": 3,
+      "runs": 6,
+      "calls": 18,
+      "cost": 0.18,
+      "final_state": "finished",
+      "stopped_on_its_own": true
+    },
+    {
+      "label": "Hourly, bounded to 24 hours",
+      "frequency": "hourly",
+      "window": "24 hours",
+      "recipients": 1,
+      "runs": 24,
+      "calls": 24,
+      "cost": 0.24,
+      "final_state": "finished",
+      "stopped_on_its_own": true
+    },
+    {
+      "label": "Daily, bounded to 7 days",
+      "frequency": "daily",
+      "window": "7 days",
+      "recipients": 10,
+      "runs": 7,
+      "calls": 70,
+      "cost": 0.7,
+      "final_state": "finished",
+      "stopped_on_its_own": true
+    },
+    {
+      "label": "Daily, bounded to 30 days",
+      "frequency": "daily",
+      "window": "4.28571 weeks",
+      "recipients": 50,
+      "runs": 30,
+      "calls": 1500,
+      "cost": 15.0,
+      "final_state": "finished",
+      "stopped_on_its_own": true
+    },
+    {
+      "label": "Weekly, bounded to 8 weeks",
+      "frequency": "weekly",
+      "window": "8 weeks",
+      "recipients": 25,
+      "runs": 8,
+      "calls": 200,
+      "cost": 2.0,
+      "final_state": "finished",
+      "stopped_on_its_own": true
+    },
+    {
+      "label": "Once",
+      "frequency": "once",
+      "window": "open-ended",
+      "recipients": 10,
+      "runs": 1,
+      "calls": 10,
+      "cost": 0.1,
+      "final_state": "finished",
+      "stopped_on_its_own": true
+    },
+    {
+      "label": "Daily, NO end date (30 days shown)",
+      "frequency": "daily",
+      "window": "open-ended",
+      "recipients": 50,
+      "runs": 34,
+      "calls": 1700,
+      "cost": 17.0,
+      "final_state": "active",
+      "stopped_on_its_own": false
+    }
+  ]
+}

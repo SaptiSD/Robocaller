@@ -79,26 +79,50 @@ def compute_next_run(campaign: dict, after: datetime) -> datetime | None:
 
     Daily and weekly runs are anchored to a wall-clock time in the campaign's
     own timezone, so a 10:00 campaign stays at 10:00 across a DST change.
+
+    Returns None when there is no next run, which is what retires a campaign:
+    either it was a one-off, or the next occurrence would fall past `ends_at`.
+    """
+    candidate = _raw_next_run(campaign, after)
+    if candidate is None:
+        return None
+    ends_at = db.from_utc(campaign.get("ends_at"))
+    if ends_at and candidate > ends_at:
+        return None
+    return candidate
+
+
+def _raw_next_run(campaign: dict, after: datetime,
+                  inclusive: bool = False) -> datetime | None:
+    """The next occurrence by frequency alone, ignoring the campaign's window.
+
+    `inclusive` allows the occurrence to land exactly on `after`. Recurrence
+    needs the strict form - the next run must be after the one just fired - but
+    the *first* run does not: a campaign set to begin Monday 10:00 with a daily
+    10:00 slot should fire that Monday, not wait until Tuesday.
     """
     frequency = (campaign.get("frequency") or "once").lower()
     if frequency == "once":
         return None
     if frequency == "hourly":
-        return after + timedelta(hours=1)
+        return after if inclusive else after + timedelta(hours=1)
 
     tz = _zone(campaign.get("timezone"))
     local = after.astimezone(tz)
     hour, minute = parse_hhmm(campaign.get("call_time"))
     candidate = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
+    def too_early(moment: datetime) -> bool:
+        return moment < local if inclusive else moment <= local
+
     if frequency == "daily":
-        if candidate <= local:
+        if too_early(candidate):
             candidate += timedelta(days=1)
     elif frequency == "weekly":
         target = int(campaign.get("weekday") or 0)  # 0 = Monday
         delta = (target - candidate.weekday()) % 7
         candidate += timedelta(days=delta)
-        if candidate <= local:
+        if too_early(candidate):
             candidate += timedelta(days=7)
     else:
         return None
@@ -106,15 +130,37 @@ def compute_next_run(campaign: dict, after: datetime) -> datetime | None:
     return candidate.astimezone(after.tzinfo)
 
 
-def first_run_at(campaign: dict, start_now: bool, now: datetime) -> datetime:
-    """When a freshly saved campaign should first fire."""
+def first_run_at(campaign: dict, start_now: bool, now: datetime) -> datetime | None:
+    """When a freshly saved campaign should first fire.
+
+    Returns None when it never should - an end timestamp already in the past,
+    or one that falls before the first occurrence would come round.
+    """
+    starts_at = db.from_utc(campaign.get("starts_at"))
+    ends_at = db.from_utc(campaign.get("ends_at"))
+    if ends_at and ends_at <= now:
+        return None
+
+    # A start in the future moves the clock forward: the first run is worked out
+    # from that moment, not from now, so "daily at 10:00 beginning Monday" waits
+    # for Monday rather than firing at 10:00 tomorrow.
+    anchor = max(now, starts_at) if starts_at else now
+    # A start date names a moment the operator chose, so a slot landing exactly
+    # on it counts. Without `inclusive` a campaign set to begin Monday 10:00
+    # with a daily 10:00 slot would quietly skip Monday and start on Tuesday.
+    on_the_mark = bool(starts_at) and anchor == starts_at
     if start_now:
-        return now
-    if (campaign.get("frequency") or "once").lower() == "once":
+        first = anchor
+    elif (campaign.get("frequency") or "once").lower() == "once":
         # A one-off with a time set waits for that time today, else tomorrow.
-        upcoming = compute_next_run({**campaign, "frequency": "daily"}, now)
-        return upcoming or now
-    return compute_next_run(campaign, now) or now
+        first = _raw_next_run({**campaign, "frequency": "daily"}, anchor,
+                              inclusive=on_the_mark) or anchor
+    else:
+        first = _raw_next_run(campaign, anchor, inclusive=on_the_mark) or anchor
+
+    if ends_at and first > ends_at:
+        return None
+    return first
 
 
 # --- queueing ---------------------------------------------------------------
@@ -192,10 +238,25 @@ def enqueue_single(phone: str, script: str = "", voice: str = "") -> int:
 
 def materialize_due_campaigns(now: datetime | None = None) -> int:
     now = now or db.utcnow()
+    stamp = db.to_utc(now)
+
+    # Retire anything past its end timestamp before looking for work. The end
+    # can be edited after the fact, so this cannot be left to compute_next_run
+    # alone - a campaign whose window was shortened still has a next_run_at
+    # sitting in the table, and without this sweep it would fire once more.
+    db.execute(
+        "UPDATE campaigns SET state = 'finished', next_run_at = NULL "
+        "WHERE state = 'active' AND ends_at IS NOT NULL AND ends_at <= ?",
+        (stamp,),
+    )
+
     due = db.query(
         "SELECT * FROM campaigns WHERE state = 'active' "
-        "AND next_run_at IS NOT NULL AND next_run_at <= ?",
-        (db.to_utc(now),),
+        "AND next_run_at IS NOT NULL AND next_run_at <= ? "
+        # Belt and braces: next_run_at is already set past starts_at, but a
+        # hand-edited row must not be able to dial before the window opens.
+        "AND (starts_at IS NULL OR starts_at <= ?)",
+        (stamp, stamp),
     )
     for campaign in due:
         enqueue_campaign(campaign["id"], now)

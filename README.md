@@ -25,7 +25,7 @@ is Phase 3, and it is a different architecture (see *Roadmap*).
 | **Voice** | **AWS Polly** neural voices through Telnyx, with Telnyx's own engines as the cheaper option | Polly does not sound like a 2005 IVR. |
 | **Script writer** | **Claude** (`anthropic`), optional | Drafts a compliant script from a one-line brief. Everything else works without it. |
 | **Reports** | **ReportLab** | The PDFs in `docs/` are generated from code, so they can be rebuilt. |
-| **Tests** | Two plain Python scripts, no framework | 260 checks against a fake Telnyx. No credentials, no real calls, no cost. |
+| **Tests** | Two plain Python scripts, no framework | 283 checks against a fake Telnyx. No credentials, no real calls, no cost. |
 
 Dependencies are deliberately few: FastAPI, uvicorn, httpx, pydantic and
 python-dotenv, plus `anthropic` and `reportlab` for the two optional pieces.
@@ -46,13 +46,13 @@ Verify the whole engine without touching Telnyx:
 python smoke_test.py && python pressure_test.py
 ```
 
-**260 checks against a fake Telnyx.** No credentials, no real calls, no cost.
+**283 checks against a fake Telnyx.** No credentials, no real calls, no cost.
 
 `smoke_test.py` (75) walks the happy path: phone parsing, timezone resolution,
 calling windows, schedule arithmetic across a DST change, consent and
 do-not-call screening, pacing, and the HTTP API.
 
-`pressure_test.py` (185) tries to break it: eight threads racing the same queue,
+`pressure_test.py` (208) tries to break it: eight threads racing the same queue,
 the exact parameter names sent to Telnyx's TeXML endpoint, every failure that
 strands a first-run account (bad API key, wrong application ID, empty balance,
 missing outbound voice profile), forged and replayed Ed25519 webhook signatures,
@@ -199,6 +199,35 @@ thousand rows is not ten thousand simultaneous calls.
 
 ---
 
+## Scheduling a campaign
+
+A campaign fires **once**, **hourly**, **daily** or **weekly**, at a chosen time
+of day, inside an optional window:
+
+| Field | Effect |
+|---|---|
+| **Begins** | Nothing is dialled before this. Blank = start at the first scheduled slot. A slot landing exactly on the start counts, so "begins Monday 10:00, daily at 10:00" fires that Monday. |
+| **Ends** | The campaign retires itself once the next run would fall past this. Blank = **it never stops on its own**. |
+
+Both are entered in the campaign's own timezone (the same one the time of day
+uses) and stored in UTC. A window whose end has already passed, or that leaves no
+room for a single run, is refused at creation rather than saved as a campaign
+that can never fire.
+
+**Set an end date on anything recurring.** A daily campaign to 50 people is about
+$15 over 30 days; with no end date that same campaign has no upper bound at all.
+The form warns when you leave it blank. Verify the arithmetic and see the costs
+for a range of schedules:
+
+```bash
+python docs/frequency_check.py
+```
+
+That drives the real dispatcher on a simulated clock — no calls, no cost — and
+writes the table that appears in the project report.
+
+---
+
 ## The dispatch queue
 
 A campaign firing does not immediately place N calls. It writes N rows into
@@ -300,8 +329,8 @@ callbacks — the three things direct mode cannot do.
 | `config.py` | Settings resolution (database over environment) |
 | `web/` | The dashboard — plain HTML/CSS/JS, no build step |
 | `smoke_test.py` | 75 happy-path checks against a fake Telnyx |
-| `pressure_test.py` | 185 adversarial checks - concurrency, Telnyx errors, forged webhooks |
-| `docs/` | Generated PDF reports and the code that builds them |
+| `pressure_test.py` | 208 adversarial checks - concurrency, Telnyx errors, forged webhooks |
+| `docs/` | Generated PDF reports and the code that builds them, plus `frequency_check.py` and `capture_screens.py` |
 | `_legacy_streamlit/` | The previous Streamlit prototype, kept for reference |
 
 **The reports in `docs/` are generated**, so they can be rebuilt rather than
@@ -317,6 +346,7 @@ Pass a name to build a different one:
 | Command | Output | What it is |
 |---|---|---|
 | `build_report.py` | `RoboCall-AI-Project-Report.pdf` | What the project is, how it's built, where it stands |
+| `build_report.py brief` | `RoboCall-AI-Requirements-Check.pdf` | Every item in the brief, mapped to where it lives |
 | `build_report.py guide` | `RoboCall-AI-User-Guide.pdf` | How to use the dashboard, field by field |
 | `build_report.py compliance` | `RoboCall-AI-Compliance-Briefing.pdf` | US telemarketing law, and which parts the app handles |
 | `build_report.py carrier` | `RoboCall-AI-Status-Report.pdf` | The Sept 14 evaluation that chose Telnyx over Twilio |

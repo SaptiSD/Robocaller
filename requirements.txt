@@ -7,3 +7,6 @@ pydantic>=2.7
 
 # Optional - only needed for the "Draft with AI" button.
 anthropic>=1.0
+
+# Optional - only needed to run against Postgres/Supabase instead of SQLite.
+psycopg[binary,pool]>=3.2

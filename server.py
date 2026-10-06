@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -72,6 +73,8 @@ class CampaignIn(BaseModel):
     timezone: str = "America/New_York"
     amd: str = "voicemail"
     require_consent: bool = True
+    starts_at: str = ""
+    ends_at: str = ""
     start_now: bool = False
     contacts: str = ""
     contacts_consented: bool = False
@@ -87,6 +90,8 @@ class CampaignPatch(BaseModel):
     timezone: str | None = None
     amd: str | None = None
     require_consent: bool | None = None
+    starts_at: str | None = None
+    ends_at: str | None = None
     state: str | None = None
 
 
@@ -164,9 +169,9 @@ def campaign_row(row: dict) -> dict:
     ) or {}
     stats = db.query_one(
         "SELECT COUNT(*) AS total, "
-        "SUM(state = 'done' AND status = 'completed') AS completed, "
-        "SUM(state IN ('pending', 'deferred')) AS waiting, "
-        "SUM(state = 'dialing') AS in_flight "
+        "SUM(CASE WHEN state = 'done' AND status = 'completed' THEN 1 ELSE 0 END) AS completed, "
+        "SUM(CASE WHEN state IN ('pending', 'deferred') THEN 1 ELSE 0 END) AS waiting, "
+        "SUM(CASE WHEN state = 'dialing' THEN 1 ELSE 0 END) AS in_flight "
         "FROM call_tasks WHERE campaign_id = ?",
         (row["id"],),
     ) or {}
@@ -179,6 +184,32 @@ def campaign_row(row: dict) -> dict:
         "calls_waiting": stats.get("waiting") or 0,
         "calls_in_flight": stats.get("in_flight") or 0,
     }
+
+
+def _campaign_moment(raw: str, label: str, tz_name: str = "UTC") -> str | None:
+    """Parse a `datetime-local` value into the stored UTC string, or None.
+
+    The browser sends wall-clock text with no offset ("2026-10-05T16:00"), and
+    it is read in the campaign's own timezone - the same one `call_time` uses.
+    Interpreting it as UTC instead would silently shift every window by the
+    operator's offset, which is the kind of bug that only shows up as calls
+    going out at the wrong hour.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    text = text.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            naive = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        try:
+            zone = ZoneInfo(tz_name)
+        except Exception:  # noqa: BLE001 - an unknown zone is reported elsewhere
+            zone = timezone.utc
+        return db.to_utc(naive.replace(tzinfo=zone))
+    raise HTTPException(400, f"{label} timestamp must look like 2026-10-05 16:00.")
 
 
 def require_campaign(campaign_id: int) -> dict:
@@ -217,13 +248,13 @@ def overview() -> dict:
     today = db.to_utc(db.utcnow() - timedelta(hours=24))
     totals = db.query_one(
         "SELECT COUNT(*) AS total, "
-        "SUM(state = 'done' AND status = 'completed') AS completed, "
-        "SUM(state = 'done' AND status IN ('busy', 'no-answer')) AS unanswered, "
-        "SUM(state = 'done' AND status IN ('failed', 'canceled', 'unknown')) AS failed, "
-        "SUM(state IN ('pending', 'deferred')) AS waiting, "
-        "SUM(state = 'dialing') AS in_flight, "
-        "SUM(state = 'skipped') AS skipped, "
-        "SUM(answered_by LIKE 'machine%') AS voicemail "
+        "SUM(CASE WHEN state = 'done' AND status = 'completed' THEN 1 ELSE 0 END) AS completed, "
+        "SUM(CASE WHEN state = 'done' AND status IN ('busy', 'no-answer') THEN 1 ELSE 0 END) AS unanswered, "
+        "SUM(CASE WHEN state = 'done' AND status IN ('failed', 'canceled', 'unknown') THEN 1 ELSE 0 END) AS failed, "
+        "SUM(CASE WHEN state IN ('pending', 'deferred') THEN 1 ELSE 0 END) AS waiting, "
+        "SUM(CASE WHEN state = 'dialing' THEN 1 ELSE 0 END) AS in_flight, "
+        "SUM(CASE WHEN state = 'skipped' THEN 1 ELSE 0 END) AS skipped, "
+        "SUM(CASE WHEN answered_by LIKE 'machine%' THEN 1 ELSE 0 END) AS voicemail "
         "FROM call_tasks"
     ) or {}
     last_day = db.query_one(
@@ -231,7 +262,7 @@ def overview() -> dict:
         (today,),
     ) or {}
     campaigns = db.query_one(
-        "SELECT SUM(state = 'active') AS active, COUNT(*) AS total FROM campaigns"
+        "SELECT SUM(CASE WHEN state = 'active' THEN 1 ELSE 0 END) AS active, COUNT(*) AS total FROM campaigns"
     ) or {}
     upcoming = db.query(
         "SELECT id, name, next_run_at, frequency, timezone FROM campaigns "
@@ -278,17 +309,29 @@ def create_campaign(body: CampaignIn) -> dict:
     if not 0 <= body.weekday <= 6:
         raise HTTPException(400, "Weekday must be 0 (Monday) through 6 (Sunday).")
 
+    starts_at = _campaign_moment(body.starts_at, "Start", body.timezone)
+    ends_at = _campaign_moment(body.ends_at, "End", body.timezone)
+    if starts_at and ends_at and ends_at <= starts_at:
+        raise HTTPException(400, "The end timestamp must be after the start timestamp.")
+
     now = db.utcnow()
-    payload = body.model_dump()
+    payload = {**body.model_dump(), "starts_at": starts_at, "ends_at": ends_at}
+    first = dispatcher.first_run_at(payload, body.start_now, now)
+    if ends_at and first is None:
+        raise HTTPException(
+            400,
+            "That end timestamp leaves no room for a single call - it has already "
+            "passed, or it falls before the first run would come round.",
+        )
     campaign_id = db.insert(
         "INSERT INTO campaigns (name, message, voice, frequency, call_time, weekday, "
-        "timezone, state, amd, require_consent, created_at, next_run_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+        "timezone, state, amd, require_consent, created_at, starts_at, ends_at, "
+        "next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
         (
             body.name.strip(), body.message.strip(), body.voice, body.frequency,
             body.call_time, body.weekday, body.timezone, body.amd,
             1 if body.require_consent else 0, db.to_utc(now),
-            db.to_utc(dispatcher.first_run_at(payload, body.start_now, now)),
+            starts_at, ends_at, db.to_utc(first) if first else None,
         ),
     )
 
@@ -326,6 +369,18 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
         raise HTTPException(400, f"'{fields['call_time']}' is not a valid time of day (HH:MM).")
     if "weekday" in fields and not 0 <= fields["weekday"] <= 6:
         raise HTTPException(400, "Weekday must be 0 (Monday) through 6 (Sunday).")
+    # An empty string here means "clear the window", which is distinct from the
+    # field being absent - model_dump() already dropped the absent ones as None.
+    zone = fields.get("timezone", campaign["timezone"])
+    for key, label in (("starts_at", "Start"), ("ends_at", "End")):
+        if key in fields:
+            fields[key] = _campaign_moment(fields[key], label, zone)
+    window = {
+        "starts_at": fields.get("starts_at", campaign["starts_at"]),
+        "ends_at": fields.get("ends_at", campaign["ends_at"]),
+    }
+    if window["starts_at"] and window["ends_at"] and window["ends_at"] <= window["starts_at"]:
+        raise HTTPException(400, "The end timestamp must be after the start timestamp.")
     if "message" in fields:
         problems = compliance.validate_script(fields["message"])
         if problems:
@@ -337,7 +392,8 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
     # A schedule change (or a resume) needs the next run recomputed.
     updated = require_campaign(campaign_id)
     if updated["state"] == "active" and (
-        {"frequency", "call_time", "weekday", "timezone", "state"} & fields.keys()
+        {"frequency", "call_time", "weekday", "timezone", "state",
+         "starts_at", "ends_at"} & fields.keys()
     ):
         now = db.utcnow()
         next_run = dispatcher.compute_next_run(updated, now)

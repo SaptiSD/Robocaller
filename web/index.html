@@ -244,6 +244,24 @@ Telnyx bills each call against your account balance.
               <select id="c-timezone"></select>
             </div>
           </div>
+          <div class="field-row" id="wrap-window">
+            <div class="field">
+              <label for="c-starts-at">Begins</label>
+              <input type="datetime-local" id="c-starts-at">
+              <span class="hint" style="display:block">Optional. Nothing is dialled before this. Blank = as soon as the first slot comes round.</span>
+            </div>
+            <div class="field">
+              <label for="c-ends-at">Ends</label>
+              <input type="datetime-local" id="c-ends-at">
+              <span class="hint" style="display:block">Optional but recommended. Blank = repeats until you pause it.</span>
+            </div>
+          </div>
+          <div class="banner warn hidden" id="window-warning">
+            <span>&#9888;</span>
+            <span>This campaign has <b>no end date</b>, so it will keep calling
+              &mdash; and keep billing &mdash; every
+              <span id="window-warning-freq">day</span> until you pause it.</span>
+          </div>
           <div class="field" style="margin-bottom:0">
             <label class="check">
               <input type="checkbox" id="c-start-now">

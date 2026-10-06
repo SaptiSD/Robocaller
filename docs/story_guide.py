@@ -185,6 +185,31 @@ def build_story(ctx):
         "It is a separate thing from the calling window, which is enforced per recipient in "
         "<i>their</i> timezone. A campaign that fires at 08:00 Eastern will still hold its "
         "California numbers until the window opens there."))
+    s.append(P(
+        "<b>Begins</b> and <b>Ends</b> bound the whole campaign. Both are optional and both are "
+        "read in the schedule timezone you picked, so <i>5 October, 16:00</i> means 16:00 there, "
+        "not 16:00 UTC."))
+    s.append(table([
+        ["Field", "What it does"],
+        ["<b>Begins</b>",
+         "Nothing is dialled before this moment. Leave it blank and the campaign starts at its "
+         "first scheduled slot. This is how you set something up on Tuesday that should not call "
+         "anyone until Monday."],
+        ["<b>Ends</b>",
+         "The campaign retires itself once the next run would fall past this. Leave it blank and a "
+         "recurring campaign <b>never stops on its own</b> &mdash; it keeps calling, and keeps "
+         "billing, until you pause it. The form warns you when you leave it empty."],
+    ], [0.85 * inch, BODY_W - 0.85 * inch]))
+    s.append(Spacer(1, 5))
+    s.append(callout(
+        "<b>Set an end date.</b> A daily campaign to 50 people costs about $15 over 30 days. With "
+        "no end date that same campaign has no upper bound at all &mdash; it just keeps going. The "
+        "$2/day cap on your Telnyx profile will eventually stop it, but by running out of money, "
+        "which is a bad way to find out.", border=BAD))
+    s.append(P(
+        "A campaign whose end has already passed, or whose end falls before its first slot could "
+        "come round, is rejected when you save it rather than created as something that can never "
+        "fire.", "caption"))
 
     # ---------------- 5 ----------------
     s.append(P("5 &nbsp; Watching it run", "h1"))
@@ -273,7 +298,7 @@ def build_story(ctx):
     s.append(Spacer(1, 8))
     s.append(callout(
         "<b>Verify without spending anything.</b> <i>python smoke_test.py</i> and <i>python "
-        "pressure_test.py</i> run 260 checks against a fake carrier in about a second. They need no "
+        "pressure_test.py</i> run 283 checks against a fake carrier in about a second. They need no "
         "credentials and place no calls, so there is never a reason not to run them after a "
         "change.", border=GOOD))
 

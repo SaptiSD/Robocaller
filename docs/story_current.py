@@ -6,8 +6,22 @@ is read later. Rebuild with `python docs/build_report.py`.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from reportlab.lib.units import inch
 from reportlab.platypus import Spacer
+
+# Written by docs/frequency_check.py. Loaded rather than hard-coded so the
+# scheduling table in section 5 is evidence that can be regenerated, not prose
+# that quietly goes stale the next time the scheduler changes.
+_RESULTS = Path(__file__).resolve().parent / "frequency_results.json"
+try:
+    _DATA = json.loads(_RESULTS.read_text(encoding="utf-8"))
+    FREQ_ROWS = _DATA["rows"]
+    COST_PER_CALL = _DATA["cost_per_call"]
+except (OSError, ValueError, KeyError):
+    FREQ_ROWS, COST_PER_CALL = [], 0.01
 
 
 def build_story(ctx):
@@ -24,14 +38,14 @@ def build_story(ctx):
     s.append(Spacer(1, 4))
     s.append(P("24 September 2026 &nbsp;&#183;&nbsp; Phase 1: <b>complete</b> "
                "&nbsp;&#183;&nbsp; Carrier: <b>Telnyx, funded and live</b> "
-               "&nbsp;&#183;&nbsp; Automated checks: <b>260 passing</b>", "meta"))
+               "&nbsp;&#183;&nbsp; Automated checks: <b>283 passing</b>", "meta"))
     s.append(rule(6, 11))
 
     s.append(callout(
         "<b>Summary.</b> Phase 1 is finished and proven end to end. The application dials through "
         "<b>Telnyx</b>, and on 24 September a real handset rang and heard the script read aloud in "
         "a neural voice. The migration off Twilio is complete: no Twilio code, credentials or "
-        "dependency remains in the running system. <b>260 automated checks pass</b> against a fake "
+        "dependency remains in the running system. <b>283 automated checks pass</b> against a fake "
         "carrier, and the first live call exposed a genuine defect that the test suite could not "
         "have caught on its own &mdash; now fixed and covered. Total spend to date is "
         "<b>$1.24</b>, against a balance of $8.76.", border=GOOD))
@@ -178,7 +192,62 @@ def build_story(ctx):
         "new assertions pin all of it down."))
 
     # ---------------- 5. verification ----------------
-    s.append(P("5 &nbsp; How much of this is verified", "h1"))
+    s.append(P("5 &nbsp; Scheduling: frequency, windows, and what they cost", "h1"))
+    s.append(P(
+        "A campaign fires on a frequency &mdash; <b>once</b>, <b>hourly</b>, <b>daily</b> or "
+        "<b>weekly</b> &mdash; at a chosen time of day, inside an optional window with a "
+        "<b>begins</b> and an <b>ends</b> timestamp. Both are read in the campaign's own timezone, "
+        "the same one the time of day uses, and stored in UTC."))
+    s.append(P(
+        "The end timestamp is the one that matters. Without it a recurring campaign has no stopping "
+        "condition: it keeps dialling and keeps billing until somebody remembers to pause it. The "
+        "table below is the evidence that it does stop &mdash; and the last row is what happens "
+        "when it is left blank."))
+
+    s.append(Spacer(1, 4))
+    s.append(P("Verified by simulation", "h2"))
+    s.append(P(
+        "Each scenario is driven through the <b>real dispatcher</b> against a scratch database and "
+        "a stand-in carrier, on a simulated clock. The counts are the counts the live engine would "
+        "produce, because it is the live engine producing them. Verifying a weekly campaign against "
+        "a real clock would take two months, and an hourly one would bill for every tick."))
+
+    if FREQ_ROWS:
+        rows = [["Scenario", "Runs", "Calls", "Cost", "Stops by itself"]]
+        for r in FREQ_ROWS:
+            mark = ("<b>yes</b>" if r["stopped_on_its_own"]
+                    else "<b>no &mdash; runs forever</b>")
+            rows.append([r["label"], str(r["runs"]), str(r["calls"]),
+                         f"${r['cost']:.2f}", mark])
+        s.append(table(rows, [2.35 * inch, 0.52 * inch, 0.58 * inch,
+                              0.62 * inch, BODY_W - 4.07 * inch]))
+        s.append(P(
+            f"Reproduce with <i>python docs/frequency_check.py</i>. Priced at "
+            f"<b>${COST_PER_CALL:.2f} per call</b> &mdash; measured, not quoted: the account "
+            "balance moved from $8.77 to $8.76 across a real 21-second delivered call.",
+            "caption"))
+    else:
+        s.append(callout(
+            "No results file found. Run <i>python docs/frequency_check.py</i> and rebuild this "
+            "report to populate the table.", border=BAD))
+
+    s.append(Spacer(1, 6))
+    s.append(callout(
+        "<b>Read the last two rows together.</b> The same daily campaign to the same 50 people "
+        "costs <b>$15</b> bounded to 30 days, and has <i>no upper bound at all</i> without an end "
+        "date &mdash; it simply keeps going. That is the entire argument for the field. The "
+        "$2.00/day cap on the Telnyx profile is the backstop, but a cap stops a campaign by "
+        "running out of money, which is a worse way to find out.", border=BAD))
+
+    s.append(Spacer(1, 4))
+    s.append(P(
+        "Nineteen further checks in the test suite cover the boundaries the table cannot show: an "
+        "end date moved into the past retiring a campaign on the spot, a start date deferring the "
+        "first run, an end that falls before the first slot being refused at creation rather than "
+        "producing a campaign that can never fire, and a window entered as 10:00 New York being "
+        "stored as 15:00 UTC rather than shifted by the operator's own offset."))
+
+    s.append(P("6 &nbsp; How much of this is verified", "h1"))
     s.append(P(
         "Two plain Python scripts, no test framework. They run against a fake Telnyx in about a "
         "second, need no credentials and cost nothing, so there is no reason not to run them."))
@@ -188,12 +257,12 @@ def build_story(ctx):
          "The happy path: phone parsing, timezone resolution from area code, calling windows, "
          "schedule arithmetic across a daylight-saving change, consent and do-not-call screening, "
          "pacing, and the HTTP API end to end."],
-        ["<b>pressure_test.py</b>", "185",
+        ["<b>pressure_test.py</b>", "208",
          "Deliberate abuse: eight threads racing the same queue, the exact parameter names sent to "
          "Telnyx, every failure that strands a first-run account, forged and replayed Ed25519 "
          "webhook signatures, a provider that throws mid-dial, schema drift from an older "
-         "database, malformed numbers and times, TeXML injection, every API rejection path, and directory-traversal attempts against the document viewer."],
-        ["<b>Total</b>", "<b>260</b>", "<b>All passing.</b>"],
+         "database, malformed numbers and times, TeXML injection, every API rejection path, directory-traversal attempts against the document viewer, and the campaign start/end window."],
+        ["<b>Total</b>", "<b>283</b>", "<b>All passing.</b>"],
     ], [1.30 * inch, 0.70 * inch, BODY_W - 2.0 * inch]))
 
     s.append(Spacer(1, 7))
@@ -204,7 +273,7 @@ def build_story(ctx):
         "call filled."))
 
     # ---------------- 6. money ----------------
-    s.append(P("6 &nbsp; Cost position and spending controls", "h1"))
+    s.append(P("7 &nbsp; Cost position and spending controls", "h1"))
     s.append(table([
         ["Item", "Amount", "Note"],
         ["Phone number", "$1.00 once, then $1.00/month",
@@ -229,7 +298,7 @@ def build_story(ctx):
     ]))
 
     # ---------------- 7. limits ----------------
-    s.append(P("7 &nbsp; What is deliberately not done yet", "h1"))
+    s.append(P("8 &nbsp; What is deliberately not done yet", "h1"))
     s.append(P(
         "Direct mode is what makes the app runnable on a laptop, and it is genuinely limited. "
         "Setting a public base URL switches the whole system to webhook mode and unlocks the rest; "
@@ -254,7 +323,7 @@ def build_story(ctx):
         "document is the play-and-read system underneath it."))
 
     # ---------------- 8. next ----------------
-    s.append(P("8 &nbsp; Sensible next steps", "h1"))
+    s.append(P("9 &nbsp; Sensible next steps", "h1"))
     s.extend(bullets([
         "<b>Run a small real campaign</b> &mdash; five or ten consenting numbers &mdash; to "
         "exercise pacing, the calling window and the call log against real carrier behaviour "
