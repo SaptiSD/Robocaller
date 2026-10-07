@@ -401,15 +401,22 @@ def _enable_rls(conn) -> None:
             pass
 
 
-def describe() -> str:
-    """Where the data lives, for the startup log. Never includes credentials."""
+def where() -> dict:
+    """Where the data lives, for the startup log and Settings. Never credentials."""
     if IS_PG:
         from psycopg.conninfo import conninfo_to_dict
 
         info = conninfo_to_dict(DATABASE_URL)
-        return (f"Postgres {info.get('host', '?')}/{info.get('dbname', '?')}, "
-                f"schema {PG_SCHEMA or 'public'}")
-    return f"SQLite {DB_PATH}"
+        return {"backend": "postgres", "host": info.get("host", "?"),
+                "dbname": info.get("dbname", "?"), "schema": PG_SCHEMA or "public"}
+    return {"backend": "sqlite", "path": str(DB_PATH)}
+
+
+def describe() -> str:
+    w = where()
+    if w["backend"] == "postgres":
+        return f"Postgres {w['host']}/{w['dbname']}, schema {w['schema']}"
+    return f"SQLite {w['path']}"
 
 
 def init() -> tuple[Path | None, list[str]]:

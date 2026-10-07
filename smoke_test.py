@@ -432,6 +432,10 @@ def test_api() -> None:
         res = client.get("/api/settings")
         check("secrets are never sent to the browser",
               res.json()["settings"].get("telnyx_api_key") == "")
+        check("settings report which database is in use",
+              res.json()["database"]["backend"] == ("postgres" if db.IS_PG else "sqlite"))
+        check("the database location never includes the connection string",
+              "postgresql://" not in res.text and (not db.IS_PG or db.DATABASE_URL not in res.text))
 
         res = client.delete(f"/api/campaigns/{campaign_id}")
         check("a campaign can be deleted", res.status_code == 200)

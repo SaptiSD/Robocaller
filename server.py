@@ -582,7 +582,7 @@ def get_settings() -> dict:
         "frequencies": list(db.FREQUENCIES),
         "amd_modes": list(telephony.AMD_MODES),
         "timezones": list(dispatcher.KNOWN_TIMEZONES),
-        "db_path": str(db.DB_PATH),
+        "database": db.where(),
         "script_ai": scriptwriter.available(),
     }
 

@@ -490,9 +490,14 @@ async function loadSettings() {
   $("#s-base-url").value = data.settings.public_base_url || "";
   $("#s-anthropic").placeholder = data.settings.anthropic_api_key_set
     ? "saved — leave blank to keep it" : "sk-ant-...";
-  $("#db-path").innerHTML =
-    `<code>${esc(data.db_path)}</code><br>Deliberately outside this project folder &mdash;
-     Dropbox overwrites a live SQLite file and destroys it.`;
+  const store = data.database;
+  $("#db-path").innerHTML = store.backend === "postgres"
+    ? `Postgres &mdash; <code>${esc(store.host)}/${esc(store.dbname)}</code>,
+       schema <code>${esc(store.schema)}</code><br>A hosted database: campaigns, contacts and
+       call history survive restarts and redeploys.`
+    : `SQLite file &mdash; <code>${esc(store.path)}</code><br>Deliberately outside this project
+       folder &mdash; Dropbox overwrites a live SQLite file and destroys it. On a host like Render
+       this file is wiped on every redeploy; set <code>DATABASE_URL</code> to use Postgres instead.`;
 
   $("#mode-status").innerHTML = data.settings.delivery_mode === "webhook"
     ? `<div class="banner ok"><span>&#10003;</span><span><b>Webhook mode.</b>
