@@ -301,13 +301,10 @@ Railway and Fly.io all do, and all have a free tier.
 
 Two things must be settled before this is on a public URL:
 
-1. **Set `APP_PASSWORD`.** Without it every route is open, and anyone who finds
-   the URL can queue calls against your Telnyx balance and read your contact
-   lists. With it, the browser asks for a username (`admin`, or `APP_USERNAME`)
-   and that password before anything loads. The Telnyx webhooks and `/healthz`
-   stay open - Telnyx can't sign in, and its webhooks are already gated by a
-   per-call token and signature. The server logs a warning at startup if the
-   password is missing.
+1. **There is no authentication.** Every route is open. Anyone who finds the URL
+   can queue calls against your Telnyx balance and read your contact lists. On
+   `localhost` that is fine; on the internet it is not. This needs to be added
+   before the first public deploy.
 2. **SQLite on an ephemeral filesystem is lost on every redeploy.** Free tiers on
    Render and Fly.io reset the disk when the container restarts. Either attach a
    persistent volume and point `ROBOCALL_DB` at it, or move to Postgres.

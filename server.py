@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import base64
 import csv
-import hmac
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -53,9 +51,6 @@ async def lifespan(app: FastAPI):
             "An older prototype's database was at that path. It has been moved to "
             "%s and a fresh one created.", archived,
         )
-    if not os.getenv("APP_PASSWORD"):
-        log.warning("APP_PASSWORD is not set: the dashboard and API are open to anyone "
-                    "who can reach this server. Set it before exposing it publicly.")
     _engine = dispatcher.Dispatcher()
     _engine.start()
     yield
@@ -64,52 +59,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RoboCall AI", lifespan=lifespan)
-
-
-# --- access control ---------------------------------------------------------
-
-# Paths that must answer without the password. Telnyx can't sign in - its
-# webhooks are gated by the per-call token and signature check below instead -
-# and an uptime pinger only needs to know the process is alive.
-_OPEN_PATHS = {"/healthz"}
-_OPEN_PREFIXES = ("/telnyx/",)
-
-
-def _credentials_ok(header: str, password: str) -> bool:
-    scheme, _, encoded = header.partition(" ")
-    if scheme.lower() != "basic":
-        return False
-    try:
-        user, _, given = base64.b64decode(encoded).decode("utf-8").partition(":")
-    except (ValueError, UnicodeDecodeError):
-        return False
-    expected_user = os.getenv("APP_USERNAME") or "admin"
-    # Both compared in constant time, and both always compared, so the response
-    # time doesn't reveal which half was wrong.
-    user_ok = hmac.compare_digest(user.encode(), expected_user.encode())
-    password_ok = hmac.compare_digest(given.encode(), password.encode())
-    return user_ok and password_ok
-
-
-@app.middleware("http")
-async def require_password(request: Request, call_next):
-    """HTTP Basic auth over everything, when APP_PASSWORD is set.
-
-    Read from the environment only, never from the settings table: Settings is
-    edited through this same API, so a password stored there could be changed by
-    anyone the password was meant to keep out. Unset means open, which is fine
-    on localhost and logged loudly at startup.
-    """
-    password = os.getenv("APP_PASSWORD", "")
-    path = request.url.path
-    if (not password or path in _OPEN_PATHS or path.startswith(_OPEN_PREFIXES)
-            or _credentials_ok(request.headers.get("authorization", ""), password)):
-        return await call_next(request)
-    return PlainTextResponse(
-        "Sign in required.",
-        status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="RoboCall AI", charset="UTF-8"'},
-    )
 
 
 @app.get("/healthz", include_in_schema=False)
