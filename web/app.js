@@ -430,16 +430,21 @@ function callsTable(rows, withCampaign = true) {
       <th>When</th>${withCampaign ? "<th>Campaign</th>" : ""}<th>Number</th>
       <th>Status</th><th>Length</th><th>Telnyx SID</th><th>Detail</th>
     </tr></thead>
-    <tbody>${rows.map((r) => `
+    <tbody>${rows.map((r) => {
+      // A missing name means either a test call (never had a campaign) or a
+      // campaign deleted since - the id is what tells the two apart.
+      const campaign = r.campaign_name || (r.campaign_id ? "Deleted campaign" : "Test call");
+      return `
       <tr>
         <td class="hint when">${esc(fmtWhen(r.updated_at))}</td>
-        ${withCampaign ? `<td class="name" title="${esc(r.campaign_name || "Test call")}">${esc(r.campaign_name || "Test call")}</td>` : ""}
+        ${withCampaign ? `<td class="name" title="${esc(campaign)}">${esc(campaign)}</td>` : ""}
         <td class="phone">${esc(r.pretty)}</td>
         <td>${statusPill(r)}</td>
         <td class="num">${r.duration ? r.duration + "s" : "—"}</td>
         <td class="hint" style="font-family:var(--mono);font-size:11px">${esc(r.sid || "—")}</td>
         <td class="hint">${esc(r.error || (r.state === "deferred" ? r.status : "") || "")}</td>
-      </tr>`).join("")}
+      </tr>`;
+    }).join("")}
     </tbody></table>`;
 }
 

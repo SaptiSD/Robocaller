@@ -29,6 +29,7 @@ for _leak in (
     "TELNYX_API_KEY", "TELNYX_TEXML_APP_ID", "TELNYX_FROM_NUMBER",
     "TELNYX_PUBLIC_KEY", "TEST_DESTINATION_NUMBER", "PUBLIC_BASE_URL",
     "ANTHROPIC_API_KEY", "BUSINESS_NAME", "CALLBACK_NUMBER",
+    "APP_PASSWORD", "APP_USERNAME",
 ):
     os.environ[_leak] = ""
 
@@ -443,6 +444,45 @@ def test_api() -> None:
 
         check("the dashboard is served", client.get("/").status_code == 200)
 
+        orphans = [r for r in client.get("/api/calls").json() if r["campaign_id"] == campaign_id]
+        check("a deleted campaign's calls keep their campaign id, so the log can say so",
+              orphans and all(r["campaign_name"] is None for r in orphans), str(orphans[:1]))
+
+
+def test_auth() -> None:
+    print("\naccess control")
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        print("  skip (httpx not installed)")
+        return
+
+    import server
+
+    os.environ["APP_PASSWORD"] = "correct horse"
+    try:
+        with TestClient(server.app) as client:
+            check("without a password the dashboard is refused", client.get("/").status_code == 401)
+            res = client.get("/api/overview")
+            check("without a password the API is refused", res.status_code == 401)
+            check("the refusal asks the browser to sign in",
+                  res.headers.get("www-authenticate", "").startswith("Basic"))
+            check("a wrong password is refused",
+                  client.get("/api/overview", auth=("admin", "nope")).status_code == 401)
+            check("a wrong username is refused",
+                  client.get("/api/overview", auth=("root", "correct horse")).status_code == 401)
+            res = client.get("/api/overview", headers={"Authorization": "Basic !!!not-base64"})
+            check("a malformed header is refused, not a crash", res.status_code == 401)
+            check("the right credentials get in",
+                  client.get("/api/overview", auth=("admin", "correct horse")).status_code == 200)
+            check("the health check stays open", client.get("/healthz").status_code == 200)
+            # 404 for the unknown token proves the request got past the password
+            # check; a 401 would mean Telnyx could never reach the webhooks.
+            res = client.post("/telnyx/status/no-such-token", data={"CallStatus": "completed"})
+            check("Telnyx webhooks are not behind the password", res.status_code == 404, str(res.status_code))
+    finally:
+        os.environ.pop("APP_PASSWORD", None)
+
 
 def main() -> int:
     print(f"scratch database: {db.DB_PATH}")
@@ -455,6 +495,7 @@ def main() -> int:
     test_pause_and_optout()
     test_pacing()
     test_api()
+    test_auth()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

@@ -372,6 +372,46 @@ def _add_missing_columns_pg(conn) -> list[str]:
     return added
 
 
+_TABLES = tuple(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", _SCHEMA))
+
+
+def _enable_rls(conn) -> None:
+    """Turn on row-level security, with no policies, for every app table.
+
+    Supabase publishes tables in `public` through its REST API. Nothing grants
+    the API roles access to these today, but with RLS on and no policy, a grant
+    added later by hand still exposes zero rows. The app is unaffected: it
+    connects as the tables' owner, and owners bypass RLS.
+
+    Skipped where already on, so a restart doesn't take an exclusive lock on
+    every table. A role that doesn't own the tables can't change this, and that
+    shouldn't stop the app from starting.
+    """
+    import psycopg
+
+    off = [r[0] for r in conn.execute(
+        "SELECT relname FROM pg_class WHERE relnamespace = current_schema()::regnamespace "
+        "AND relkind = 'r' AND NOT relrowsecurity AND relname = ANY(%s)",
+        (list(_TABLES),),
+    )]
+    for table in off:
+        try:
+            conn.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+        except psycopg.errors.InsufficientPrivilege:
+            pass
+
+
+def describe() -> str:
+    """Where the data lives, for the startup log. Never includes credentials."""
+    if IS_PG:
+        from psycopg.conninfo import conninfo_to_dict
+
+        info = conninfo_to_dict(DATABASE_URL)
+        return (f"Postgres {info.get('host', '?')}/{info.get('dbname', '?')}, "
+                f"schema {PG_SCHEMA or 'public'}")
+    return f"SQLite {DB_PATH}"
+
+
 def init() -> tuple[Path | None, list[str]]:
     """Prepare the database. Returns (archived legacy file, columns added).
 
@@ -390,6 +430,7 @@ def init() -> tuple[Path | None, list[str]]:
             conn.execute(_pg_schema(_SCHEMA))
             added = _add_missing_columns_pg(conn)
             conn.execute(_INDEXES)
+            _enable_rls(conn)
         return None, added
 
     archived = archive_incompatible()
