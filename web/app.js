@@ -537,7 +537,7 @@ async function saveSettings() {
   };
   try {
     await api("/settings", { method: "POST", body: { values } });
-    $("#s-token").value = "";
+    $("#s-api-key").value = "";
     $("#s-anthropic").value = "";
     $("#s-perplexity").value = "";
     toast("Settings saved.");
