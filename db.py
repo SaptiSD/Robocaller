@@ -54,6 +54,7 @@ TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 FREQUENCIES = ("once", "hourly", "daily", "weekly")
 CAMPAIGN_STATES = ("draft", "active", "paused", "finished")
+CALL_MODES = ("message", "agent")
 
 # Task lifecycle:
 #   pending   - queued, waiting for its turn in the dispatcher
@@ -74,6 +75,9 @@ CREATE TABLE IF NOT EXISTS campaigns (
     name         TEXT NOT NULL,
     message      TEXT NOT NULL,
     voice        TEXT NOT NULL DEFAULT 'Polly.Joanna-Neural',
+    -- 'message' reads the message aloud; 'agent' hands the call to the AI
+    -- phone agent (agent.py), with the message as its talking points.
+    mode         TEXT NOT NULL DEFAULT 'message',
     frequency    TEXT NOT NULL DEFAULT 'once',
     call_time    TEXT NOT NULL DEFAULT '10:00',
     weekday      INTEGER NOT NULL DEFAULT 0,
@@ -113,6 +117,7 @@ CREATE TABLE IF NOT EXISTS call_tasks (
     token         TEXT NOT NULL DEFAULT '',
     script_override TEXT NOT NULL DEFAULT '',
     voice_override  TEXT NOT NULL DEFAULT '',
+    mode_override   TEXT NOT NULL DEFAULT '',
     state         TEXT NOT NULL DEFAULT 'pending',
     status        TEXT NOT NULL DEFAULT '',
     attempts      INTEGER NOT NULL DEFAULT 0,

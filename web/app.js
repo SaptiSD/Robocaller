@@ -278,6 +278,7 @@ function campaignCard(c) {
   if (c.starts_at) schedule += ` · from ${fmtDay(c.starts_at, c.timezone)}`;
   if (c.ends_at) schedule += ` · until ${fmtDay(c.ends_at, c.timezone)}`;
   else if (c.frequency !== "once" && c.state === "active") schedule += " · no end date";
+  if (c.mode === "agent") schedule = `AI conversation · ${schedule}`;
 
   return `<div class="campaign">
     <div class="campaign-top">
@@ -493,6 +494,7 @@ async function loadSettings() {
   $("#s-perplexity").placeholder = data.settings.perplexity_api_key_set
     ? "saved — leave blank to keep it" : "pplx-...";
   $("#s-script-provider").value = data.settings.script_provider || "";
+  renderAgent(data.agent);
   const store = data.database;
   $("#db-path").innerHTML = store.backend === "postgres"
     ? `Postgres &mdash; <code>${esc(store.host)}/${esc(store.dbname)}</code>,
@@ -665,6 +667,7 @@ async function submitCampaign(event) {
     name: $("#c-name").value.trim(),
     message: $("#c-message").value.trim(),
     voice: $("#c-voice").value,
+    mode: $("#c-mode").value,
     amd: $("#c-amd").value,
     frequency: $("#c-frequency").value,
     call_time: $("#c-time").value || "10:00",
@@ -685,6 +688,7 @@ async function submitCampaign(event) {
     if (result.invalid.length) note += ` ${result.invalid.length} line(s) weren't valid numbers.`;
     toast(note);
     $("#campaign-form").reset();
+    refreshModeHint();
     $("#script-preview").textContent = "—";
     $("#c-require-consent").checked = true;
     refreshWindowWarning();
@@ -764,6 +768,52 @@ async function handleClick(event) {
   }
 }
 
+function renderAgent(info) {
+  if (!info) return;
+  const btn = $("#btn-agent-setup");
+  btn.textContent = info.assistant_id ? "Update in Telnyx" : "Set up in Telnyx";
+  btn.disabled = !info.can_setup;
+  $("#agent-status").innerHTML = info.ready
+    ? `<span style="color:var(--good)">&#10003; Ready.</span> Model <code>${esc(info.model)}</code>,
+       voice <code>${esc(info.voice)}</code>, Telnyx assistant <code>${esc(info.assistant_id)}</code>.`
+    : info.missing.length
+      ? `Not ready yet. Still needed: ${info.missing.map(esc).join("; ")}.`
+      : "Everything it needs is in place &mdash; press the button to create the agent in Telnyx.";
+  refreshModeHint();
+}
+
+async function setupAgent() {
+  const btn = $("#btn-agent-setup");
+  btn.disabled = true;
+  $("#agent-setup-status").innerHTML = `<span class="spinner"></span> setting up in Telnyx…`;
+  try {
+    META.agent = await api("/agent/setup", { method: "POST" });
+    renderAgent(META.agent);
+    $("#agent-setup-status").textContent = "Done.";
+  } catch (err) {
+    $("#agent-setup-status").innerHTML = `<span style="color:var(--critical)">${esc(err.message)}</span>`;
+    btn.disabled = false;
+  }
+}
+
+// An AI call has talking points rather than a script, and its own voice, so the
+// script preview and voice picker only apply to recorded messages.
+function refreshModeHint() {
+  const agentMode = $("#c-mode").value === "agent";
+  $("#c-message-label").textContent = agentMode
+    ? "Talking points for the AI agent" : "Message the voice will read";
+  $("#c-message").placeholder = agentMode
+    ? "What the agent should tell people, and the facts it may use to answer questions. It won't go beyond this."
+    : "Write for the ear. Short sentences. Spell out numbers and dates.";
+  $("#wrap-preview").style.display = agentMode ? "none" : "";
+  $("#wrap-voice").style.display = agentMode ? "none" : "";
+  const ready = META.agent && META.agent.ready;
+  $("#c-mode-hint").innerHTML = !agentMode ? ""
+    : ready
+      ? "The agent says up front that it's an automated AI assistant, answers only from your talking points, and honours opt-outs. Each minute costs more than a recorded message."
+      : `<span style="color:var(--critical)">The AI phone agent isn't set up yet &mdash; finish Settings &rsaquo; AI phone agent first.</span>`;
+}
+
 async function testCall() {
   const btn = $("#btn-test-call");
   btn.disabled = true;
@@ -771,7 +821,8 @@ async function testCall() {
   try {
     const r = await api("/test-call", {
       method: "POST",
-      body: { phone: $("#test-phone").value, message: $("#test-message").value, voice: "Polly.Joanna-Neural" },
+      body: { phone: $("#test-phone").value, message: $("#test-message").value,
+              voice: "Polly.Joanna-Neural", mode: $("#test-mode").value },
     });
     const task = r.task || {};
     $("#test-status").innerHTML = task.sid
@@ -833,6 +884,8 @@ $("#btn-test-call").addEventListener("click", testCall);
 $("#btn-verify").addEventListener("click", verifyTelnyx);
 $("#btn-save-settings").addEventListener("click", saveSettings);
 $("#btn-draft").addEventListener("click", draftScript);
+$("#btn-agent-setup").addEventListener("click", setupAgent);
+$("#c-mode").addEventListener("change", refreshModeHint);
 $("#btn-refresh-calls").addEventListener("click", loadCalls);
 $("#btn-refresh-docs").addEventListener("click", () => {
   loadDocs().catch((err) => toast(err.message, true));

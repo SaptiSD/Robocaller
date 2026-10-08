@@ -71,7 +71,14 @@ Telnyx bills each call against your account balance.
             <input type="text" id="test-phone" placeholder="+1 617 555 0142">
           </div>
           <div class="field">
-            <label for="test-message">Message <span class="hint" style="display:inline">(blank uses a stock test script)</span></label>
+            <label for="test-mode">Call type</label>
+            <select id="test-mode">
+              <option value="message">Recorded message &mdash; a voice reads the message</option>
+              <option value="agent">AI conversation &mdash; the AI agent talks with you</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="test-message">Message <span class="hint" style="display:inline">(blank uses a stock test script; for an AI call, what it should talk about)</span></label>
             <textarea id="test-message" rows="3" placeholder="Hi, this is a test of the RoboCall dashboard."></textarea>
           </div>
           <div class="btn-row">
@@ -141,7 +148,7 @@ Telnyx bills each call against your account balance.
           </div>
 
           <div class="field">
-            <label for="c-brief">Brief <span class="hint" style="display:inline">&mdash; describe the call, Claude drafts the script</span></label>
+            <label for="c-brief">Brief <span class="hint" style="display:inline">&mdash; describe the call, AI drafts the script</span></label>
             <div class="btn-row" style="align-items:stretch">
               <input type="text" id="c-brief" style="flex:1;min-width:220px"
                      placeholder="Memorial Day sale, 40% off all sofas, Friday through Monday, at our Danvers showroom">
@@ -151,19 +158,28 @@ Telnyx bills each call against your account balance.
           </div>
 
           <div class="field">
-            <label for="c-message">Message the voice will read</label>
+            <label for="c-mode">Call type</label>
+            <select id="c-mode">
+              <option value="message">Recorded message &mdash; a voice reads your message</option>
+              <option value="agent">AI conversation &mdash; an AI agent talks with each person</option>
+            </select>
+            <div class="hint" id="c-mode-hint"></div>
+          </div>
+
+          <div class="field">
+            <label for="c-message" id="c-message-label">Message the voice will read</label>
             <textarea id="c-message" class="mono" rows="6" required
               placeholder="Write for the ear. Short sentences. Spell out numbers and dates."></textarea>
             <div class="hint" id="script-meter"></div>
           </div>
 
-          <div class="field">
+          <div class="field" id="wrap-preview">
             <label>What the recipient actually hears</label>
             <div class="campaign-msg" id="script-preview">&mdash;</div>
           </div>
 
           <div class="field-row">
-            <div class="field">
+            <div class="field" id="wrap-voice">
               <label for="c-voice">Voice</label>
               <select id="c-voice"></select>
             </div>
@@ -446,6 +462,18 @@ Telnyx bills each call against your account balance.
         <div class="field" style="margin-bottom:0">
           <label for="s-perplexity">Perplexity API key <span class="hint" style="display:inline">&mdash; optional</span></label>
           <input type="password" id="s-perplexity" placeholder="pplx-... (leave blank to keep the saved one)">
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>AI phone agent</h2></div>
+        <div class="hint" style="margin-bottom:12px">For "AI conversation" calls. Telnyx runs the call;
+          Perplexity, through this server, decides what to say. Setting it up creates the agent in your
+          Telnyx account.</div>
+        <div id="agent-status" class="hint"></div>
+        <div class="btn-row" style="margin-top:12px">
+          <button id="btn-agent-setup">Set up in Telnyx</button>
+          <span id="agent-setup-status" class="hint"></span>
         </div>
       </div>
 

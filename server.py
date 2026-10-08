@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import hmac
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -19,15 +20,18 @@ from zoneinfo import ZoneInfo
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import agent
 import compliance
 import config
 import db
 import dispatcher
+import llm_proxy
 import scriptwriter
 import telephony
 
@@ -74,6 +78,7 @@ class CampaignIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     message: str = ""
     voice: str = telephony.DEFAULT_VOICE
+    mode: str = "message"
     frequency: str = "once"
     call_time: str = "10:00"
     weekday: int = 0
@@ -91,6 +96,7 @@ class CampaignPatch(BaseModel):
     name: str | None = None
     message: str | None = None
     voice: str | None = None
+    mode: str | None = None
     frequency: str | None = None
     call_time: str | None = None
     weekday: int | None = None
@@ -115,6 +121,7 @@ class TestCallIn(BaseModel):
     phone: str = ""
     message: str = ""
     voice: str = telephony.DEFAULT_VOICE
+    mode: str = "message"
 
 
 class DraftIn(BaseModel):
@@ -219,6 +226,14 @@ def _campaign_moment(raw: str, label: str, tz_name: str = "UTC") -> str | None:
     raise HTTPException(400, f"{label} timestamp must look like 2026-10-05 16:00.")
 
 
+def _check_mode(mode: str) -> None:
+    if mode not in db.CALL_MODES:
+        raise HTTPException(400, f"Call type must be one of {db.CALL_MODES}.")
+    if mode == "agent" and not agent.status()["ready"]:
+        raise HTTPException(400, "The AI phone agent isn't set up yet - finish "
+                                 "Settings > AI phone agent first.")
+
+
 def require_campaign(campaign_id: int) -> dict:
     row = db.query_one("SELECT * FROM campaigns WHERE id = ?", (campaign_id,))
     if not row:
@@ -304,8 +319,11 @@ def create_campaign(body: CampaignIn) -> dict:
         raise HTTPException(400, f"Frequency must be one of {db.FREQUENCIES}.")
     if body.amd not in telephony.AMD_MODES:
         raise HTTPException(400, f"Answering-machine mode must be one of {telephony.AMD_MODES}.")
+    _check_mode(body.mode)
     if not body.message.strip():
-        raise HTTPException(400, "A campaign needs a message for the voice to read.")
+        raise HTTPException(400, "A campaign needs a message for the voice to read."
+                            if body.mode == "message" else
+                            "An AI campaign needs talking points - what the agent should cover.")
     problems = compliance.validate_script(body.message)
     if problems:
         raise HTTPException(400, " ".join(problems))
@@ -331,11 +349,11 @@ def create_campaign(body: CampaignIn) -> dict:
             "passed, or it falls before the first run would come round.",
         )
     campaign_id = db.insert(
-        "INSERT INTO campaigns (name, message, voice, frequency, call_time, weekday, "
+        "INSERT INTO campaigns (name, message, voice, mode, frequency, call_time, weekday, "
         "timezone, state, amd, require_consent, created_at, starts_at, ends_at, "
-        "next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+        "next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
         (
-            body.name.strip(), body.message.strip(), body.voice, body.frequency,
+            body.name.strip(), body.message.strip(), body.voice, body.mode, body.frequency,
             body.call_time, body.weekday, body.timezone, body.amd,
             1 if body.require_consent else 0, db.to_utc(now),
             starts_at, ends_at, db.to_utc(first) if first else None,
@@ -370,6 +388,8 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
         raise HTTPException(400, f"Frequency must be one of {db.FREQUENCIES}.")
     if "amd" in fields and fields["amd"] not in telephony.AMD_MODES:
         raise HTTPException(400, f"Answering-machine mode must be one of {telephony.AMD_MODES}.")
+    if "mode" in fields:
+        _check_mode(fields["mode"])
     if "timezone" in fields and fields["timezone"] not in dispatcher.KNOWN_TIMEZONES:
         raise HTTPException(400, f"Unknown timezone '{fields['timezone']}'.")
     if "call_time" in fields and not dispatcher.valid_hhmm(fields["call_time"]):
@@ -528,8 +548,9 @@ def test_call(body: TestCallIn) -> dict:
         raise HTTPException(400, "Set a test number on the Settings page first.")
     if config.telephony() is None:
         raise HTTPException(400, "Telnyx isn't configured yet - fill in Settings.")
+    _check_mode(body.mode)
 
-    task_id = dispatcher.enqueue_single(phone, body.message.strip(), body.voice)
+    task_id = dispatcher.enqueue_single(phone, body.message.strip(), body.voice, body.mode)
     # Restricted to this one task: pressing "Call me now" must never also dial
     # whoever is at the front of a campaign queue. The calling window is skipped
     # because the operator is deliberately calling their own number right now.
@@ -584,7 +605,21 @@ def get_settings() -> dict:
         "timezones": list(dispatcher.KNOWN_TIMEZONES),
         "database": db.where(),
         "script_ai": scriptwriter.available(),
+        "agent": agent.status(),
     }
+
+
+@app.post("/api/agent/setup")
+def setup_agent() -> dict:
+    """Create or update the Telnyx assistant. Writes to the Telnyx account."""
+    phone = config.telephony()
+    if phone is None:
+        raise HTTPException(400, "Enter the Telnyx credentials first.")
+    assistant_id, error = agent.setup(phone)
+    if error:
+        raise HTTPException(400, error)
+    db.log_event(f"AI phone agent set up in Telnyx ({assistant_id}).")
+    return agent.status()
 
 
 @app.post("/api/settings")
@@ -819,6 +854,112 @@ async def handle_status(token: str, request: Request) -> Response:
         int(form.get("CallDuration") or 0),
     )
     return PlainTextResponse("", status_code=204)
+
+
+# --- the AI phone agent's model endpoint and tools ---------------------------
+
+def _agent_authorized(presented: str) -> bool:
+    token = agent.proxy_token()
+    return bool(token) and hmac.compare_digest(presented.encode(), token.encode())
+
+
+def _llm_error(status: int, message: str) -> JSONResponse:
+    # OpenAI's error shape, since the caller is an OpenAI-compatible client.
+    return JSONResponse({"error": {"message": message, "type": "invalid_request_error",
+                                   "code": status}}, status_code=status)
+
+
+def _bearer(request: Request) -> str:
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    return value.strip() if scheme.lower() == "bearer" else ""
+
+
+@app.get("/llm/v1/models")
+def llm_models(request: Request) -> JSONResponse:
+    if not _agent_authorized(_bearer(request)):
+        return _llm_error(401, "Invalid or missing bearer token.")
+    return JSONResponse({"object": "list", "data": [
+        {"id": agent.model(), "object": "model", "owned_by": "perplexity"}]})
+
+
+@app.post("/llm/v1/chat/completions")
+async def llm_chat(request: Request) -> Response:
+    """Telnyx's AI assistant asks here what to say next; Perplexity answers."""
+    if not agent.proxy_token():
+        return _llm_error(503, "AGENT_PROXY_TOKEN is not set on this server.")
+    if not _agent_authorized(_bearer(request)):
+        return _llm_error(401, "Invalid or missing bearer token.")
+    key = config.get("perplexity_api_key")
+    if not key:
+        return _llm_error(503, "No Perplexity API key is configured.")
+    try:
+        body = await request.json()
+    except ValueError:
+        return _llm_error(400, "Request body must be JSON.")
+
+    upstream = llm_proxy.to_agent_request(body, agent.model())
+    model = upstream["model"]
+    headers = {"Authorization": f"Bearer {key}"}
+    client = llm_proxy.client()
+    started = time.monotonic()
+
+    if not upstream.get("stream"):
+        try:
+            res = await client.post(llm_proxy.AGENT_URL, headers=headers, json=upstream)
+        except httpx.HTTPError as exc:
+            return _llm_error(502, f"Could not reach Perplexity: {exc}")
+        if res.status_code != 200:
+            return _llm_error(502, f"Perplexity returned HTTP {res.status_code}: {res.text[:300]}")
+        result = res.json()
+        llm_proxy.log_turn(model, started, result.get("usage"))
+        return JSONResponse(llm_proxy.to_chat_completion(result, model))
+
+    # Open the upstream stream before answering, so a Perplexity failure comes
+    # back as a real HTTP error rather than a 200 that goes quiet.
+    try:
+        res = await client.send(client.build_request(
+            "POST", llm_proxy.AGENT_URL, headers=headers, json=upstream), stream=True)
+    except httpx.HTTPError as exc:
+        return _llm_error(502, f"Could not reach Perplexity: {exc}")
+    if res.status_code != 200:
+        detail = (await res.aread()).decode("utf-8", "replace")[:300]
+        await res.aclose()
+        return _llm_error(502, f"Perplexity returned HTTP {res.status_code}: {detail}")
+
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+
+    async def relay():
+        usage: dict = {}
+
+        async def events():
+            async for event in llm_proxy.agent_events(res.aiter_lines()):
+                if event.get("type") == "response.completed":
+                    usage.update((event.get("response") or {}).get("usage") or {})
+                yield event
+
+        try:
+            async for line in llm_proxy.translate_stream(events(), model, include_usage):
+                yield line
+        finally:
+            await res.aclose()
+            llm_proxy.log_turn(model, started, usage)
+
+    return StreamingResponse(relay(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/telnyx/agent/optout/{token}")
+async def agent_optout(token: str, request: Request) -> JSONResponse:
+    """The agent's add_to_do_not_call tool. Telnyx sends the shared token in a
+    header; the call token in the path says whose number to block."""
+    if not _agent_authorized(request.headers.get("x-agent-token", "")):
+        raise HTTPException(403, "Bad agent token.")
+    task = _task_for(token)
+    db.suppress(task["phone"], "opted out on an AI call")
+    db.log_event(f"{compliance.pretty(task['phone'])} asked the AI agent not to call again "
+                 "- added to the do-not-call list.")
+    return JSONResponse({"ok": True, "result": "Added to the do-not-call list. "
+                                               "They will not be called again."})
 
 
 @app.exception_handler(HTTPException)

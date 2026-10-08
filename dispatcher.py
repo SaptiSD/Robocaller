@@ -23,6 +23,7 @@ import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import agent
 import compliance
 import config
 import db
@@ -220,17 +221,19 @@ def enqueue_campaign(campaign_id: int, now: datetime | None = None) -> tuple[int
     return queued, skipped
 
 
-def enqueue_single(phone: str, script: str = "", voice: str = "") -> int:
+def enqueue_single(phone: str, script: str = "", voice: str = "", mode: str = "message") -> int:
     """Queue a one-off call (the dashboard's test button).
 
-    It has no campaign, so the script and voice ride on the task row itself.
+    It has no campaign, so the script, voice and call type ride on the task row.
     """
     now = db.to_utc(db.utcnow())
     return db.insert(
         "INSERT INTO call_tasks (campaign_id, contact_id, phone, run_key, token, "
-        "script_override, voice_override, state, status, scheduled_for, created_at, "
-        "updated_at) VALUES (NULL, NULL, ?, 'manual', ?, ?, ?, 'pending', '', ?, ?, ?)",
-        (phone, secrets.token_urlsafe(16), script, voice, now, now, now),
+        "script_override, voice_override, mode_override, state, status, scheduled_for, "
+        "created_at, updated_at) "
+        "VALUES (NULL, NULL, ?, 'manual', ?, ?, ?, ?, 'pending', '', ?, ?, ?)",
+        (phone, secrets.token_urlsafe(16), script, voice,
+         mode if mode in db.CALL_MODES else "message", now, now, now),
     )
 
 
@@ -317,15 +320,19 @@ def dispatch_pending(
 
     if only_task_id is not None:
         tasks = db.query(
-            "SELECT t.*, c.message, c.voice, c.amd, c.name AS campaign_name "
-            "FROM call_tasks t LEFT JOIN campaigns c ON c.id = t.campaign_id "
+            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.name AS campaign_name, "
+            "ct.name AS contact_name FROM call_tasks t "
+            "LEFT JOIN campaigns c ON c.id = t.campaign_id "
+            "LEFT JOIN contacts ct ON ct.id = t.contact_id "
             "WHERE t.id = ? AND t.state IN ('pending', 'deferred')",
             (only_task_id,),
         )
     else:
         tasks = db.query(
-            "SELECT t.*, c.message, c.voice, c.amd, c.name AS campaign_name "
-            "FROM call_tasks t LEFT JOIN campaigns c ON c.id = t.campaign_id "
+            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.name AS campaign_name, "
+            "ct.name AS contact_name FROM call_tasks t "
+            "LEFT JOIN campaigns c ON c.id = t.campaign_id "
+            "LEFT JOIN contacts ct ON ct.id = t.contact_id "
             "WHERE t.state IN ('pending', 'deferred') AND t.scheduled_for <= ? "
             "ORDER BY t.scheduled_for, t.id LIMIT ?",
             (db.to_utc(now), budget),
@@ -381,15 +388,32 @@ def dispatch_pending(
         if not phone.supports(amd):
             amd = default_amd
 
+        mode = task.get("mode_override") or task.get("mode") or "message"
         try:
-            result = phone.place_call(
-                to_number=task["phone"],
-                script=script,
-                voice=task["voice_override"] or task["voice"] or "",
-                amd=amd,
-                token=task["token"],
-                ring_seconds=ring_seconds,
-            )
+            if mode == "agent":
+                result = phone.place_ai_call(
+                    to_number=task["phone"],
+                    assistant_id=config.get("telnyx_assistant_id"),
+                    variables=agent.variables(
+                        task,
+                        talking_points=task["script_override"] or task["message"]
+                        or _fallback_talking_points(),
+                        business=business,
+                        callback=callback,
+                    ),
+                    amd=amd,
+                    token=task["token"],
+                    ring_seconds=ring_seconds,
+                )
+            else:
+                result = phone.place_call(
+                    to_number=task["phone"],
+                    script=script,
+                    voice=task["voice_override"] or task["voice"] or "",
+                    amd=amd,
+                    token=task["token"],
+                    ring_seconds=ring_seconds,
+                )
         except Exception as exc:  # noqa: BLE001
             # The task is already claimed. Letting this escape would abandon it in
             # 'dialing' forever and abort every other call in the batch, so one
@@ -475,6 +499,11 @@ def _finish(task_id: int, state: str, status: str, error: str = "") -> None:
         "UPDATE call_tasks SET state = ?, status = ?, error = ?, updated_at = ? WHERE id = ?",
         (state, status, error, db.to_utc(db.utcnow()), task_id),
     )
+
+
+def _fallback_talking_points() -> str:
+    return ("This is a test of the AI calling system. Ask how their day is going, "
+            "answer any questions about the test briefly, then say goodbye.")
 
 
 def _fallback_message() -> str:

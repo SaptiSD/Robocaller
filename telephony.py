@@ -318,6 +318,55 @@ class Telephony:
             )
         return CallResult(True, sid=call_sid)
 
+    def place_ai_call(
+        self,
+        to_number: str,
+        assistant_id: str,
+        variables: dict[str, str],
+        amd: str = "voicemail",
+        token: str = "",
+        ring_seconds: int = 30,
+    ) -> CallResult:
+        """Dial a number and hand the call to the Telnyx AI Assistant.
+
+        Uses Telnyx's dedicated AI-call endpoint, which takes the same TeXML
+        application id as an ordinary call but refuses Url/Texml - the assistant
+        is the whole call.
+        """
+        if not assistant_id:
+            return CallResult(False, error="The AI agent isn't set up yet - use "
+                                           "Settings > AI phone agent.")
+        if not self.application_id:
+            return CallResult(False, error="No Telnyx TeXML application ID is set.")
+
+        params: dict[str, object] = {
+            "From": self.from_number,
+            "To": to_number,
+            "AIAssistantId": assistant_id,
+            "AIAssistantDynamicVariables": {k: str(v) for k, v in variables.items()},
+            "Timeout": max(5, min(int(ring_seconds), 120)),
+        }
+        if amd != "off":
+            # Lets the assistant's voicemail setting leave its message instead of
+            # starting a conversation with an answering machine. Async, so a person
+            # who answers isn't left in silence while detection runs.
+            params["MachineDetection"] = "Enable"
+            params["AsyncAmd"] = True
+        if self.mode == "webhook" and token:
+            params["StatusCallback"] = f"{self.public_base_url}/telnyx/status/{token}"
+            params["StatusCallbackMethod"] = "POST"
+            params["StatusCallbackEvent"] = "initiated ringing answered completed"
+
+        payload, error = self._call_api(
+            "POST", f"/texml/ai_calls/{self.application_id}", json=params
+        )
+        if error:
+            return CallResult(False, error=_explain(error))
+        call_sid = _first_sid(payload)
+        if not call_sid:
+            return CallResult(True, error="Telnyx accepted the AI call but returned no call SID.")
+        return CallResult(True, sid=call_sid)
+
     def fetch_call(self, sid: str) -> tuple[dict, str]:
         """Current state of a call. Returns (fields, error)."""
         account, error = self.account_sid()

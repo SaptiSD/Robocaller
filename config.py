@@ -28,6 +28,12 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "anthropic_api_key": ("ANTHROPIC_API_KEY", ""),
     "perplexity_api_key": ("PERPLEXITY_API_KEY", ""),
     "script_provider": ("SCRIPT_PROVIDER", ""),
+    # The conversational phone agent (agent.py). The model is any Perplexity
+    # Agent API id; Claude Haiku keeps each spoken reply quick and handles the
+    # hang-up and opt-out tools reliably.
+    "telnyx_assistant_id": ("TELNYX_ASSISTANT_ID", ""),
+    "agent_model": ("AGENT_MODEL", "anthropic/claude-haiku-4-5"),
+    "agent_voice": ("AGENT_VOICE", "Telnyx.KokoroTTS.af_heart"),
     "test_number": ("TEST_DESTINATION_NUMBER", ""),
     "business_name": ("BUSINESS_NAME", ""),
     "callback_number": ("CALLBACK_NUMBER", ""),
