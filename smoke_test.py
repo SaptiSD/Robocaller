@@ -28,7 +28,8 @@ os.environ["ROBOCALL_DB"] = str(_tmp / "test.db")
 for _leak in (
     "TELNYX_API_KEY", "TELNYX_TEXML_APP_ID", "TELNYX_FROM_NUMBER",
     "TELNYX_PUBLIC_KEY", "TEST_DESTINATION_NUMBER", "PUBLIC_BASE_URL",
-    "ANTHROPIC_API_KEY", "BUSINESS_NAME", "CALLBACK_NUMBER",
+    "ANTHROPIC_API_KEY", "PERPLEXITY_API_KEY", "SCRIPT_PROVIDER",
+    "BUSINESS_NAME", "CALLBACK_NUMBER",
 ):
     os.environ[_leak] = ""
 
@@ -369,6 +370,88 @@ def test_pacing() -> None:
                        "AND state IN ('pending', 'deferred')", (campaign_id,))["n"] == 0)
 
 
+# --- 5b. AI script drafting --------------------------------------------------
+
+class FakeResponse:
+    def __init__(self, status: int, body: dict) -> None:
+        self.status_code = status
+        self._body = body
+        self.text = str(body)
+
+    def json(self) -> dict:
+        return self._body
+
+
+def test_scriptwriter() -> None:
+    print("\nscript drafting")
+    import scriptwriter
+
+    keys = ("anthropic_api_key", "perplexity_api_key", "script_provider")
+    try:
+        check("no key means no drafting", config.script_provider() == "" and not scriptwriter.available())
+
+        db.set_setting("perplexity_api_key", "pplx-test")
+        check("a Perplexity key alone selects Perplexity", config.script_provider() == "perplexity")
+        db.set_setting("anthropic_api_key", "sk-ant-test")
+        check("with both keys, Claude is the default", config.script_provider() == "anthropic")
+        db.set_setting("script_provider", "perplexity")
+        check("the Settings choice wins when its key exists", config.script_provider() == "perplexity")
+        db.set_setting("perplexity_api_key", "")
+        check("a choice without its key falls back to the other",
+              config.script_provider() == "anthropic")
+        db.set_setting("anthropic_api_key", "")
+        db.set_setting("perplexity_api_key", "pplx-test")
+
+        sent: list[dict] = []
+        reply = {"output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "content": [
+                {"type": "output_text", "text": '"Hi, this is Sandbox Furniture. '},
+                {"type": "output_text", "text": 'Our sofa sale starts Friday."'},
+            ]},
+        ]}
+        original = scriptwriter.httpx.post
+
+        def fake_post(url, **kwargs):
+            sent.append({"url": url, **kwargs})
+            return FakeResponse(200, reply)
+
+        scriptwriter.httpx.post = fake_post
+        try:
+            text = scriptwriter.draft("Sofa sale Friday", business_name="Sandbox Furniture")
+            check("the Perplexity draft is joined and unquoted",
+                  text == "Hi, this is Sandbox Furniture. Our sofa sale starts Friday.", repr(text))
+            request = sent[0]
+            check("the draft goes to Perplexity's Agent API", request["url"] == scriptwriter.PERPLEXITY_URL)
+            check("the key is sent as a bearer token",
+                  request["headers"]["Authorization"] == "Bearer pplx-test")
+            check("the script rules travel as instructions",
+                  request["json"]["instructions"] == scriptwriter.SYSTEM)
+            check("no tools are sent, so there is no web search or search fee",
+                  "tools" not in request["json"])
+
+            reply.clear()
+            reply.update({"error": {"message": "bad key"}})
+            scriptwriter.httpx.post = lambda url, **kw: FakeResponse(401, reply)
+            try:
+                scriptwriter.draft("Sofa sale Friday")
+                check("a rejected Perplexity key is reported", False)
+            except scriptwriter.ScriptError as exc:
+                check("a rejected Perplexity key is reported", "rejected" in str(exc), str(exc))
+
+            scriptwriter.httpx.post = lambda url, **kw: FakeResponse(200, {"output": []})
+            try:
+                scriptwriter.draft("Sofa sale Friday")
+                check("an empty Perplexity reply is an error, not a blank script", False)
+            except scriptwriter.ScriptError as exc:
+                check("an empty Perplexity reply is an error, not a blank script", "empty" in str(exc))
+        finally:
+            scriptwriter.httpx.post = original
+    finally:
+        for key in keys:
+            db.set_setting(key, "")
+
+
 # --- 6. the HTTP API ---------------------------------------------------------
 
 def test_api() -> None:
@@ -431,7 +514,8 @@ def test_api() -> None:
 
         res = client.get("/api/settings")
         check("secrets are never sent to the browser",
-              res.json()["settings"].get("telnyx_api_key") == "")
+              res.json()["settings"].get("telnyx_api_key") == ""
+              and res.json()["settings"].get("perplexity_api_key") == "")
         check("settings report which database is in use",
               res.json()["database"]["backend"] == ("postgres" if db.IS_PG else "sqlite"))
         check("the database location never includes the connection string",
@@ -463,6 +547,7 @@ def main() -> int:
     test_quiet_hours()
     test_pause_and_optout()
     test_pacing()
+    test_scriptwriter()
     test_api()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

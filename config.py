@@ -26,6 +26,8 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "telnyx_public_key": ("TELNYX_PUBLIC_KEY", ""),
     "public_base_url": ("PUBLIC_BASE_URL", ""),
     "anthropic_api_key": ("ANTHROPIC_API_KEY", ""),
+    "perplexity_api_key": ("PERPLEXITY_API_KEY", ""),
+    "script_provider": ("SCRIPT_PROVIDER", ""),
     "test_number": ("TEST_DESTINATION_NUMBER", ""),
     "business_name": ("BUSINESS_NAME", ""),
     "callback_number": ("CALLBACK_NUMBER", ""),
@@ -36,7 +38,7 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "dispatch_paused": ("", "0"),
 }
 
-SECRET_KEYS = {"telnyx_api_key", "anthropic_api_key"}
+SECRET_KEYS = {"telnyx_api_key", "anthropic_api_key", "perplexity_api_key"}
 
 
 def get(key: str) -> str:
@@ -47,6 +49,20 @@ def get(key: str) -> str:
     if env_var:
         return os.getenv(env_var, "") or default
     return default
+
+
+def script_provider() -> str:
+    """Which service drafts scripts: "anthropic", "perplexity", or "" for neither.
+
+    The one chosen in Settings wins if its key is present; otherwise whichever
+    key exists, Anthropic first. Lives here rather than in scriptwriter so the
+    dashboard can show it without importing the drafting code.
+    """
+    keys = {"anthropic": get("anthropic_api_key"), "perplexity": get("perplexity_api_key")}
+    chosen = get("script_provider").strip().lower()
+    if keys.get(chosen):
+        return chosen
+    return next((name for name, key in keys.items() if key), "")
 
 
 def get_int(key: str, fallback: int) -> int:
@@ -76,6 +92,7 @@ def public_view() -> dict[str, object]:
         get("telnyx_api_key") and get("telnyx_app_id") and get("telnyx_from_number")
     )
     out["delivery_mode"] = "webhook" if get("public_base_url") else "direct"
+    out["script_provider_active"] = script_provider()
     return out
 
 

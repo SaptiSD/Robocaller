@@ -430,10 +430,22 @@ Telnyx bills each call against your account balance.
 
       <div class="card">
         <div class="card-head"><h2>AI script writer</h2></div>
-        <div class="field" style="margin-bottom:0">
+        <div class="hint" style="margin-bottom:12px">Powers the "Draft with AI" button. Either key works; everything else works without one.</div>
+        <div class="field">
+          <label for="s-script-provider">Write scripts with</label>
+          <select id="s-script-provider">
+            <option value="">Automatic &mdash; whichever key is saved (Claude first)</option>
+            <option value="anthropic">Claude, with an Anthropic key</option>
+            <option value="perplexity">Perplexity, with a Perplexity key</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="s-anthropic">Anthropic API key <span class="hint" style="display:inline">&mdash; optional</span></label>
           <input type="password" id="s-anthropic" placeholder="sk-ant-... (leave blank to keep the saved one)">
-          <div class="hint">Powers the "Draft with AI" button. Everything else works without it.</div>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="s-perplexity">Perplexity API key <span class="hint" style="display:inline">&mdash; optional</span></label>
+          <input type="password" id="s-perplexity" placeholder="pplx-... (leave blank to keep the saved one)">
         </div>
       </div>
 

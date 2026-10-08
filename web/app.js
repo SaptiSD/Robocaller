@@ -490,6 +490,9 @@ async function loadSettings() {
   $("#s-base-url").value = data.settings.public_base_url || "";
   $("#s-anthropic").placeholder = data.settings.anthropic_api_key_set
     ? "saved — leave blank to keep it" : "sk-ant-...";
+  $("#s-perplexity").placeholder = data.settings.perplexity_api_key_set
+    ? "saved — leave blank to keep it" : "pplx-...";
+  $("#s-script-provider").value = data.settings.script_provider || "";
   const store = data.database;
   $("#db-path").innerHTML = store.backend === "postgres"
     ? `Postgres &mdash; <code>${esc(store.host)}/${esc(store.dbname)}</code>,
@@ -529,11 +532,14 @@ async function saveSettings() {
     ring_seconds: $("#s-ring").value,
     public_base_url: $("#s-base-url").value.trim(),
     anthropic_api_key: $("#s-anthropic").value.trim(),
+    perplexity_api_key: $("#s-perplexity").value.trim(),
+    script_provider: $("#s-script-provider").value,
   };
   try {
     await api("/settings", { method: "POST", body: { values } });
     $("#s-token").value = "";
     $("#s-anthropic").value = "";
+    $("#s-perplexity").value = "";
     toast("Settings saved.");
     loadSettings();
   } catch (err) { toast(err.message, true); }
@@ -638,7 +644,8 @@ async function draftScript() {
 
   const btn = $("#btn-draft");
   btn.disabled = true;
-  $("#draft-status").innerHTML = `<span class="spinner"></span> Claude is writing…`;
+  const writer = SETTINGS.script_provider_active === "perplexity" ? "Perplexity" : "Claude";
+  $("#draft-status").innerHTML = `<span class="spinner"></span> ${writer} is writing…`;
   try {
     const result = await api("/script/draft", {
       method: "POST",
