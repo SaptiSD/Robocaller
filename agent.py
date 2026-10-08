@@ -20,6 +20,9 @@ import compliance
 import config
 
 SECRET_IDENTIFIER = "robocall-llm-proxy"
+# A campaign's extra info rides along with every reply the agent makes, so its
+# length is paid for - in tokens and in delay - on every turn of every call.
+AGENT_INFO_MAX = 4000
 ASSISTANT_NAME = "RoboCall AI campaign agent"
 
 INSTRUCTIONS = """You are an automated AI assistant making a short outbound phone \
@@ -28,14 +31,17 @@ call on behalf of {{business_name}}. You are speaking with {{contact_name}}.
 Why you are calling:
 {{talking_points}}
 
+Background you can draw on to answer questions:
+{{extra_info}}
+
 How to behave:
 - This is a live phone call. Keep every reply to one or two short spoken \
 sentences. Never use lists, markdown, emoji, abbreviations or web addresses.
 - If asked, say plainly that you are an automated AI assistant. Never claim to be \
 a person.
-- Only state facts from "Why you are calling". If asked something you don't know, \
-say you'll pass the question on and give the callback number, \
-{{callback_spoken}}.
+- Only state facts from "Why you are calling" and the background. If asked \
+something neither covers, say you'll pass the question on and give the callback \
+number, {{callback_spoken}}.
 - Never invent prices, discounts, deadlines or promises. Never ask for payment, \
 card, bank or account details, passwords, or government ID numbers.
 - If the person asks not to be called again, asks to be removed, or says to stop: \
@@ -116,7 +122,8 @@ def assistant_payload(base_url: str, application_id: str) -> dict:
         ],
         "dynamic_variables": {
             "business_name": "our business", "contact_name": "the person who answered",
-            "greeting_name": "", "talking_points": "", "callback_spoken": "the number we called from",
+            "greeting_name": "", "talking_points": "", "extra_info": "(none)",
+            "callback_spoken": "the number we called from",
             "call_token": "",
         },
         "telephony_settings": {
@@ -130,7 +137,8 @@ def assistant_payload(base_url: str, application_id: str) -> dict:
     }
 
 
-def variables(task: dict, talking_points: str, business: str, callback: str) -> dict[str, str]:
+def variables(task: dict, talking_points: str, business: str, callback: str,
+              extra_info: str = "") -> dict[str, str]:
     """Per-call values. Telnyx types these as string-to-string, so every value is a str."""
     name = (task.get("contact_name") or "").strip()
     return {
@@ -138,6 +146,7 @@ def variables(task: dict, talking_points: str, business: str, callback: str) -> 
         "contact_name": name or "the person who answered",
         "greeting_name": f" {name.split()[0]}" if name else "",
         "talking_points": talking_points.strip(),
+        "extra_info": (extra_info or "").strip() or "(none)",
         "callback_spoken": compliance.spell_number(callback) if callback else "the number we called from",
         "call_token": task.get("token") or "",
     }

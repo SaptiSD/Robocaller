@@ -79,6 +79,7 @@ class CampaignIn(BaseModel):
     message: str = ""
     voice: str = telephony.DEFAULT_VOICE
     mode: str = "message"
+    agent_info: str = ""
     frequency: str = "once"
     call_time: str = "10:00"
     weekday: int = 0
@@ -97,6 +98,7 @@ class CampaignPatch(BaseModel):
     message: str | None = None
     voice: str | None = None
     mode: str | None = None
+    agent_info: str | None = None
     frequency: str | None = None
     call_time: str | None = None
     weekday: int | None = None
@@ -234,6 +236,13 @@ def _check_mode(mode: str) -> None:
                                  "Settings > AI phone agent first.")
 
 
+def _check_agent_info(info: str) -> None:
+    if len(info or "") > agent.AGENT_INFO_MAX:
+        raise HTTPException(400, f"The extra info for the AI is {len(info):,} characters - keep it "
+                                 f"under {agent.AGENT_INFO_MAX:,}. It's sent with every reply, so "
+                                 "length adds cost and delay to each call.")
+
+
 def require_campaign(campaign_id: int) -> dict:
     row = db.query_one("SELECT * FROM campaigns WHERE id = ?", (campaign_id,))
     if not row:
@@ -320,6 +329,7 @@ def create_campaign(body: CampaignIn) -> dict:
     if body.amd not in telephony.AMD_MODES:
         raise HTTPException(400, f"Answering-machine mode must be one of {telephony.AMD_MODES}.")
     _check_mode(body.mode)
+    _check_agent_info(body.agent_info)
     if not body.message.strip():
         raise HTTPException(400, "A campaign needs a message for the voice to read."
                             if body.mode == "message" else
@@ -349,11 +359,12 @@ def create_campaign(body: CampaignIn) -> dict:
             "passed, or it falls before the first run would come round.",
         )
     campaign_id = db.insert(
-        "INSERT INTO campaigns (name, message, voice, mode, frequency, call_time, weekday, "
-        "timezone, state, amd, require_consent, created_at, starts_at, ends_at, "
-        "next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO campaigns (name, message, voice, mode, agent_info, frequency, call_time, "
+        "weekday, timezone, state, amd, require_consent, created_at, starts_at, ends_at, "
+        "next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
         (
-            body.name.strip(), body.message.strip(), body.voice, body.mode, body.frequency,
+            body.name.strip(), body.message.strip(), body.voice, body.mode,
+            body.agent_info.strip() if body.mode == "agent" else "", body.frequency,
             body.call_time, body.weekday, body.timezone, body.amd,
             1 if body.require_consent else 0, db.to_utc(now),
             starts_at, ends_at, db.to_utc(first) if first else None,
@@ -390,6 +401,9 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
         raise HTTPException(400, f"Answering-machine mode must be one of {telephony.AMD_MODES}.")
     if "mode" in fields:
         _check_mode(fields["mode"])
+    if "agent_info" in fields:
+        _check_agent_info(fields["agent_info"])
+        fields["agent_info"] = fields["agent_info"].strip()
     if "timezone" in fields and fields["timezone"] not in dispatcher.KNOWN_TIMEZONES:
         raise HTTPException(400, f"Unknown timezone '{fields['timezone']}'.")
     if "call_time" in fields and not dispatcher.valid_hhmm(fields["call_time"]):

@@ -320,8 +320,8 @@ def dispatch_pending(
 
     if only_task_id is not None:
         tasks = db.query(
-            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.name AS campaign_name, "
-            "ct.name AS contact_name FROM call_tasks t "
+            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.agent_info, "
+            "c.name AS campaign_name, ct.name AS contact_name FROM call_tasks t "
             "LEFT JOIN campaigns c ON c.id = t.campaign_id "
             "LEFT JOIN contacts ct ON ct.id = t.contact_id "
             "WHERE t.id = ? AND t.state IN ('pending', 'deferred')",
@@ -329,8 +329,8 @@ def dispatch_pending(
         )
     else:
         tasks = db.query(
-            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.name AS campaign_name, "
-            "ct.name AS contact_name FROM call_tasks t "
+            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.agent_info, "
+            "c.name AS campaign_name, ct.name AS contact_name FROM call_tasks t "
             "LEFT JOIN campaigns c ON c.id = t.campaign_id "
             "LEFT JOIN contacts ct ON ct.id = t.contact_id "
             "WHERE t.state IN ('pending', 'deferred') AND t.scheduled_for <= ? "
@@ -400,6 +400,7 @@ def dispatch_pending(
                         or _fallback_talking_points(),
                         business=business,
                         callback=callback,
+                        extra_info=task.get("agent_info") or "",
                     ),
                     amd=amd,
                     token=task["token"],

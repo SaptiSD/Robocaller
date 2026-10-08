@@ -641,6 +641,8 @@ def test_agent_calls() -> None:
                   payload["telephony_settings"]["voicemail_detection"]["on_voicemail_detected"]["action"]
                   == "leave_message_and_stop_assistant")
             check("the greeting says it's an AI", "automated AI assistant" in payload["greeting"])
+            check("the agent's instructions include the campaign's extra info",
+                  "{{extra_info}}" in payload["instructions"])
 
             assistant_id, error = agent.setup(fake)
             writes = [(m, p) for m, p, _ in fake.api if m != "GET"]
@@ -667,6 +669,8 @@ def test_agent_calls() -> None:
             check("the talking points travel as a variable",
                   call["variables"]["talking_points"] == "Ask about the sofa delivery.")
             check("every variable is a string", all(isinstance(v, str) for v in call["variables"].values()))
+            check("with no extra info the agent is told there is none",
+                  call["variables"]["extra_info"] == "(none)")
             task = db.query_one("SELECT * FROM call_tasks WHERE id = ?", (task_id,))
             check("the call token travels too, for the opt-out tool",
                   call["variables"]["call_token"] == task["token"] == call["token"])
@@ -674,7 +678,8 @@ def test_agent_calls() -> None:
             # A campaign in AI mode, with a named contact.
             midday = datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc)
             campaign_id = make_campaign(name="AI follow-up", message="Tell them the sofa sale starts Friday.")
-            db.execute("UPDATE campaigns SET mode = 'agent' WHERE id = ?", (campaign_id,))
+            db.execute("UPDATE campaigns SET mode = 'agent', agent_info = ? WHERE id = ?",
+                       ("Open ten to six, closed Tuesdays. Free parking out back.", campaign_id))
             db.insert("INSERT INTO contacts (campaign_id, phone, name, consent, created_at) "
                       "VALUES (?, ?, ?, 1, ?)", (campaign_id, "+16175550194", "Dana Whitfield", db.now_str()))
             dispatcher.enqueue_campaign(campaign_id, midday)
@@ -687,6 +692,8 @@ def test_agent_calls() -> None:
             check("campaign AI calls use answering-machine detection", call["amd"] == "voicemail")
             check("campaign talking points come from its message",
                   call["variables"]["talking_points"] == "Tell them the sofa sale starts Friday.")
+            check("the campaign's extra info reaches the agent",
+                  call["variables"]["extra_info"] == "Open ten to six, closed Tuesdays. Free parking out back.")
         finally:
             config.telephony = original
     finally:
@@ -774,6 +781,16 @@ def test_agent_http() -> None:
                   res.status_code == 400 and "AI phone agent" in res.json()["error"], res.text[:200])
             res = client.post("/api/test-call", json={"phone": "617-555-0197", "mode": "agent"})
             check("so is an AI test call", res.status_code == 400)
+
+            res = client.post("/api/campaigns", json={
+                "name": "Too much", "message": "Hello.", "agent_info": "x" * 4001})
+            check("over-long extra info is refused with the reason",
+                  res.status_code == 400 and "4,001 characters" in res.json()["error"], res.text[:200])
+            res = client.post("/api/campaigns", json={
+                "name": "Recorded", "message": "Hello from the showroom.", "agent_info": "ignored"})
+            stored = db.query_one("SELECT agent_info FROM campaigns WHERE id = ?", (res.json()["id"],))
+            check("a recorded-message campaign doesn't keep AI info", stored["agent_info"] == "")
+            client.delete(f"/api/campaigns/{res.json()['id']}")
     finally:
         llm_proxy.client = original_client
         os.environ.pop("AGENT_PROXY_TOKEN", None)

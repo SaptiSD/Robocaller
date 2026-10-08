@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS campaigns (
     -- 'message' reads the message aloud; 'agent' hands the call to the AI
     -- phone agent (agent.py), with the message as its talking points.
     mode         TEXT NOT NULL DEFAULT 'message',
+    -- Extra facts the AI agent may draw on to answer questions (agent mode).
+    agent_info   TEXT NOT NULL DEFAULT '',
     frequency    TEXT NOT NULL DEFAULT 'once',
     call_time    TEXT NOT NULL DEFAULT '10:00',
     weekday      INTEGER NOT NULL DEFAULT 0,

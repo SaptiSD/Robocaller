@@ -667,7 +667,8 @@ async function submitCampaign(event) {
     name: $("#c-name").value.trim(),
     message: $("#c-message").value.trim(),
     voice: $("#c-voice").value,
-    mode: $("#c-mode").value,
+    mode: $("#c-agent").checked ? "agent" : "message",
+    agent_info: $("#c-agent").checked ? $("#c-agent-info").value.trim() : "",
     amd: $("#c-amd").value,
     frequency: $("#c-frequency").value,
     call_time: $("#c-time").value || "10:00",
@@ -689,6 +690,7 @@ async function submitCampaign(event) {
     toast(note);
     $("#campaign-form").reset();
     refreshModeHint();
+    $("#c-agent-info").dispatchEvent(new Event("input"));
     $("#script-preview").textContent = "—";
     $("#c-require-consent").checked = true;
     refreshWindowWarning();
@@ -799,11 +801,12 @@ async function setupAgent() {
 // An AI call has talking points rather than a script, and its own voice, so the
 // script preview and voice picker only apply to recorded messages.
 function refreshModeHint() {
-  const agentMode = $("#c-mode").value === "agent";
+  const agentMode = $("#c-agent").checked;
+  $("#wrap-agent-info").hidden = !agentMode;
   $("#c-message-label").textContent = agentMode
     ? "Talking points for the AI agent" : "Message the voice will read";
   $("#c-message").placeholder = agentMode
-    ? "What the agent should tell people, and the facts it may use to answer questions. It won't go beyond this."
+    ? "Why you're calling - what the agent should tell each person. Put supporting facts in More info above."
     : "Write for the ear. Short sentences. Spell out numbers and dates.";
   $("#wrap-preview").style.display = agentMode ? "none" : "";
   $("#wrap-voice").style.display = agentMode ? "none" : "";
@@ -885,7 +888,13 @@ $("#btn-verify").addEventListener("click", verifyTelnyx);
 $("#btn-save-settings").addEventListener("click", saveSettings);
 $("#btn-draft").addEventListener("click", draftScript);
 $("#btn-agent-setup").addEventListener("click", setupAgent);
-$("#c-mode").addEventListener("change", refreshModeHint);
+$("#c-agent").addEventListener("change", refreshModeHint);
+$("#c-agent-info").addEventListener("input", () => {
+  const n = $("#c-agent-info").value.length;
+  $("#c-agent-info-meter").textContent = n
+    ? `${n.toLocaleString()} / 4,000 characters. Sent with every reply, so shorter is faster and cheaper.`
+    : "The AI only states what's here or in the talking points. Anything else, it hands off to your callback number.";
+});
 $("#btn-refresh-calls").addEventListener("click", loadCalls);
 $("#btn-refresh-docs").addEventListener("click", () => {
   loadDocs().catch((err) => toast(err.message, true));

@@ -158,12 +158,19 @@ Telnyx bills each call against your account balance.
           </div>
 
           <div class="field">
-            <label for="c-mode">Call type</label>
-            <select id="c-mode">
-              <option value="message">Recorded message &mdash; a voice reads your message</option>
-              <option value="agent">AI conversation &mdash; an AI agent talks with each person</option>
-            </select>
+            <label class="switch-row" for="c-agent">
+              <input type="checkbox" role="switch" class="switch" id="c-agent">
+              <span><b>AI conversation</b>
+                <span class="hint" style="display:inline">&mdash; an AI agent talks with each person instead of reading a recorded message</span></span>
+            </label>
             <div class="hint" id="c-mode-hint"></div>
+          </div>
+
+          <div class="field" id="wrap-agent-info" hidden>
+            <label for="c-agent-info">More info for the AI <span class="hint" style="display:inline">&mdash; optional</span></label>
+            <textarea id="c-agent-info" rows="5" maxlength="4000"
+              placeholder="Facts the AI can use to answer questions: store hours, address, parking, which products are included, return policy, financing, who to ask for…"></textarea>
+            <div class="hint" id="c-agent-info-meter">The AI only states what's here or in the talking points. Anything else, it hands off to your callback number.</div>
           </div>
 
           <div class="field">
