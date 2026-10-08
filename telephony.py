@@ -323,7 +323,6 @@ class Telephony:
         to_number: str,
         assistant_id: str,
         variables: dict[str, str],
-        amd: str = "voicemail",
         token: str = "",
         ring_seconds: int = 30,
     ) -> CallResult:
@@ -346,12 +345,9 @@ class Telephony:
             "AIAssistantDynamicVariables": {k: str(v) for k, v in variables.items()},
             "Timeout": max(5, min(int(ring_seconds), 120)),
         }
-        if amd != "off":
-            # Lets the assistant's voicemail setting leave its message instead of
-            # starting a conversation with an answering machine. Async, so a person
-            # who answers isn't left in silence while detection runs.
-            params["MachineDetection"] = "Enable"
-            params["AsyncAmd"] = True
+        # No answering-machine detection: phones now screen unknown callers with
+        # an automated prompt, a "machine" verdict there silenced the agent, and
+        # the agent's instructions handle screeners and voicemail by ear instead.
         if self.mode == "webhook" and token:
             params["StatusCallback"] = f"{self.public_base_url}/telnyx/status/{token}"
             params["StatusCallbackMethod"] = "POST"

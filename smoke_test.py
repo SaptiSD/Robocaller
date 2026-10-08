@@ -637,10 +637,18 @@ def test_agent_calls() -> None:
                   == "https://robocaller.example.com/telnyx/agent/optout/{{call_token}}")
             check("the opt-out tool authenticates with the proxy token",
                   tools["webhook"]["webhook"]["headers"] == [{"name": "X-Agent-Token", "value": "proxy-secret"}])
-            check("answering machines get a voicemail, not a conversation",
-                  payload["telephony_settings"]["voicemail_detection"]["on_voicemail_detected"]["action"]
-                  == "leave_message_and_stop_assistant")
-            check("the greeting says it's an AI", "automated AI assistant" in payload["greeting"])
+            check("a 'machine' verdict never stops the agent (call screeners count as machines)",
+                  payload["telephony_settings"]["voicemail_detection"]["on_voicemail_detected"]
+                  == {"action": "continue_assistant"})
+            check("the other side speaks first", payload["greeting"] == "")
+            check("the agent's opening line says it's an AI",
+                  "this is an automated AI assistant calling on behalf of {{business_name}}"
+                  in payload["instructions"])
+            check("the agent knows how to answer a call screener",
+                  "call screener" in payload["instructions"])
+            check("the agent knows how to leave a voicemail and hang up",
+                  "Voicemail" in payload["instructions"] and "To be removed from our calling list"
+                  in payload["instructions"])
             check("the agent's instructions include the campaign's extra info",
                   "{{extra_info}}" in payload["instructions"])
 
@@ -665,7 +673,7 @@ def test_agent_calls() -> None:
             dispatcher.dispatch_pending(only_task_id=task_id, ignore_window=True)
             call = fake.ai_calls[-1]
             check("an AI test call goes to the assistant", call["assistant_id"] == "assistant-new")
-            check("a test call skips answering-machine detection", call["amd"] == "off")
+            check("AI calls never ask for answering-machine detection", "amd" not in call)
             check("the talking points travel as a variable",
                   call["variables"]["talking_points"] == "Ask about the sofa delivery.")
             check("every variable is a string", all(isinstance(v, str) for v in call["variables"].values()))
@@ -689,7 +697,6 @@ def test_agent_calls() -> None:
             check("campaign AI calls carry the contact's name",
                   call["variables"]["contact_name"] == "Dana Whitfield"
                   and call["variables"]["greeting_name"] == " Dana")
-            check("campaign AI calls use answering-machine detection", call["amd"] == "voicemail")
             check("campaign talking points come from its message",
                   call["variables"]["talking_points"] == "Tell them the sofa sale starts Friday.")
             check("the campaign's extra info reaches the agent",

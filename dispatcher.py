@@ -402,7 +402,6 @@ def dispatch_pending(
                         callback=callback,
                         extra_info=task.get("agent_info") or "",
                     ),
-                    amd=amd,
                     token=task["token"],
                     ring_seconds=ring_seconds,
                 )

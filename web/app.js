@@ -810,6 +810,7 @@ function refreshModeHint() {
     : "Write for the ear. Short sentences. Spell out numbers and dates.";
   $("#wrap-preview").style.display = agentMode ? "none" : "";
   $("#wrap-voice").style.display = agentMode ? "none" : "";
+  $("#wrap-amd").style.display = agentMode ? "none" : "";  // the agent handles voicemail itself
   const ready = META.agent && META.agent.ready;
   $("#c-mode-hint").innerHTML = !agentMode ? ""
     : ready

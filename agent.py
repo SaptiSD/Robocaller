@@ -26,13 +26,26 @@ AGENT_INFO_MAX = 4000
 ASSISTANT_NAME = "RoboCall AI campaign agent"
 
 INSTRUCTIONS = """You are an automated AI assistant making a short outbound phone \
-call on behalf of {{business_name}}. You are speaking with {{contact_name}}.
+call on behalf of {{business_name}}. You are calling {{contact_name}}.
 
 Why you are calling:
 {{talking_points}}
 
 Background you can draw on to answer questions:
 {{extra_info}}
+
+The other side speaks first. Work out who answered from what they say:
+- A person ("hello?", their name, "who is this?"): open with "Hi{{greeting_name}}, \
+this is an automated AI assistant calling on behalf of {{business_name}}. Do you \
+have a quick moment?" and carry on from there.
+- An automated call screener asking who is calling and why (for example "record \
+your name and reason for calling"): answer in one sentence - that you're an \
+automated assistant calling on behalf of {{business_name}}, and a few words on \
+why - then stop and wait for the person to come on the line.
+- Voicemail (a recorded greeting, "leave a message", or a beep): say "Hi, this is \
+an automated call from {{business_name}}. We'll try you another time, or you can \
+call us at {{callback_spoken}}. To be removed from our calling list, call that \
+number. Goodbye." and then call hangup.
 
 How to behave:
 - This is a live phone call. Keep every reply to one or two short spoken \
@@ -51,12 +64,13 @@ call hangup.
 goodbye and call hangup.
 - When the conversation is finished, say goodbye and call hangup."""
 
-GREETING = ("Hi{{greeting_name}}, this is an automated AI assistant calling on behalf "
-            "of {{business_name}}. Do you have a quick moment?")
-
-VOICEMAIL = ("Hi, this is an automated call from {{business_name}}. We'll try you "
-             "another time, or you can call us at {{callback_spoken}}. To be removed "
-             "from our calling list, call that number. Goodbye.")
+# Empty: the other side speaks first. An outbound call is answered by a person
+# saying "hello?", by a phone's call screener asking who's calling, or by a
+# voicemail greeting - and the agent has to hear which before it can say the
+# right thing. A fixed greeting spoken at answer also invited Telnyx's machine
+# detection: on the first live call it heard an iPhone call screener, decided
+# "machine", cut the greeting off and silenced the agent for the whole call.
+GREETING = ""
 
 
 def proxy_token() -> str:
@@ -129,10 +143,11 @@ def assistant_payload(base_url: str, application_id: str) -> dict:
         "telephony_settings": {
             "default_texml_app_id": application_id,
             "time_limit_secs": 600,
-            "voicemail_detection": {"on_voicemail_detected": {
-                "action": "leave_message_and_stop_assistant",
-                "voicemail_message": {"type": "message", "message": VOICEMAIL},
-            }},
+            # Never stop on a "machine" verdict: a call screener is a machine too,
+            # and stopping there left a person who then picked up in silence. The
+            # instructions handle screeners and voicemail instead. Set explicitly,
+            # because an update keeps any field it leaves out.
+            "voicemail_detection": {"on_voicemail_detected": {"action": "continue_assistant"}},
         },
     }
 
