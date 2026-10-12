@@ -706,6 +706,33 @@ def test_agent_calls() -> None:
                   ("POST", "/ai/assistants/assistant-new") in [(m, p) for m, p, _ in fake.api])
             check("the agent is ready once set up", agent.status()["ready"] is True)
 
+            # Switching the model to Telnyx's built-in copy.
+            db.set_setting("agent_llm", "telnyx")
+            check("switching where the AI runs pauses AI calls until Update",
+                  agent.status()["needs_update"] is True and agent.status()["ready"] is False)
+            built_in = agent.assistant_payload("https://robocaller.example.com", "app-123")
+            check("the built-in route names the model and drops the outside endpoint",
+                  built_in.get("model") == "anthropic/claude-haiku-4-5" and "external_llm" not in built_in)
+            db.set_setting("perplexity_api_key", "")
+            check("the built-in route doesn't need a Perplexity key",
+                  not any("Perplexity" in m for m in agent.status()["missing"]))
+            fake.api.clear()
+            agent.setup(fake)
+            writes = [(m, p) for m, p, _ in fake.api]
+            check("switching creates a fresh assistant and stores no model token",
+                  writes == [("POST", "/ai/assistants")], str(writes))
+            check("after Update the agent is ready on the new route",
+                  agent.status()["ready"] is True and agent.status()["route"] == "telnyx")
+            db.set_setting("agent_llm", "perplexity")
+            db.set_setting("perplexity_api_key", "pplx-test")
+            fake.api.clear()
+            agent.setup(fake)
+            check("switching back creates a fresh Perplexity assistant",
+                  ("POST", "/ai/assistants") in [(m, p) for m, p, _ in fake.api]
+                  and agent.status()["ready"] is True)
+            check("the agent may answer everyday questions with common sense",
+                  "common sense" in agent.INSTRUCTIONS)
+
             # A test call in AI mode.
             task_id = dispatcher.enqueue_single("+16175550193", "Ask about the sofa delivery.", mode="agent")
             dispatcher.dispatch_pending(only_task_id=task_id, ignore_window=True)
@@ -743,7 +770,8 @@ def test_agent_calls() -> None:
             config.telephony = original
     finally:
         os.environ.pop("AGENT_PROXY_TOKEN", None)
-        for key in ("perplexity_api_key", "public_base_url", "telnyx_assistant_id"):
+        for key in ("perplexity_api_key", "public_base_url", "telnyx_assistant_id",
+                    "agent_llm", "telnyx_assistant_route"):
             db.set_setting(key, "")
 
 

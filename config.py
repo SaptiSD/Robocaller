@@ -32,6 +32,10 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     # Agent API id; Claude Haiku keeps each spoken reply quick and handles the
     # hang-up and opt-out tools reliably.
     "telnyx_assistant_id": ("TELNYX_ASSISTANT_ID", ""),
+    # Where the agent's model runs: "perplexity" (through this server's /llm/v1)
+    # or "telnyx" (Telnyx's built-in copy of the model - one less hop per reply).
+    "agent_llm": ("AGENT_LLM", "perplexity"),
+    "telnyx_assistant_route": ("", ""),  # which of those the saved assistant uses
     "agent_model": ("AGENT_MODEL", "anthropic/claude-haiku-4-5"),
     "agent_voice": ("AGENT_VOICE", "Telnyx.KokoroTTS.af_heart"),
     "test_number": ("TEST_DESTINATION_NUMBER", ""),

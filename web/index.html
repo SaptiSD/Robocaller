@@ -474,9 +474,16 @@ Telnyx bills each call against your account balance.
 
       <div class="card">
         <div class="card-head"><h2>AI phone agent</h2></div>
-        <div class="hint" style="margin-bottom:12px">For "AI conversation" calls. Telnyx runs the call;
-          Perplexity, through this server, decides what to say. Setting it up creates the agent in your
-          Telnyx account.</div>
+        <div class="hint" style="margin-bottom:12px">For "AI conversation" calls. Telnyx runs the call and an AI
+          model decides what to say. Setting it up creates the agent in your Telnyx account.</div>
+        <div class="field">
+          <label for="s-agent-llm">The agent's AI runs on</label>
+          <select id="s-agent-llm">
+            <option value="perplexity">Perplexity, through this server &mdash; uses your Perplexity key</option>
+            <option value="telnyx">Telnyx's built-in model &mdash; quicker replies, billed by Telnyx</option>
+          </select>
+          <div class="hint">Same model either way (Claude Haiku). After changing this, press Update in Telnyx.</div>
+        </div>
         <div id="agent-status" class="hint"></div>
         <div class="btn-row" style="margin-top:12px">
           <button id="btn-agent-setup">Set up in Telnyx</button>

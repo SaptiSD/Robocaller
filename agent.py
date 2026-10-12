@@ -68,9 +68,12 @@ How to behave:
 sentences. Never use lists, markdown, emoji, abbreviations or web addresses.
 - If asked, say plainly that you are an automated AI assistant. Never claim to be \
 a person.
-- Only state facts from "Why you are calling" and the background. If asked \
-something neither covers, say you'll pass the question on and give the callback \
-number, {{callback_spoken}}.
+- About {{business_name}}, state only facts from "Why you are calling" and the \
+background - never make up prices, discounts, dates, availability, policies or \
+promises. If asked about one of those and neither covers it, say you'll pass the \
+question on and give the callback number, {{callback_spoken}}.
+- Simple, related everyday questions you can answer with common sense - for \
+example what to wear for the weather you mentioned - just answer, briefly.
 - Never invent prices, discounts, deadlines or promises. Never ask for payment, \
 card, bank or account details, passwords, or government ID numbers.
 - If the person asks not to be called again, asks to be removed, or says to stop: \
@@ -99,10 +102,23 @@ def model() -> str:
     return config.get("agent_model").strip() or config.DEFAULTS["agent_model"][1]
 
 
+ROUTES = ("perplexity", "telnyx")
+
+
+def route() -> str:
+    chosen = config.get("agent_llm").strip().lower()
+    return chosen if chosen in ROUTES else "perplexity"
+
+
+def _saved_route() -> str:
+    # Assistants created before the choice existed all ran through Perplexity.
+    return config.get("telnyx_assistant_route") or "perplexity"
+
+
 def status() -> dict:
     """What the dashboard needs to say whether AI calls can go out, and if not why."""
     missing = []
-    if not config.get("perplexity_api_key"):
+    if route() == "perplexity" and not config.get("perplexity_api_key"):
         missing.append("a Perplexity API key")
     if not proxy_token():
         missing.append("AGENT_PROXY_TOKEN in the server's environment")
@@ -111,14 +127,31 @@ def status() -> dict:
     if config.telephony() is None:
         missing.append("Telnyx credentials")
     assistant_id = config.get("telnyx_assistant_id")
+    # Switching where the model runs needs a fresh assistant (see setup), so until
+    # Update is pressed the saved one is on the old route and calls wait.
+    needs_update = bool(assistant_id) and _saved_route() != route()
     return {
         "can_setup": not missing,
         "missing": missing,
         "assistant_id": assistant_id,
-        "ready": not missing and bool(assistant_id),
+        "ready": not missing and bool(assistant_id) and not needs_update,
+        "needs_update": needs_update,
+        "route": route(),
         "model": model(),
         "voice": config.get("agent_voice"),
     }
+
+
+def _llm_fields(base_url: str) -> dict:
+    if route() == "telnyx":
+        # Telnyx's own copy of the model: no key, no trip through this server.
+        return {"model": model()}
+    return {"external_llm": {
+        "base_url": f"{base_url}/llm/v1",
+        "model": model(),
+        "llm_api_key_ref": SECRET_IDENTIFIER,
+        "authentication_method": "token",
+    }}
 
 
 def assistant_payload(base_url: str, application_id: str) -> dict:
@@ -127,12 +160,7 @@ def assistant_payload(base_url: str, application_id: str) -> dict:
         "name": ASSISTANT_NAME,
         "instructions": INSTRUCTIONS,
         "greeting": GREETING,
-        "external_llm": {
-            "base_url": f"{base_url}/llm/v1",
-            "model": model(),
-            "llm_api_key_ref": SECRET_IDENTIFIER,
-            "authentication_method": "token",
-        },
+        **_llm_fields(base_url),
         "voice_settings": {"voice": config.get("agent_voice")},
         # Flux decides a turn has ended from how the person speaks, not from a
         # silence timer. With nova-3, Telnyx's defaults waited 1.5s of silence after
@@ -204,21 +232,26 @@ def setup(phone) -> tuple[str, str]:
     if not info["can_setup"]:
         return "", "Missing " + ", ".join(info["missing"]) + "."
 
-    # A secret's token can't be read back or edited, so replace it outright.
-    listing, _ = phone._call_api("GET", "/integration_secrets", params={"page[size]": 250})
-    for secret in listing.get("data") or []:
-        if secret.get("identifier") == SECRET_IDENTIFIER and secret.get("id"):
-            phone._call_api("DELETE", f"/integration_secrets/{secret['id']}")
-    _, error = phone._call_api("POST", "/integration_secrets", json={
-        "identifier": SECRET_IDENTIFIER, "type": "bearer", "token": proxy_token()})
-    if error:
-        return "", f"Could not store the model token in Telnyx: {error}"
+    if route() == "perplexity":
+        # A secret's token can't be read back or edited, so replace it outright.
+        listing, _ = phone._call_api("GET", "/integration_secrets", params={"page[size]": 250})
+        for secret in listing.get("data") or []:
+            if secret.get("identifier") == SECRET_IDENTIFIER and secret.get("id"):
+                phone._call_api("DELETE", f"/integration_secrets/{secret['id']}")
+        _, error = phone._call_api("POST", "/integration_secrets", json={
+            "identifier": SECRET_IDENTIFIER, "type": "bearer", "token": proxy_token()})
+        if error:
+            return "", f"Could not store the model token in Telnyx: {error}"
 
     payload = assistant_payload(config.get("public_base_url"), phone.application_id)
     assistant_id = config.get("telnyx_assistant_id")
-    if assistant_id:
+    # An update keeps any field it leaves out, so an assistant built around an
+    # outside model can't simply be switched to a built-in one (or back): a
+    # change of route gets a fresh assistant instead.
+    if assistant_id and _saved_route() == route():
         _, error = phone._call_api("POST", f"/ai/assistants/{assistant_id}", json=payload)
         if not error:
+            config.set_many({"telnyx_assistant_route": route()})
             return assistant_id, ""
         # Deleted in the portal, most likely - fall through and create a new one.
     created, error = phone._call_api("POST", "/ai/assistants", json=payload)
@@ -227,5 +260,5 @@ def setup(phone) -> tuple[str, str]:
     assistant_id = str((created.get("data") or created).get("id") or "")
     if not assistant_id:
         return "", "Telnyx created the assistant but returned no id."
-    config.set_many({"telnyx_assistant_id": assistant_id})
+    config.set_many({"telnyx_assistant_id": assistant_id, "telnyx_assistant_route": route()})
     return assistant_id, ""

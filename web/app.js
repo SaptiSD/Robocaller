@@ -775,13 +775,26 @@ function renderAgent(info) {
   const btn = $("#btn-agent-setup");
   btn.textContent = info.assistant_id ? "Update in Telnyx" : "Set up in Telnyx";
   btn.disabled = !info.can_setup;
+  $("#s-agent-llm").value = info.route || "perplexity";
+  const where = info.route === "telnyx" ? "Telnyx" : "Perplexity";
   $("#agent-status").innerHTML = info.ready
-    ? `<span style="color:var(--good)">&#10003; Ready.</span> Model <code>${esc(info.model)}</code>,
+    ? `<span style="color:var(--good)">&#10003; Ready.</span> Model <code>${esc(info.model)}</code> via ${where},
        voice <code>${esc(info.voice)}</code>, Telnyx assistant <code>${esc(info.assistant_id)}</code>.`
+    : info.needs_update && !info.missing.length
+      ? `<span style="color:var(--critical)">Switched to ${where} &mdash; press Update in Telnyx to apply it.
+         AI calls are paused until then.</span>`
     : info.missing.length
       ? `Not ready yet. Still needed: ${info.missing.map(esc).join("; ")}.`
       : "Everything it needs is in place &mdash; press the button to create the agent in Telnyx.";
   refreshModeHint();
+}
+
+async function changeAgentLlm() {
+  try {
+    await api("/settings", { method: "POST", body: { values: { agent_llm: $("#s-agent-llm").value } } });
+    META.agent = (await api("/settings")).agent;
+    renderAgent(META.agent);
+  } catch (err) { toast(err.message, true); }
 }
 
 async function setupAgent() {
@@ -889,6 +902,7 @@ $("#btn-verify").addEventListener("click", verifyTelnyx);
 $("#btn-save-settings").addEventListener("click", saveSettings);
 $("#btn-draft").addEventListener("click", draftScript);
 $("#btn-agent-setup").addEventListener("click", setupAgent);
+$("#s-agent-llm").addEventListener("change", changeAgentLlm);
 $("#c-agent").addEventListener("change", refreshModeHint);
 $("#c-agent-info").addEventListener("input", () => {
   const n = $("#c-agent-info").value.length;
