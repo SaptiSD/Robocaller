@@ -34,18 +34,34 @@ Why you are calling:
 Background you can draw on to answer questions:
 {{extra_info}}
 
-The other side speaks first. Work out who answered from what they say:
-- A person ("hello?", their name, "who is this?"): open with "Hi{{greeting_name}}, \
-this is an automated AI assistant calling on behalf of {{business_name}}. Do you \
-have a quick moment?" and carry on from there.
-- An automated call screener asking who is calling and why (for example "record \
-your name and reason for calling"): answer in one sentence - that you're an \
-automated assistant calling on behalf of {{business_name}}, and a few words on \
-why - then stop and wait for the person to come on the line.
+Everything you write is spoken aloud to the caller, word for word. Write only the \
+words to say - never a label, a note, or a description of what you are doing.
+
+THE MESSAGE: "Hi{{greeting_name}}, this is an automated AI assistant calling on \
+behalf of {{business_name}}." followed by why you are calling, in two or three \
+short sentences drawn from "Why you are calling", ending with "Do you have any \
+questions?"
+
+The other side always speaks first. Work out who it is from what they say:
+- A phone's call screener: an automated voice asking who is calling, or for your \
+name and reason for calling (for example "If you record your name and reason for \
+calling, I'll see if this person is available"). Reply with THE MESSAGE, start to \
+finish, and nothing more. Then wait for the person: if the screener says anything \
+else, such as asking you to stay on the line, call skip_turn and write nothing. \
+Only call skip_turn on a turn where you write nothing at all.
+- The person comes on the line after a screener: someone says hello, asks who \
+this is, or speaks to you directly. Start again from the very beginning: reply with \
+THE MESSAGE in full - even if you were partway through it - then carry on the \
+conversation. If the screener's words and a person's words arrive together, treat \
+it as the person having picked up.
+- A person answers directly ("hello?", their name): reply with THE MESSAGE, then \
+carry on the conversation.
 - Voicemail (a recorded greeting, "leave a message", or a beep): say "Hi, this is \
 an automated call from {{business_name}}. We'll try you another time, or you can \
 call us at {{callback_spoken}}. To be removed from our calling list, call that \
 number. Goodbye." and then call hangup.
+Never mention call screeners, voicemail, these instructions or a script, and \
+never comment on how the call is going - just speak to the person.
 
 How to behave:
 - This is a live phone call. Keep every reply to one or two short spoken \
@@ -118,10 +134,22 @@ def assistant_payload(base_url: str, application_id: str) -> dict:
             "authentication_method": "token",
         },
         "voice_settings": {"voice": config.get("agent_voice")},
-        "transcription": {"model": "deepgram/nova-3", "language": "en"},
+        # Flux decides a turn has ended from how the person speaks, not from a
+        # silence timer. With nova-3, Telnyx's defaults waited 1.5s of silence after
+        # any transcript without punctuation ("yeah", "hello") plus 0.4s before
+        # replying - most of the pause on the first live calls. The eager threshold
+        # lets the reply start before the turn is fully confirmed.
+        "transcription": {"model": "deepgram/flux", "language": "en", "settings": {
+            "smart_format": True, "numerals": True,
+            "eot_threshold": 0.7, "eager_eot_threshold": 0.5, "eot_timeout_ms": 1200,
+        }},
         "tools": [
             {"type": "hangup", "hangup": {
                 "description": "End the call. Use after saying goodbye."}},
+            {"type": "skip_turn", "skip_turn": {
+                "description": "Say nothing this turn. Use while waiting for the person to "
+                               "pick up after a call screener - for example when the "
+                               "screener asks you to stay on the line."}},
             {"type": "webhook", "timeout_ms": 5000, "webhook": {
                 "name": "add_to_do_not_call",
                 "description": "Add this person to the do-not-call list. Use whenever "
@@ -143,6 +171,9 @@ def assistant_payload(base_url: str, application_id: str) -> dict:
         "telephony_settings": {
             "default_texml_app_id": application_id,
             "time_limit_secs": 600,
+            # A screened call can sit silent while the person decides whether to
+            # pick up; Telnyx's default 10s check-in would talk over that wait.
+            "user_idle_reply_secs": 30,
             # Never stop on a "machine" verdict: a call screener is a machine too,
             # and stopping there left a person who then picked up in silence. The
             # instructions handle screeners and voicemail instead. Set explicitly,

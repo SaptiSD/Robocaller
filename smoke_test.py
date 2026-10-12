@@ -575,6 +575,35 @@ def test_agent_translation() -> None:
     check("streamed argument deltas are relayed once, not duplicated",
           "".join(parts) == '{"reason": "x"}', repr(parts))
 
+    # Speaking and calling skip_turn in one reply: the words must win, in either order.
+    def names(evts):
+        chunks = _sse_payloads(asyncio.run(run(evts)))
+        deltas = [c["choices"][0]["delta"] for c in chunks if isinstance(c, dict) and c.get("choices")]
+        finish = [c["choices"][0]["finish_reason"] for c in chunks
+                  if isinstance(c, dict) and c.get("choices") and c["choices"][0]["finish_reason"]]
+        return ([t["function"]["name"] for d in deltas for t in d.get("tool_calls") or [] if t.get("id")],
+                "".join(d.get("content") or "" for d in deltas), finish)
+
+    skip = {"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_s",
+            "call_id": "cs", "name": "skip_turn", "arguments": "{}"}}
+    said = {"type": "response.output_text.delta", "delta": "Hi Dana, this is an automated assistant."}
+    done = {"type": "response.completed", "response": {}}
+    tools, text, finish = names([said, skip, done])
+    check("speech followed by skip_turn: the speech goes out, the skip doesn't",
+          tools == [] and text and finish == ["stop"], str((tools, finish)))
+    tools, text, finish = names([skip, said, done])
+    check("skip_turn followed by speech: same - held back, then dropped", tools == [] and text, str(tools))
+    tools, text, finish = names([skip, done])
+    check("skip_turn on its own is passed through", tools == ["skip_turn"] and finish == ["tool_calls"], str(tools))
+    tools, _, _ = names([said, {"type": "response.output_item.added", "item": {"type": "function_call",
+                         "id": "fc_h", "call_id": "ch", "name": "hangup", "arguments": "{}"}}, done])
+    check("other tools still go out alongside speech", tools == ["hangup"], str(tools))
+    both = llm_proxy.to_chat_completion({"output": [
+        {"type": "message", "content": [{"type": "output_text", "text": "Hello."}]},
+        {"type": "function_call", "call_id": "c", "name": "skip_turn", "arguments": "{}"}]}, "m")
+    check("non-streamed replies drop skip_turn when they speak too",
+          "tool_calls" not in both["choices"][0]["message"] and both["choices"][0]["finish_reason"] == "stop")
+
 
 class FakeAgentPhone:
     """A Telephony stand-in that records AI calls and Telnyx API writes."""
@@ -641,6 +670,15 @@ def test_agent_calls() -> None:
                   payload["telephony_settings"]["voicemail_detection"]["on_voicemail_detected"]
                   == {"action": "continue_assistant"})
             check("the other side speaks first", payload["greeting"] == "")
+            check("the agent can stay silent on purpose (skip_turn)", "skip_turn" in tools)
+            check("turn detection uses Flux with an eager end of turn",
+                  payload["transcription"]["model"] == "deepgram/flux"
+                  and payload["transcription"]["settings"]["eager_eot_threshold"]
+                  <= payload["transcription"]["settings"]["eot_threshold"])
+            check("a screened call gets time before the agent checks in",
+                  payload["telephony_settings"]["user_idle_reply_secs"] >= 30)
+            check("after a screener, the agent restarts its message when the person picks up",
+                  "Start again from the very beginning" in payload["instructions"])
             check("the agent's opening line says it's an AI",
                   "this is an automated AI assistant calling on behalf of {{business_name}}"
                   in payload["instructions"])

@@ -25,6 +25,10 @@ from typing import Any, AsyncIterator
 import httpx
 
 AGENT_URL = "https://api.perplexity.ai/v1/agent"
+# Telnyx's "stay silent this turn" tool. A model will sometimes speak and call it
+# in the same reply; if Telnyx honoured the skip, the words would be thrown away,
+# so a reply that says something never forwards it.
+SILENT_TOOL = "skip_turn"
 TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 DEFAULT_MAX_OUTPUT_TOKENS = 400
 
@@ -134,6 +138,8 @@ def to_chat_completion(response: dict, model: str) -> dict:
             calls.append({"id": item.get("call_id", ""), "type": "function",
                           "function": {"name": item.get("name", ""),
                                        "arguments": item.get("arguments") or "{}"}})
+    if text.strip():
+        calls = [c for c in calls if c["function"]["name"] != SILENT_TOOL]
     message: dict[str, Any] = {"role": "assistant", "content": text or None}
     if calls:
         message["tool_calls"] = calls
@@ -164,10 +170,14 @@ async def translate_stream(events: AsyncIterator[dict], model: str,
     tool_index: dict[str, int] = {}
     args_sent: set[str] = set()
     final: dict = {}
+    spoke = False
+    # Held back until the reply is complete, then sent only if nothing was said.
+    silent: dict[str, dict] = {}
 
     async for event in events:
         kind = event.get("type", "")
         if kind == "response.output_text.delta" and event.get("delta"):
+            spoke = spoke or bool(event["delta"].strip())
             yield chunk({"content": event["delta"]})
         elif kind in ("response.output_item.added", "response.output_item.done"):
             item = event.get("item") or {}
@@ -175,6 +185,10 @@ async def translate_stream(events: AsyncIterator[dict], model: str,
                 continue
             item_id = item.get("id") or item.get("call_id", "")
             arguments = item.get("arguments") or ""
+            if item.get("name") == SILENT_TOOL or item_id in silent:
+                held = silent.setdefault(item_id, {"call_id": item.get("call_id", ""), "arguments": ""})
+                held["arguments"] = arguments or held["arguments"]
+                continue
             if item_id not in tool_index:
                 tool_index[item_id] = len(tool_index)
                 yield chunk({"tool_calls": [{"index": tool_index[item_id], "id": item.get("call_id", ""),
@@ -188,7 +202,9 @@ async def translate_stream(events: AsyncIterator[dict], model: str,
                 args_sent.add(item_id)
         elif kind == "response.function_call_arguments.delta" and event.get("delta"):
             item_id = event.get("item_id", "")
-            if item_id in tool_index:
+            if item_id in silent:
+                silent[item_id]["arguments"] += event["delta"]
+            elif item_id in tool_index:
                 yield chunk({"tool_calls": [{"index": tool_index[item_id], "function": {"arguments": event["delta"]}}]})
                 args_sent.add(item_id)
         elif kind == "response.completed":
@@ -197,6 +213,12 @@ async def translate_stream(events: AsyncIterator[dict], model: str,
             log.warning("Perplexity stream error: %s", json.dumps(event)[:300])
             final = event.get("response") or {}
             break
+
+    if not spoke:
+        for item_id, held in silent.items():
+            tool_index[item_id] = len(tool_index)
+            yield chunk({"tool_calls": [{"index": tool_index[item_id], "id": held["call_id"], "type": "function",
+                                         "function": {"name": SILENT_TOOL, "arguments": held["arguments"] or "{}"}}]})
 
     yield chunk({}, _finish(final, bool(tool_index)))
     if include_usage:
