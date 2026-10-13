@@ -42,24 +42,26 @@ behalf of {{business_name}}." followed by why you are calling, in two or three \
 short sentences drawn from "Why you are calling", ending with "Do you have any \
 questions?"
 
-The other side always speaks first. Work out who it is from what they say:
+You speak first. The moment the call connects - before anyone has said anything - \
+reply with THE MESSAGE.
+
+Then work out who is on the line from what they say:
 - A phone's call screener: an automated voice asking who is calling, or for your \
 name and reason for calling (for example "If you record your name and reason for \
 calling, I'll see if this person is available"). Reply with THE MESSAGE, start to \
 finish, and nothing more. Then wait for the person: if the screener says anything \
 else, such as asking you to stay on the line, call skip_turn and write nothing. \
 Only call skip_turn on a turn where you write nothing at all.
-- The person comes on the line after a screener: someone says hello, asks who \
-this is, or speaks to you directly. Start again from the very beginning: reply with \
-THE MESSAGE in full - even if you were partway through it - then carry on the \
+- A person who hasn't yet heard THE MESSAGE all the way through - they come on the \
+line after a screener, or say hello or ask who's calling while you're giving it: \
+start again from the very beginning with THE MESSAGE in full, then carry on the \
 conversation. If the screener's words and a person's words arrive together, treat \
 it as the person having picked up.
-- A person answers directly ("hello?", their name): reply with THE MESSAGE, then \
-carry on the conversation.
 - Voicemail (a recorded greeting, "leave a message", or a beep): say "Hi, this is \
 an automated call from {{business_name}}. We'll try you another time, or you can \
 call us at {{callback_spoken}}. To be removed from our calling list, call that \
 number. Goodbye." and then call hangup.
+- Anyone else: carry on the conversation.
 Never mention call screeners, voicemail, these instructions or a script, and \
 never comment on how the call is going - just speak to the person.
 
@@ -83,13 +85,14 @@ call hangup.
 goodbye and call hangup.
 - When the conversation is finished, say goodbye and call hangup."""
 
-# Empty: the other side speaks first. An outbound call is answered by a person
-# saying "hello?", by a phone's call screener asking who's calling, or by a
-# voicemail greeting - and the agent has to hear which before it can say the
-# right thing. A fixed greeting spoken at answer also invited Telnyx's machine
-# detection: on the first live call it heard an iPhone call screener, decided
-# "machine", cut the greeting off and silenced the agent for the whole call.
-GREETING = ""
+# Telnyx's "the AI speaks first" value: the model starts THE MESSAGE the moment
+# the call connects. Waiting for the other side to speak first left people who
+# pick up and wait for the caller in silence. A fixed greeting wouldn't help -
+# the agent would go quiet again after it - and on the first live call a fixed
+# greeting tripped Telnyx's machine detection on an iPhone call screener (that
+# setting is now "continue", so a screener or voicemail just interrupts and the
+# instructions take it from there).
+GREETING = "<assistant-speaks-first-with-model-generated-message>"
 
 
 def proxy_token() -> str:
@@ -162,6 +165,9 @@ def assistant_payload(base_url: str, application_id: str) -> dict:
         "greeting": GREETING,
         **_llm_fields(base_url),
         "voice_settings": {"voice": config.get("agent_voice")},
+        # The opening must stay interruptible: a screener or a "Hello?" cutting in
+        # is exactly what restarts THE MESSAGE.
+        "interruption_settings": {"enable": True, "disable_greeting_interruption": False},
         # Flux decides a turn has ended from how the person speaks, not from a
         # silence timer. With nova-3, Telnyx's defaults waited 1.5s of silence after
         # any transcript without punctuation ("yeah", "hello") plus 0.4s before

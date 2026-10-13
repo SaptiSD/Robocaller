@@ -729,7 +729,11 @@ def test_agent_calls() -> None:
             check("a 'machine' verdict never stops the agent (call screeners count as machines)",
                   payload["telephony_settings"]["voicemail_detection"]["on_voicemail_detected"]
                   == {"action": "continue_assistant"})
-            check("the other side speaks first", payload["greeting"] == "")
+            check("the agent speaks first, as soon as the call connects",
+                  payload["greeting"] == "<assistant-speaks-first-with-model-generated-message>"
+                  and "You speak first" in payload["instructions"])
+            check("its opening can be interrupted (a screener or a Hello? restarts it)",
+                  payload["interruption_settings"] == {"enable": True, "disable_greeting_interruption": False})
             check("the agent can stay silent on purpose (skip_turn)", "skip_turn" in tools)
             check("turn detection uses Flux with an eager end of turn",
                   payload["transcription"]["model"] == "deepgram/flux"
@@ -738,7 +742,7 @@ def test_agent_calls() -> None:
             check("a screened call gets time before the agent checks in",
                   payload["telephony_settings"]["user_idle_reply_secs"] >= 30)
             check("after a screener, the agent restarts its message when the person picks up",
-                  "Start again from the very beginning" in payload["instructions"])
+                  "start again from the very beginning" in payload["instructions"])
             check("the agent's opening line says it's an AI",
                   "this is an automated AI assistant calling on behalf of {{business_name}}"
                   in payload["instructions"])
