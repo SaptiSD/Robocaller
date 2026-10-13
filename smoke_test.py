@@ -988,6 +988,37 @@ def test_webhook_signatures() -> None:
             check("an unreadable key is refused with a clear reason",
                   post(client).status_code == 403
                   and "not a valid public key" in post(client).json()["error"])
+
+            # Render has no python-multipart; Starlette's request.form() needs it.
+            # Simulate that, and make sure webhooks don't depend on it.
+            import starlette.requests as starlette_requests
+            saved = starlette_requests.parse_options_header
+            starlette_requests.parse_options_header = None
+            try:
+                db.set_setting("telnyx_public_key", public)
+                check("webhooks work without python-multipart (Render doesn't have it)",
+                      post(client).status_code == 204)
+
+                # A webhook-mode recorded call: placed, but its message not yet fetched.
+                fake = install_fake(mode="webhook")
+                played_id = dispatcher.enqueue_single("+16175550199", "Hello from the showroom.")
+                dispatcher.dispatch_pending(only_task_id=played_id, ignore_window=True)
+                row = db.query_one("SELECT token, played FROM call_tasks WHERE id = ?", (played_id,))
+                check("a webhook-mode message isn't counted as played until Telnyx fetches it",
+                      fake.placed and row["played"] == 0)
+                stamp = str(int(_time.time()))
+                voice_body = b"CallStatus=in-progress&AnsweredBy=human"
+                res = client.post(f"/telnyx/voice/{row['token']}", content=voice_body, headers={
+                    "content-type": "application/x-www-form-urlencoded",
+                    "telnyx-signature-ed25519": base64.b64encode(
+                        private.sign(stamp.encode() + b"|" + voice_body)).decode(),
+                    "telnyx-timestamp": stamp})
+                check("Telnyx gets the message script", res.status_code == 200
+                      and "Hello from the showroom" in res.text, res.text[:200])
+                check("and the call is now marked as played",
+                      db.query_one("SELECT played FROM call_tasks WHERE id = ?", (played_id,))["played"] == 1)
+            finally:
+                starlette_requests.parse_options_header = saved
     finally:
         db.set_setting("telnyx_public_key", "")
         server._warned.clear()

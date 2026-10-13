@@ -454,10 +454,13 @@ def dispatch_pending(
             result = CallResult(False, error=f"{type(exc).__name__}: {exc}")
 
         if result.ok:
+            # In webhook mode a recorded message is fetched from us mid-call, and
+            # that fetch can fail; until it happens the message hasn't played.
+            fetched_later = mode != "agent" and getattr(phone, "mode", "direct") == "webhook"
             db.execute(
-                "UPDATE call_tasks SET status = 'queued', sid = ?, "
+                "UPDATE call_tasks SET status = 'queued', sid = ?, played = ?, "
                 "attempts = attempts + 1, error = '', updated_at = ? WHERE id = ?",
-                (result.sid, db.to_utc(now), task["id"]),
+                (result.sid, 0 if fetched_later else 1, db.to_utc(now), task["id"]),
             )
             placed += 1
         elif _line_full(result.error):

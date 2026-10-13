@@ -102,7 +102,8 @@ function fmtTime(utcString) {
 function statusPill(task) {
   const s = task.status || task.state;
   let cls = "muted", label = s || "—";
-  if (s === "completed") { cls = "good"; label = "Delivered"; }
+  if (s === "completed" && task.played === 0) { cls = "critical"; label = "Answered, message not played"; }
+  else if (s === "completed") { cls = "good"; label = "Delivered"; }
   else if (s === "busy") { cls = "warning"; label = "Busy"; }
   else if (s === "no-answer") { cls = "warning"; label = "No answer"; }
   else if (["failed", "canceled", "unknown"].includes(s)) { cls = "critical"; label = s === "unknown" ? "Lost track" : s[0].toUpperCase() + s.slice(1); }

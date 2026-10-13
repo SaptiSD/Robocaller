@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS call_tasks (
     script_override TEXT NOT NULL DEFAULT '',
     voice_override  TEXT NOT NULL DEFAULT '',
     mode_override   TEXT NOT NULL DEFAULT '',
+    -- 0 while a webhook-mode recorded message hasn't been fetched by Telnyx yet,
+    -- so an answered call whose message never played isn't shown as delivered.
+    -- Defaults to 1: rows from before this existed, and calls whose script or
+    -- AI agent travels with the call, have no such gap.
+    played          INTEGER NOT NULL DEFAULT 1,
     state         TEXT NOT NULL DEFAULT 'pending',
     status        TEXT NOT NULL DEFAULT '',
     attempts      INTEGER NOT NULL DEFAULT 0,

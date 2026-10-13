@@ -16,6 +16,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -820,13 +821,16 @@ def _warn_once(kind: str, message: str) -> None:
 async def _signed_form(request: Request) -> dict:
     """The POST body as a dict, once its signature has been checked.
 
-    The raw bytes have to be read before the form is parsed, because the
-    signature covers exactly those bytes. Starlette replays the cached body into
-    `form()`, so reading it first costs nothing.
+    The raw bytes are read first because the signature covers exactly those
+    bytes - and parsed here rather than with Starlette's `request.form()`, which
+    needs the separate python-multipart package. It wasn't in requirements.txt,
+    so on Render every webhook crashed with a 500 once signatures started
+    passing, and Telnyx answered recorded-message calls with "There was an
+    error that occurred, goodbye". Telnyx sends plain urlencoded forms.
     """
     body = await request.body()
     _validate(request, body)
-    return dict(await request.form())
+    return dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
 
 
 def _task_for(token: str) -> dict:
@@ -870,6 +874,8 @@ async def texml_for_call(token: str, request: Request) -> Response:
               or telephony.DEFAULT_VOICE,
         optout_url=f"{base}/telnyx/optout/{token}" if base else "",
     )
+    # The message is about to play - the call log may now say "Delivered".
+    db.execute("UPDATE call_tasks SET played = 1 WHERE id = ?", (task["id"],))
     return Response(xml, media_type="text/xml")
 
 
