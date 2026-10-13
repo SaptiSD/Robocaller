@@ -870,6 +870,65 @@ def test_agent_http() -> None:
         db.set_setting("perplexity_api_key", "")
 
 
+# --- 5d. Telnyx webhook signatures -------------------------------------------
+
+def test_webhook_signatures() -> None:
+    print("\nTelnyx webhook signatures")
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        print("  skip (httpx not installed)")
+        return
+    import base64
+    import time as _time
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    import server
+
+    private = Ed25519PrivateKey.generate()
+    public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+    task_id = dispatcher.enqueue_single("+16175550198", "signature test")
+    token = db.query_one("SELECT token FROM call_tasks WHERE id = ?", (task_id,))["token"]
+    body = b"CallStatus=ringing&CallDuration=0"
+
+    def post(client):
+        stamp = str(int(_time.time()))
+        signature = base64.b64encode(private.sign(stamp.encode() + b"|" + body)).decode()
+        return client.post(f"/telnyx/status/{token}", content=body, headers={
+            "content-type": "application/x-www-form-urlencoded",
+            "telnyx-signature-ed25519": signature, "telnyx-timestamp": stamp})
+
+    try:
+        with TestClient(server.app) as client:
+            db.set_setting("telnyx_public_key", public)
+            check("a correctly signed webhook is accepted", post(client).status_code == 204)
+            db.set_setting("telnyx_public_key", public.rstrip("="))
+            check("a key that lost its trailing '=' still works (Render's .env import did this)",
+                  public.endswith("=") and post(client).status_code == 204)
+            db.set_setting("telnyx_public_key", f'"{public}"')
+            check("a key pasted with quotes still works", post(client).status_code == 204)
+
+            other = base64.b64encode(Ed25519PrivateKey.generate().public_key()
+                                     .public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+            db.set_setting("telnyx_public_key", other)
+            server._warned.clear()
+            before = db.query_one("SELECT COUNT(*) AS n FROM events WHERE level = 'error'")["n"]
+            first, second = post(client), post(client)
+            after = db.query_one("SELECT COUNT(*) AS n FROM events WHERE level = 'error'")["n"]
+            check("a webhook signed with a different key is refused",
+                  first.status_code == 403 and second.status_code == 403)
+            check("the refusal shows up in Activity, once rather than per webhook", after - before == 1)
+            db.set_setting("telnyx_public_key", "not-base64!!")
+            check("an unreadable key is refused with a clear reason",
+                  post(client).status_code == 403
+                  and "not a valid public key" in post(client).json()["error"])
+    finally:
+        db.set_setting("telnyx_public_key", "")
+        server._warned.clear()
+
+
 # --- 6. the HTTP API ---------------------------------------------------------
 
 def test_api() -> None:
@@ -918,6 +977,19 @@ def test_api() -> None:
 
         res = client.post(f"/api/campaigns/{campaign_id}/run")
         check("run-now queues every contact", res.json()["queued"] == 2, res.text[:200])
+
+        # The friend's "the campaign didn't work": a contact added without the consent box.
+        res = client.post("/api/campaigns", json={
+            "name": "No consent", "message": "Hello from the showroom.", "contacts": "617-555-0192"})
+        check("creating with unconsented contacts says they won't be called",
+              res.json()["unconsented"] == 1, res.text[:200])
+        unconsented_id = res.json()["id"]
+        res = client.post(f"/api/campaigns/{unconsented_id}/run")
+        check("a run that skips everyone says why",
+              res.json()["queued"] == 0 and res.json()["skip_reasons"] == {"no-consent": 1}, res.text[:200])
+        check("the Activity feed says why too", "no consent on record" in
+              db.query_one("SELECT message FROM events ORDER BY id DESC LIMIT 1")["message"])
+        client.delete(f"/api/campaigns/{unconsented_id}")
 
         res = client.patch(f"/api/campaigns/{campaign_id}", json={"state": "paused"})
         check("a campaign can be paused", res.json()["state"] == "paused")
@@ -969,6 +1041,7 @@ def main() -> int:
     test_agent_translation()
     test_agent_calls()
     test_agent_http()
+    test_webhook_signatures()
     test_api()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

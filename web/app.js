@@ -37,12 +37,26 @@ async function api(path, options = {}) {
   return data;
 }
 
+// "Queued 0, skipped 1" left people guessing - say why, and what to do about it.
+function runSummary(r) {
+  const why = { "no-consent": "no consent on record", "suppressed": "on the do-not-call list" };
+  const reasons = Object.entries(r.skip_reasons || {}).map(([k, n]) => `${n} ${why[k] || k}`).join(", ");
+  if (r.queued === 0 && r.skipped) {
+    let msg = `Nothing was dialled: ${reasons || r.skipped + " skipped"}.`;
+    if ((r.skip_reasons || {})["no-consent"]) {
+      msg += " Add those numbers again with the consent box ticked - only if they really gave written consent.";
+    }
+    return msg;
+  }
+  return `Queued ${r.queued} call(s)` + (r.skipped ? `, skipped ${r.skipped} (${reasons}).` : ".");
+}
+
 function toast(message, bad = false) {
   const el = $("#toast");
   el.textContent = message;
   el.className = "on" + (bad ? " bad" : "");
   clearTimeout(el._t);
-  el._t = setTimeout(() => (el.className = ""), 3600);
+  el._t = setTimeout(() => (el.className = ""), Math.max(3600, message.length * 60));  // long enough to read
 }
 
 const esc = (s) =>
@@ -687,7 +701,10 @@ async function submitCampaign(event) {
     const result = await api("/campaigns", { method: "POST", body });
     let note = `Campaign created with ${result.contacts_added} contact(s).`;
     if (result.invalid.length) note += ` ${result.invalid.length} line(s) weren't valid numbers.`;
-    toast(note);
+    if (result.unconsented) {
+      note += ` None are marked as having given consent, so they won't be called. Add them again with the consent box ticked - only if they really did consent.`;
+    }
+    toast(note, Boolean(result.unconsented));
     $("#campaign-form").reset();
     refreshModeHint();
     $("#c-agent-info").dispatchEvent(new Event("input"));
@@ -718,7 +735,7 @@ async function handleClick(event) {
   if (run) {
     try {
       const r = await api(`/campaigns/${run.dataset.run}/run`, { method: "POST" });
-      toast(`Queued ${r.queued} call(s)` + (r.skipped ? `, skipped ${r.skipped}.` : "."));
+      toast(runSummary(r), r.queued === 0 && r.skipped > 0);
       currentView === "detail" ? openCampaign(Number(run.dataset.run)) : loadCampaigns();
     } catch (err) { toast(err.message, true); }
     return;

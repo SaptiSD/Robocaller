@@ -379,6 +379,8 @@ def create_campaign(body: CampaignIn) -> dict:
     return {
         "id": campaign_id,
         "contacts_added": added,
+        # Contacts that will be screened out on every run - worth saying up front.
+        "unconsented": added if body.require_consent and not body.contacts_consented else 0,
         "invalid": invalid,
         "campaign": campaign_row(require_campaign(campaign_id)),
     }
@@ -477,7 +479,8 @@ def run_campaign(campaign_id: int) -> dict:
         "UPDATE campaigns SET last_run_at = ?, runs = runs + 1 WHERE id = ?",
         (db.now_str(), campaign_id),
     )
-    return {"queued": queued, "skipped": skipped}
+    return {"queued": queued, "skipped": skipped,
+            "skip_reasons": dispatcher.skip_reasons(campaign) if skipped else {}}
 
 
 # --- contacts ---------------------------------------------------------------
@@ -758,7 +761,7 @@ def _validate(request: Request, body: bytes) -> None:
     when no public key has been entered, which mirrors how this behaved on
     Twilio when the auth token was absent.
     """
-    public_key = config.get("telnyx_public_key").strip()
+    public_key = _clean_key(config.get("telnyx_public_key"))
     if not public_key:
         return
 
@@ -776,9 +779,40 @@ def _validate(request: Request, body: bytes) -> None:
 
     try:
         key = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key))
+    except Exception as exc:  # noqa: BLE001
+        _warn_once("key", "TELNYX_PUBLIC_KEY isn't a valid Telnyx public key, so every Telnyx "
+                          "webhook is being refused and recorded-message calls go silent. Copy "
+                          "it again from Mission Control > Keys & Credentials > Public Key.")
+        raise HTTPException(403, "TELNYX_PUBLIC_KEY is not a valid public key.") from exc
+    try:
         key.verify(base64.b64decode(signature), b"%s|%s" % (timestamp.encode(), body))
     except Exception as exc:  # noqa: BLE001 - any failure here means "not Telnyx"
+        _warn_once("signature", "A Telnyx webhook failed its signature check. If calls are going "
+                                "silent, TELNYX_PUBLIC_KEY doesn't match the public key in Telnyx "
+                                "Mission Control > Keys & Credentials.")
         raise HTTPException(403, "Bad Telnyx signature.") from exc
+
+
+def _clean_key(raw: str) -> str:
+    """The public key as pasted, made decodable.
+
+    Base64 padding goes missing in transit - Render's .env import dropped this
+    key's trailing "=", which made every webhook fail - and pasted values often
+    carry quotes. Both are restored or stripped rather than failing every call.
+    """
+    key = (raw or "").strip().strip('"').strip("'").strip()
+    return key + "=" * (-len(key) % 4) if key else ""
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(kind: str, message: str) -> None:
+    """Put a webhook failure in the Activity feed - once per process, since a
+    single call sends several webhooks and each would otherwise log it again."""
+    if kind not in _warned:
+        _warned.add(kind)
+        db.log_event(message, "error")
 
 
 async def _signed_form(request: Request) -> dict:

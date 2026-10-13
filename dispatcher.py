@@ -214,11 +214,36 @@ def enqueue_campaign(campaign_id: int, now: datetime | None = None) -> tuple[int
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
+    reasons = skip_reasons(campaign) if skipped else {}
     db.log_event(
         f"Campaign '{campaign['name']}' queued {queued} call(s)"
-        + (f", skipped {skipped}" if skipped else "")
+        + (f", skipped {skipped} ({describe_skips(reasons)})" if skipped else "")
     )
     return queued, skipped
+
+
+SKIP_LABELS = {"no-consent": "no consent on record", "suppressed": "on the do-not-call list"}
+
+
+def skip_reasons(campaign: dict) -> dict[str, int]:
+    """Why a campaign's contacts would be skipped, counted - so "skipped 1" can
+    say what to do about it. Mirrors the screening in enqueue_campaign."""
+    suppressed = db.suppression_set()
+    counts: dict[str, int] = {}
+    for contact in db.query("SELECT phone, consent FROM contacts WHERE campaign_id = ?",
+                            (campaign["id"],)):
+        if contact["phone"] in suppressed:
+            reason = "suppressed"
+        elif campaign["require_consent"] and not contact["consent"]:
+            reason = "no-consent"
+        else:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def describe_skips(reasons: dict[str, int]) -> str:
+    return ", ".join(f"{n} {SKIP_LABELS.get(r, r)}" for r, n in reasons.items())
 
 
 def enqueue_single(phone: str, script: str = "", voice: str = "", mode: str = "message") -> int:
