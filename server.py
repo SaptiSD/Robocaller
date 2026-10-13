@@ -474,13 +474,13 @@ def run_campaign(campaign_id: int) -> dict:
     campaign = require_campaign(campaign_id)
     if not campaign["message"].strip():
         raise HTTPException(400, "This campaign has no message to read.")
-    queued, skipped = dispatcher.enqueue_campaign(campaign_id)
+    reasons: dict[str, int] = {}
+    queued, skipped = dispatcher.enqueue_campaign(campaign_id, reasons=reasons)
     db.execute(
         "UPDATE campaigns SET last_run_at = ?, runs = runs + 1 WHERE id = ?",
         (db.now_str(), campaign_id),
     )
-    return {"queued": queued, "skipped": skipped,
-            "skip_reasons": dispatcher.skip_reasons(campaign) if skipped else {}}
+    return {"queued": queued, "skipped": skipped, "skip_reasons": reasons}
 
 
 # --- contacts ---------------------------------------------------------------
@@ -554,6 +554,8 @@ def list_calls(campaign_id: int | None = None, limit: int = 200) -> list[dict]:
         )
     for row in rows:
         row["pretty"] = compliance.pretty(row["phone"])
+        # So the dashboard can show a scheduled call in the recipient's own time.
+        row["recipient_tz"] = compliance.timezone_for(row["phone"]) or ""
         row.pop("token", None)
     return rows
 

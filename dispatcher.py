@@ -35,6 +35,9 @@ TICK_SECONDS = 5
 SYNC_EVERY_TICKS = 4          # poll Telnyx for outcomes every ~20s
 MAX_ATTEMPTS = 1              # phase 1 does not retry busy / no-answer
 DEFER_GRACE = timedelta(minutes=1)
+# Telnyx caps how many calls an account can have up at once ("channel limit").
+# Hitting it is a full line, not a failed call: wait and try again.
+LINE_RETRY = timedelta(seconds=30)
 
 # Schedule timezones offered in the UI. Kept here so the server can reject
 # anything else rather than silently falling back to Eastern.
@@ -166,8 +169,12 @@ def first_run_at(campaign: dict, start_now: bool, now: datetime) -> datetime | N
 
 # --- queueing ---------------------------------------------------------------
 
-def enqueue_campaign(campaign_id: int, now: datetime | None = None) -> tuple[int, int]:
-    """Create call tasks for every eligible contact. Returns (queued, skipped)."""
+def enqueue_campaign(campaign_id: int, now: datetime | None = None,
+                     reasons: dict | None = None) -> tuple[int, int]:
+    """Create call tasks for every eligible contact. Returns (queued, skipped).
+
+    Pass a dict as `reasons` to have it filled with why contacts were skipped.
+    """
     now = now or db.utcnow()
     campaign = db.query_one("SELECT * FROM campaigns WHERE id = ?", (campaign_id,))
     if not campaign:
@@ -185,12 +192,25 @@ def enqueue_campaign(campaign_id: int, now: datetime | None = None) -> tuple[int
         "SELECT * FROM contacts WHERE campaign_id = ? ORDER BY id", (campaign_id,)
     )
     suppressed = db.suppression_set()
+    # Someone already waiting to be called - typically deferred to the start of
+    # their calling window - gets no second call. Pressing Run now twice before
+    # 9am otherwise queued the same person twice, and both fired at 9:01.
+    waiting = {
+        r["contact_id"] for r in db.query(
+            "SELECT contact_id FROM call_tasks WHERE campaign_id = ? "
+            "AND state IN ('pending', 'deferred', 'dialing')", (campaign_id,))
+    }
     run_key = f"{campaign_id}-{now.strftime('%Y%m%d%H%M%S')}"
     stamp = db.to_utc(now)
 
     rows, queued, skipped = [], 0, 0
+    counts: dict[str, int] = {}
     for contact in contacts:
         phone = contact["phone"]
+        if contact["id"] in waiting:
+            skipped += 1
+            counts["already-queued"] = counts.get("already-queued", 0) + 1
+            continue
         if phone in suppressed:
             reason, state = "suppressed", "skipped"
             skipped += 1
@@ -200,6 +220,8 @@ def enqueue_campaign(campaign_id: int, now: datetime | None = None) -> tuple[int
         else:
             reason, state = "", "pending"
             queued += 1
+        if reason:
+            counts[reason] = counts.get(reason, 0) + 1
         rows.append(
             (
                 campaign_id, contact["id"], phone, run_key, secrets.token_urlsafe(16),
@@ -214,32 +236,17 @@ def enqueue_campaign(campaign_id: int, now: datetime | None = None) -> tuple[int
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
-    reasons = skip_reasons(campaign) if skipped else {}
     db.log_event(
         f"Campaign '{campaign['name']}' queued {queued} call(s)"
-        + (f", skipped {skipped} ({describe_skips(reasons)})" if skipped else "")
+        + (f", skipped {skipped} ({describe_skips(counts)})" if skipped else "")
     )
+    if reasons is not None:
+        reasons.update(counts)
     return queued, skipped
 
 
-SKIP_LABELS = {"no-consent": "no consent on record", "suppressed": "on the do-not-call list"}
-
-
-def skip_reasons(campaign: dict) -> dict[str, int]:
-    """Why a campaign's contacts would be skipped, counted - so "skipped 1" can
-    say what to do about it. Mirrors the screening in enqueue_campaign."""
-    suppressed = db.suppression_set()
-    counts: dict[str, int] = {}
-    for contact in db.query("SELECT phone, consent FROM contacts WHERE campaign_id = ?",
-                            (campaign["id"],)):
-        if contact["phone"] in suppressed:
-            reason = "suppressed"
-        elif campaign["require_consent"] and not contact["consent"]:
-            reason = "no-consent"
-        else:
-            continue
-        counts[reason] = counts.get(reason, 0) + 1
-    return counts
+SKIP_LABELS = {"no-consent": "no consent on record", "suppressed": "on the do-not-call list",
+               "already-queued": "already waiting to be called"}
 
 
 def describe_skips(reasons: dict[str, int]) -> str:
@@ -453,6 +460,14 @@ def dispatch_pending(
                 (result.sid, db.to_utc(now), task["id"]),
             )
             placed += 1
+        elif _line_full(result.error):
+            db.execute(
+                "UPDATE call_tasks SET state = 'pending', status = 'waiting for a free line', "
+                "error = '', scheduled_for = ?, updated_at = ? WHERE id = ?",
+                (db.to_utc(now + LINE_RETRY), db.to_utc(now), task["id"]),
+            )
+            _note_line_limit()
+            break  # every line is busy - the rest of this batch would bounce too
         else:
             db.execute(
                 "UPDATE call_tasks SET state = 'done', status = 'failed', error = ?, "
@@ -462,6 +477,23 @@ def dispatch_pending(
             db.log_event(f"Call to {task['phone']} failed: {result.error}", "error")
 
     return placed
+
+
+def _line_full(error: str) -> bool:
+    """Telnyx error 90042: the account's limit on simultaneous calls is reached."""
+    return "90042" in (error or "") or "channel limit" in (error or "").lower()
+
+
+_line_limit_noted = False
+
+
+def _note_line_limit() -> None:
+    global _line_limit_noted
+    if not _line_limit_noted:
+        _line_limit_noted = True
+        db.log_event("Telnyx is limiting how many calls can be up at once on this account, so "
+                     "calls are waiting for a free line and going out one after another. Raise "
+                     "the outbound channel limit in Telnyx to call several people at a time.")
 
 
 def sync_open_calls(now: datetime | None = None) -> int:

@@ -39,7 +39,8 @@ async function api(path, options = {}) {
 
 // "Queued 0, skipped 1" left people guessing - say why, and what to do about it.
 function runSummary(r) {
-  const why = { "no-consent": "no consent on record", "suppressed": "on the do-not-call list" };
+  const why = { "no-consent": "no consent on record", "suppressed": "on the do-not-call list",
+                "already-queued": "already waiting to be called" };
   const reasons = Object.entries(r.skip_reasons || {}).map(([k, n]) => `${n} ${why[k] || k}`).join(", ");
   if (r.queued === 0 && r.skipped) {
     let msg = `Nothing was dialled: ${reasons || r.skipped + " skipped"}.`;
@@ -332,13 +333,17 @@ async function openCampaign(id) {
   const [list, contacts, calls] = await Promise.all([
     api("/campaigns"), api(`/campaigns/${id}/contacts`), api(`/calls?campaign_id=${id}&limit=100`),
   ]);
+  // The soonest call still waiting - often deferred to the start of someone's calling window.
+  const nextCall = calls.filter((r) => ["pending", "deferred"].includes(r.state))
+    .map((r) => r.scheduled_for).sort()[0];
   const c = list.find((x) => x.id === id);
   if (!c) return show("campaigns");
   currentCampaignId = id;
 
   $("#detail-name").textContent = c.name;
   $("#detail-sub").textContent =
-    `${c.contacts} contacts · ${c.calls_total} calls queued · next run ${fmtWhen(c.next_run_at, c.timezone)}`;
+    `${c.contacts} contacts · ${c.calls_total} calls queued · next run ${fmtWhen(c.next_run_at, c.timezone)}`
+    + (nextCall ? ` · next call ${fmtWhen(nextCall)}` : "");
 
   $("#detail-body").innerHTML = `
     <div class="card">
@@ -380,7 +385,7 @@ async function openCampaign(id) {
 
     <div class="card">
       <div class="card-head"><h2>Calls</h2></div>
-      <div class="table-wrap">${callsTable(calls, false)}</div>
+      <div class="table-wrap">${callsTable(calls, false, true)}</div>
     </div>`;
 
   show("detail");
@@ -438,11 +443,27 @@ function closeDoc() {
   $("#doc-frame").src = "about:blank";  // stop the PDF plugin rendering offscreen
 }
 
-function callsTable(rows, withCampaign = true) {
+// A scheduled time as the recipient will experience it, e.g. "9:01 AM PDT".
+function fmtTheirTime(utcString, tz) {
+  if (!utcString || !tz) return "";
+  const d = new Date(utcString.replace(" ", "T") + "Z");
+  try {
+    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", timeZone: tz, timeZoneName: "short" });
+  } catch { return ""; }
+}
+
+function scheduleCell(r) {
+  const waiting = ["pending", "deferred"].includes(r.state);
+  const theirs = waiting ? fmtTheirTime(r.scheduled_for, r.recipient_tz) : "";
+  return `<td class="hint when">${waiting ? `<b style="color:var(--ink)">${esc(fmtWhen(r.scheduled_for))}</b>` : esc(fmtWhen(r.scheduled_for))}`
+    + (theirs ? `<br>${esc(theirs)} their time` : "") + `</td>`;
+}
+
+function callsTable(rows, withCampaign = true, withSchedule = false) {
   if (!rows.length) return `<div class="empty">No calls yet.</div>`;
   return `<table>
     <thead><tr>
-      <th>When</th>${withCampaign ? "<th>Campaign</th>" : ""}<th>Number</th>
+      <th>When</th>${withSchedule ? "<th>Scheduled for</th>" : ""}${withCampaign ? "<th>Campaign</th>" : ""}<th>Number</th>
       <th>Status</th><th>Length</th><th>Telnyx SID</th><th>Detail</th>
     </tr></thead>
     <tbody>${rows.map((r) => {
@@ -452,12 +473,13 @@ function callsTable(rows, withCampaign = true) {
       return `
       <tr>
         <td class="hint when">${esc(fmtWhen(r.updated_at))}</td>
+        ${withSchedule ? scheduleCell(r) : ""}
         ${withCampaign ? `<td class="name" title="${esc(campaign)}">${esc(campaign)}</td>` : ""}
         <td class="phone">${esc(r.pretty)}</td>
         <td>${statusPill(r)}</td>
         <td class="num">${r.duration ? r.duration + "s" : "—"}</td>
         <td class="hint" style="font-family:var(--mono);font-size:11px">${esc(r.sid || "—")}</td>
-        <td class="hint">${esc(r.error || (r.state === "deferred" ? r.status : "") || "")}</td>
+        <td class="hint">${esc(r.error || (["deferred", "pending"].includes(r.state) ? r.status : "") || "")}</td>
       </tr>`;
     }).join("")}
     </tbody></table>`;

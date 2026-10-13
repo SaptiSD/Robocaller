@@ -372,6 +372,66 @@ def test_pacing() -> None:
                        "AND state IN ('pending', 'deferred')", (campaign_id,))["n"] == 0)
 
 
+# --- 5a. queue hygiene -------------------------------------------------------
+
+def test_queue_hygiene() -> None:
+    print("\nqueue hygiene")
+    install_fake()
+    midday = datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc)
+
+    # Run now pressed twice before the person's calling window opens.
+    campaign_id = make_campaign(name="Twice")
+    add_contact(campaign_id, "617-555-0181", consent=1)
+    first = dispatcher.enqueue_campaign(campaign_id, midday)
+    reasons: dict = {}
+    second = dispatcher.enqueue_campaign(campaign_id, midday + timedelta(minutes=5), reasons=reasons)
+    check("a second run doesn't queue someone already waiting",
+          first == (1, 0) and second == (0, 1) and reasons == {"already-queued": 1}, f"{first} {second} {reasons}")
+    waiting = db.query("SELECT id FROM call_tasks WHERE campaign_id = ? AND state = 'pending'", (campaign_id,))
+    check("so only one call is waiting for them", len(waiting) == 1)
+    db.execute("UPDATE call_tasks SET state = 'done', status = 'completed' WHERE campaign_id = ?", (campaign_id,))
+    check("once that call is over, the next run calls them again",
+          dispatcher.enqueue_campaign(campaign_id, midday + timedelta(hours=1)) == (1, 0))
+
+    # Telnyx's limit on simultaneous calls (error 90042) is a full line, not a failure.
+    class LineFull:
+        mode = "direct"
+        from_number = "+16175550100"
+        attempts = 0
+
+        def supports(self, amd):
+            return True
+
+        def place_call(self, **kwargs):
+            LineFull.attempts += 1
+            return telephony.CallResult(False, error="[90042] OB profile channel limit exceeded D2.")
+
+    original = config.telephony
+    config.telephony = lambda: LineFull()  # type: ignore[assignment]
+    try:
+        db.execute("UPDATE call_tasks SET state = 'done' WHERE state IN ('pending', 'deferred')")
+        line_campaign = make_campaign(name="Busy lines")
+        add_contact(line_campaign, "617-555-0182", consent=1)
+        add_contact(line_campaign, "617-555-0183", consent=1)
+        dispatcher.enqueue_campaign(line_campaign, midday)
+        dispatcher._line_limit_noted = False
+        dispatcher.dispatch_pending(now=midday, budget=10)
+        rows = db.query("SELECT * FROM call_tasks WHERE campaign_id = ? ORDER BY id", (line_campaign,))
+        check("a full line puts the call back in the queue instead of failing it",
+              rows[0]["state"] == "pending" and rows[0]["status"] == "waiting for a free line"
+              and rows[0]["attempts"] == 0, str(dict(rows[0])))
+        check("it retries about 30 seconds later",
+              rows[0]["scheduled_for"] == db.to_utc(midday + dispatcher.LINE_RETRY))
+        check("the rest of the batch waits too, rather than bouncing off the same limit",
+              LineFull.attempts == 1 and rows[1]["state"] == "pending")
+        dispatcher.dispatch_pending(now=midday + timedelta(minutes=1), budget=10)
+        notes = db.query("SELECT message FROM events WHERE message LIKE 'Telnyx is limiting%'")
+        check("Activity explains the limit once, not on every retry", len(notes) == 1)
+        db.execute("UPDATE call_tasks SET state = 'done' WHERE campaign_id = ?", (line_campaign,))
+    finally:
+        config.telephony = original
+
+
 # --- 5b. AI script drafting --------------------------------------------------
 
 class FakeResponse:
@@ -1022,7 +1082,10 @@ def test_api() -> None:
         check("the dashboard is served", client.get("/").status_code == 200)
         check("the health check answers", client.get("/healthz").json() == {"ok": True})
 
-        orphans = [r for r in client.get("/api/calls").json() if r["campaign_id"] == campaign_id]
+        calls = client.get("/api/calls").json()
+        check("the call log carries each recipient's time zone",
+              any(r.get("recipient_tz") == "America/New_York" for r in calls))
+        orphans = [r for r in calls if r["campaign_id"] == campaign_id]
         check("a deleted campaign's calls keep their campaign id, so the log can say so",
               orphans and all(r["campaign_name"] is None for r in orphans), str(orphans[:1]))
 
@@ -1037,6 +1100,7 @@ def main() -> int:
     test_quiet_hours()
     test_pause_and_optout()
     test_pacing()
+    test_queue_hygiene()
     test_scriptwriter()
     test_agent_translation()
     test_agent_calls()
