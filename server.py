@@ -11,12 +11,15 @@ from __future__ import annotations
 import base64
 import csv
 import hmac
+import io
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlparse
+from xml.sax.saxutils import escape, quoteattr
 from zoneinfo import ZoneInfo
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -49,6 +52,10 @@ async def lifespan(app: FastAPI):
     global _engine
     archived, migrated = db.init()
     log.info("database: %s", db.describe())
+    if db.dotenv_database_ignored():
+        log.warning("DATABASE_URL in .env is ignored on purpose - this run uses the local "
+                    "SQLite file, not the hosted database. Set DATABASE_URL in the shell "
+                    "itself to run against Postgres.")
     if migrated:
         log.info("added missing columns: %s", ", ".join(migrated))
     if archived:
@@ -81,6 +88,8 @@ class CampaignIn(BaseModel):
     voice: str = telephony.DEFAULT_VOICE
     mode: str = "message"
     agent_info: str = ""
+    business_name: str = ""
+    callback_number: str = ""
     frequency: str = "once"
     call_time: str = "10:00"
     weekday: int = 0
@@ -100,6 +109,8 @@ class CampaignPatch(BaseModel):
     voice: str | None = None
     mode: str | None = None
     agent_info: str | None = None
+    business_name: str | None = None
+    callback_number: str | None = None
     frequency: str | None = None
     call_time: str | None = None
     weekday: int | None = None
@@ -116,8 +127,18 @@ class ContactsIn(BaseModel):
     consented: bool = False
 
 
+class ContactPatch(BaseModel):
+    consent: bool
+
+
 class SettingsIn(BaseModel):
     values: dict[str, str]
+
+
+class VerifyIn(BaseModel):
+    # What is typed on the Settings page right now, saved or not - "Test
+    # connection" checks those, falling back to the saved value per field.
+    values: dict[str, str] = {}
 
 
 class TestCallIn(BaseModel):
@@ -125,6 +146,10 @@ class TestCallIn(BaseModel):
     message: str = ""
     voice: str = telephony.DEFAULT_VOICE
     mode: str = "message"
+
+
+class CampaignTestIn(BaseModel):
+    phone: str = ""
 
 
 class DraftIn(BaseModel):
@@ -137,6 +162,8 @@ class DraftIn(BaseModel):
 
 class PreviewIn(BaseModel):
     message: str = ""
+    business_name: str = ""
+    callback_number: str = ""
 
 
 class SuppressIn(BaseModel):
@@ -184,12 +211,16 @@ def campaign_row(row: dict) -> dict:
         "FROM contacts WHERE campaign_id = ?",
         (row["id"],),
     ) or {}
+    # Test calls ("call me with this campaign") are left out: they say nothing
+    # about how the campaign itself is doing.
     stats = db.query_one(
         "SELECT COUNT(*) AS total, "
-        "SUM(CASE WHEN state = 'done' AND status = 'completed' THEN 1 ELSE 0 END) AS completed, "
+        f"SUM(CASE WHEN {dispatcher.DELIVERED_SQL} THEN 1 ELSE 0 END) AS completed, "
+        "SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END) AS finished, "
         "SUM(CASE WHEN state IN ('pending', 'deferred') THEN 1 ELSE 0 END) AS waiting, "
-        "SUM(CASE WHEN state = 'dialing' THEN 1 ELSE 0 END) AS in_flight "
-        "FROM call_tasks WHERE campaign_id = ?",
+        "SUM(CASE WHEN state = 'dialing' THEN 1 ELSE 0 END) AS in_flight, "
+        "SUM(CASE WHEN state = 'skipped' THEN 1 ELSE 0 END) AS skipped "
+        "FROM call_tasks WHERE campaign_id = ? AND run_key <> 'test'",
         (row["id"],),
     ) or {}
     return {
@@ -198,9 +229,25 @@ def campaign_row(row: dict) -> dict:
         "consented": counts.get("consented") or 0,
         "calls_total": stats.get("total") or 0,
         "calls_completed": stats.get("completed") or 0,
+        # Calls actually placed and finished - the honest denominator for
+        # "delivered", since screened-out rows were never going to be dialled.
+        "calls_finished": stats.get("finished") or 0,
         "calls_waiting": stats.get("waiting") or 0,
         "calls_in_flight": stats.get("in_flight") or 0,
+        "calls_skipped": stats.get("skipped") or 0,
     }
+
+
+def _phone_field(raw: str, label: str) -> str:
+    """A phone number typed into a form, normalized - or a 400 that says which field."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    phone = compliance.normalize(raw)
+    if not phone:
+        raise HTTPException(400, f"{label} '{raw}' isn't a phone number that can be dialled. "
+                                 "Use the full number with area code, like 617-555-0142.")
+    return phone
 
 
 def _campaign_moment(raw: str, label: str, tz_name: str = "UTC") -> str | None:
@@ -280,9 +327,9 @@ def overview() -> dict:
     today = db.to_utc(db.utcnow() - timedelta(hours=24))
     totals = db.query_one(
         "SELECT COUNT(*) AS total, "
-        "SUM(CASE WHEN state = 'done' AND status = 'completed' THEN 1 ELSE 0 END) AS completed, "
-        "SUM(CASE WHEN state = 'done' AND status IN ('busy', 'no-answer') THEN 1 ELSE 0 END) AS unanswered, "
-        "SUM(CASE WHEN state = 'done' AND status IN ('failed', 'canceled', 'unknown') THEN 1 ELSE 0 END) AS failed, "
+        f"SUM(CASE WHEN {dispatcher.DELIVERED_SQL} THEN 1 ELSE 0 END) AS completed, "
+        f"SUM(CASE WHEN {dispatcher.UNANSWERED_SQL} THEN 1 ELSE 0 END) AS unanswered, "
+        f"SUM(CASE WHEN {dispatcher.FAILED_SQL} THEN 1 ELSE 0 END) AS failed, "
         "SUM(CASE WHEN state IN ('pending', 'deferred') THEN 1 ELSE 0 END) AS waiting, "
         "SUM(CASE WHEN state = 'dialing' THEN 1 ELSE 0 END) AS in_flight, "
         "SUM(CASE WHEN state = 'skipped' THEN 1 ELSE 0 END) AS skipped, "
@@ -312,6 +359,11 @@ def overview() -> dict:
         "settings": config.public_view(),
         "events": db.recent_events(12),
         "server_time": db.now_str(),
+        # Calls held because their campaign is paused - they go out on Resume.
+        "held": (db.query_one(
+            "SELECT COUNT(*) AS n FROM call_tasks t JOIN campaigns c ON c.id = t.campaign_id "
+            "WHERE t.state IN ('pending', 'deferred') AND c.state = 'paused' "
+            "AND t.run_key <> 'test'") or {}).get("n") or 0,
     }
 
 
@@ -321,6 +373,11 @@ def overview() -> dict:
 def list_campaigns() -> list[dict]:
     rows = db.query("SELECT * FROM campaigns ORDER BY id DESC")
     return [campaign_row(r) for r in rows]
+
+
+@app.get("/api/campaigns/{campaign_id}")
+def get_campaign(campaign_id: int) -> dict:
+    return campaign_row(require_campaign(campaign_id))
 
 
 @app.post("/api/campaigns")
@@ -344,6 +401,8 @@ def create_campaign(body: CampaignIn) -> dict:
         raise HTTPException(400, f"'{body.call_time}' is not a valid time of day (HH:MM).")
     if not 0 <= body.weekday <= 6:
         raise HTTPException(400, "Weekday must be 0 (Monday) through 6 (Sunday).")
+    business = _business_field(body.business_name)
+    callback = _phone_field(body.callback_number, "The campaign's callback number")
 
     starts_at = _campaign_moment(body.starts_at, "Start", body.timezone)
     ends_at = _campaign_moment(body.ends_at, "End", body.timezone)
@@ -360,13 +419,14 @@ def create_campaign(body: CampaignIn) -> dict:
             "passed, or it falls before the first run would come round.",
         )
     campaign_id = db.insert(
-        "INSERT INTO campaigns (name, message, voice, mode, agent_info, frequency, call_time, "
-        "weekday, timezone, state, amd, require_consent, created_at, starts_at, ends_at, "
-        "next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO campaigns (name, message, voice, mode, agent_info, business_name, "
+        "callback_number, frequency, call_time, weekday, timezone, state, amd, require_consent, "
+        "created_at, starts_at, ends_at, next_run_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
         (
             body.name.strip(), body.message.strip(), body.voice, body.mode,
-            body.agent_info.strip() if body.mode == "agent" else "", body.frequency,
-            body.call_time, body.weekday, body.timezone, body.amd,
+            body.agent_info.strip() if body.mode == "agent" else "", business, callback,
+            body.frequency, body.call_time, body.weekday, body.timezone, body.amd,
             1 if body.require_consent else 0, db.to_utc(now),
             starts_at, ends_at, db.to_utc(first) if first else None,
         ),
@@ -387,6 +447,14 @@ def create_campaign(body: CampaignIn) -> dict:
     }
 
 
+def _business_field(raw: str | None) -> str:
+    name = (raw or "").strip()
+    if len(name) > 120:
+        raise HTTPException(400, "The business name is over 120 characters - it's read aloud "
+                                 "at the start of every call, so keep it short.")
+    return name
+
+
 @app.patch("/api/campaigns/{campaign_id}")
 def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
     campaign = require_campaign(campaign_id)
@@ -402,8 +470,10 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
         raise HTTPException(400, f"Frequency must be one of {db.FREQUENCIES}.")
     if "amd" in fields and fields["amd"] not in telephony.AMD_MODES:
         raise HTTPException(400, f"Answering-machine mode must be one of {telephony.AMD_MODES}.")
-    if "mode" in fields:
+    if "mode" in fields and fields["mode"] != campaign["mode"]:
         _check_mode(fields["mode"])
+    elif "mode" in fields and fields["mode"] not in db.CALL_MODES:
+        raise HTTPException(400, f"Call type must be one of {db.CALL_MODES}.")
     if "agent_info" in fields:
         _check_agent_info(fields["agent_info"])
         fields["agent_info"] = fields["agent_info"].strip()
@@ -426,36 +496,56 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
     if window["starts_at"] and window["ends_at"] and window["ends_at"] <= window["starts_at"]:
         raise HTTPException(400, "The end timestamp must be after the start timestamp.")
     if "message" in fields:
+        fields["message"] = fields["message"].strip()
         problems = compliance.validate_script(fields["message"])
         if problems:
             raise HTTPException(400, " ".join(problems))
+    if "name" in fields:
+        fields["name"] = fields["name"].strip()
+        if not fields["name"] or len(fields["name"]) > 120:
+            raise HTTPException(400, "A campaign needs a name of up to 120 characters.")
+    if "business_name" in fields:
+        fields["business_name"] = _business_field(fields["business_name"])
+    if "callback_number" in fields:
+        fields["callback_number"] = _phone_field(fields["callback_number"],
+                                                 "The campaign's callback number")
+    if fields.get("mode", campaign["mode"]) != "agent":
+        fields.pop("agent_info", None)
+
+    schedule = {"frequency", "call_time", "weekday", "timezone", "starts_at", "ends_at"}
+    frequency = fields.get("frequency", campaign["frequency"])
+    # Editing a finished campaign onto a recurring schedule brings it back to life;
+    # that is the only reason to make a finished campaign recurring.
+    if campaign["state"] == "finished" and frequency != "once" and schedule & fields.keys() \
+            and "state" not in fields:
+        fields["state"] = "active"
 
     sets = ", ".join(f"{k} = ?" for k in fields)
     db.execute(f"UPDATE campaigns SET {sets} WHERE id = ?", (*fields.values(), campaign_id))
 
-    # A schedule change (or a resume) needs the next run recomputed.
+    # A schedule change (or a resume) needs the next run recomputed - the same
+    # way a new campaign's first run is, so a start date is still respected.
+    note = ""
     updated = require_campaign(campaign_id)
-    if updated["state"] == "active" and (
-        {"frequency", "call_time", "weekday", "timezone", "state",
-         "starts_at", "ends_at"} & fields.keys()
-    ):
+    if updated["state"] == "active" and (schedule | {"state"}) & fields.keys():
         now = db.utcnow()
-        next_run = dispatcher.compute_next_run(updated, now)
-        if next_run:
-            db.execute(
-                "UPDATE campaigns SET next_run_at = ? WHERE id = ?",
-                (db.to_utc(next_run), campaign_id),
-            )
+        if frequency == "once" and updated["runs"]:
+            # Already sent. Resuming must NOT silently re-dial the whole list;
+            # Run now stays the only way to send it again.
+            db.execute("UPDATE campaigns SET state = 'finished', next_run_at = NULL WHERE id = ?",
+                       (campaign_id,))
+            note = ("This one-off campaign has already gone out, so it's marked finished. "
+                    "Use Run now to call the list again.")
         else:
-            # A one-off has no next slot to compute. If its slot is already in the
-            # past, resuming it must NOT silently re-dial the entire list - clear
-            # the slot so "Run now" stays the only way to send it again.
-            prior = db.from_utc(updated["next_run_at"])
-            if prior is None or prior <= now:
-                db.execute(
-                    "UPDATE campaigns SET next_run_at = NULL WHERE id = ?", (campaign_id,)
-                )
-    return campaign_row(require_campaign(campaign_id))
+            next_run = dispatcher.first_run_at(updated, False, now)
+            if next_run is None:
+                db.execute("UPDATE campaigns SET state = 'finished', next_run_at = NULL "
+                           "WHERE id = ?", (campaign_id,))
+                note = "Its end date has passed, so there's nothing left to schedule."
+            else:
+                db.execute("UPDATE campaigns SET next_run_at = ? WHERE id = ?",
+                           (db.to_utc(next_run), campaign_id))
+    return {**campaign_row(require_campaign(campaign_id)), "note": note}
 
 
 @app.delete("/api/campaigns/{campaign_id}")
@@ -475,13 +565,25 @@ def run_campaign(campaign_id: int) -> dict:
     campaign = require_campaign(campaign_id)
     if not campaign["message"].strip():
         raise HTTPException(400, "This campaign has no message to read.")
+    if campaign["state"] == "paused":
+        # Its calls would be held by the pause anyway - better to say so than to
+        # report "Queued 40 calls" that then sit there.
+        raise HTTPException(409, "This campaign is paused. Resume it first, then Run now.")
     reasons: dict[str, int] = {}
     queued, skipped = dispatcher.enqueue_campaign(campaign_id, reasons=reasons)
     db.execute(
         "UPDATE campaigns SET last_run_at = ?, runs = runs + 1 WHERE id = ?",
         (db.now_str(), campaign_id),
     )
-    return {"queued": queued, "skipped": skipped, "skip_reasons": reasons}
+    note = ""
+    if queued and campaign["frequency"] == "once" and campaign["state"] == "active" \
+            and campaign["next_run_at"]:
+        # Sending a one-off early IS its run. Leaving the slot in place called
+        # the whole list a second time when the scheduled moment came round.
+        db.execute("UPDATE campaigns SET state = 'finished', next_run_at = NULL WHERE id = ?",
+                   (campaign_id,))
+        note = "This was its one run, so the scheduled one is cancelled."
+    return {"queued": queued, "skipped": skipped, "skip_reasons": reasons, "note": note}
 
 
 # --- contacts ---------------------------------------------------------------
@@ -528,50 +630,138 @@ def add_contacts(campaign_id: int, body: ContactsIn) -> dict:
 
 @app.delete("/api/campaigns/{campaign_id}/contacts/{contact_id}")
 def delete_contact(campaign_id: int, contact_id: int) -> dict:
+    # Taking someone off the list has to take them out of the queue as well,
+    # or a call already waiting for them still goes out.
+    cancelled = db.execute(
+        "UPDATE call_tasks SET state = 'skipped', status = 'contact removed', updated_at = ? "
+        "WHERE contact_id = ? AND campaign_id = ? AND state IN ('pending', 'deferred')",
+        (db.now_str(), contact_id, campaign_id),
+    )
     db.execute(
         "DELETE FROM contacts WHERE id = ? AND campaign_id = ?", (contact_id, campaign_id)
     )
-    return {"ok": True}
+    return {"ok": True, "cancelled": cancelled}
+
+
+@app.patch("/api/campaigns/{campaign_id}/contacts/{contact_id}")
+def set_contact_consent(campaign_id: int, contact_id: int, body: ContactPatch) -> dict:
+    campaign = require_campaign(campaign_id)
+    contact = db.query_one("SELECT * FROM contacts WHERE id = ? AND campaign_id = ?",
+                           (contact_id, campaign_id))
+    if not contact:
+        raise HTTPException(404, "No such contact.")
+    db.execute("UPDATE contacts SET consent = ? WHERE id = ?", (1 if body.consent else 0, contact_id))
+    cancelled = 0
+    if not body.consent and campaign["require_consent"]:
+        # Withdrawn consent takes them out of the queue too, not just future runs.
+        cancelled = db.execute(
+            "UPDATE call_tasks SET state = 'skipped', status = 'no-consent', updated_at = ? "
+            "WHERE contact_id = ? AND state IN ('pending', 'deferred')",
+            (db.now_str(), contact_id))
+    db.log_event(f"{compliance.pretty(contact['phone'])} marked as "
+                 f"{'having' if body.consent else 'not having'} given consent.")
+    return {"ok": True, "cancelled": cancelled}
+
+
+@app.post("/api/campaigns/{campaign_id}/contacts/consent-all")
+def consent_all(campaign_id: int) -> dict:
+    campaign = require_campaign(campaign_id)
+    changed = db.execute("UPDATE contacts SET consent = 1 WHERE campaign_id = ? AND consent = 0",
+                         (campaign_id,))
+    if changed:
+        db.log_event(f"{changed} contact(s) in '{campaign['name']}' marked as having given consent.")
+    return {"changed": changed}
 
 
 # --- calls ------------------------------------------------------------------
 
-@app.get("/api/calls")
-def list_calls(campaign_id: int | None = None, limit: int = 200) -> list[dict]:
-    limit = max(1, min(limit, 1000))
+CALL_OUTCOMES = {
+    "delivered": dispatcher.DELIVERED_SQL,
+    "unanswered": dispatcher.UNANSWERED_SQL,
+    "failed": dispatcher.FAILED_SQL,
+    "waiting": "state IN ('pending', 'deferred', 'dialing')",
+    "skipped": "state = 'skipped'",
+    "opted-out": "status = 'opted-out'",
+}
+
+
+def _calls(campaign_id: int | None, outcome: str, q: str, before_id: int | None,
+           limit: int) -> list[dict]:
+    where, params = [], []
     if campaign_id:
-        rows = db.query(
-            "SELECT t.*, c.name AS campaign_name FROM call_tasks t "
-            "LEFT JOIN campaigns c ON c.id = t.campaign_id "
-            "WHERE t.campaign_id = ? ORDER BY t.id DESC LIMIT ?",
-            (campaign_id, limit),
-        )
-    else:
-        rows = db.query(
-            "SELECT t.*, c.name AS campaign_name FROM call_tasks t "
-            "LEFT JOIN campaigns c ON c.id = t.campaign_id "
-            "ORDER BY t.id DESC LIMIT ?",
-            (limit,),
-        )
+        where.append("t.campaign_id = ?")
+        params.append(campaign_id)
+    if outcome == "test":
+        where.append("(t.campaign_id IS NULL OR t.run_key IN ('manual', 'test'))")
+    elif outcome in CALL_OUTCOMES:
+        where.append("(" + CALL_OUTCOMES[outcome].replace("state", "t.state")
+                     .replace("status", "t.status") + ")")
+    digits = "".join(ch for ch in (q or "") if ch.isdigit())
+    if digits:
+        where.append("t.phone LIKE ?")
+        params.append(f"%{digits}%")
+    if before_id:
+        where.append("t.id < ?")
+        params.append(before_id)
+    rows = db.query(
+        "SELECT t.*, c.name AS campaign_name, c.state AS campaign_state FROM call_tasks t "
+        "LEFT JOIN campaigns c ON c.id = t.campaign_id "
+        + ("WHERE " + " AND ".join(where) + " " if where else "")
+        + "ORDER BY t.id DESC LIMIT ?",
+        (*params, limit),
+    )
     for row in rows:
         row["pretty"] = compliance.pretty(row["phone"])
         # So the dashboard can show a scheduled call in the recipient's own time.
         row["recipient_tz"] = compliance.timezone_for(row["phone"]) or ""
+        row["is_test"] = dispatcher.is_test(row)
         row.pop("token", None)
     return rows
 
 
-@app.post("/api/test-call")
-def test_call(body: TestCallIn) -> dict:
-    phone = compliance.normalize(body.phone or config.get("test_number"))
+@app.get("/api/calls")
+def list_calls(campaign_id: int | None = None, limit: int = 200, outcome: str = "",
+               q: str = "", before_id: int | None = None) -> list[dict]:
+    return _calls(campaign_id, outcome, q, before_id, max(1, min(limit, 1000)))
+
+
+@app.get("/api/calls.csv", include_in_schema=False)
+def export_calls(campaign_id: int | None = None, outcome: str = "", q: str = "") -> Response:
+    rows = _calls(campaign_id, outcome, q, None, 100_000)
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["id", "updated_utc", "scheduled_utc", "campaign", "phone", "state", "status",
+                     "answered_by", "duration_s", "telnyx_sid", "error"])
+    for r in rows:
+        campaign = r["campaign_name"] or ("Test call" if r["is_test"] else "Deleted campaign")
+        writer.writerow([r["id"], r["updated_at"], r["scheduled_for"], campaign, r["phone"],
+                         r["state"], r["status"], r["answered_by"], r["duration"], r["sid"],
+                         r["error"]])
+    stamp = db.utcnow().strftime("%Y%m%d-%H%M")
+    return Response(out.getvalue(), media_type="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="call-log-{stamp}.csv"'})
+
+
+def _test_number(raw: str) -> str:
+    phone = _phone_field(raw, "The number to call") if (raw or "").strip() \
+        else compliance.normalize(config.get("test_number"))
     if not phone:
-        raise HTTPException(400, "Set a test number on the Settings page first.")
+        raise HTTPException(400, "Type a number to call, or save your own number as "
+                                 "'My test number' on the Settings page.")
     if config.telephony() is None:
         raise HTTPException(400, "Telnyx isn't configured yet - fill in Settings.")
-    _check_mode(body.mode)
+    # A test call to a blocked number would be skipped at dial time and never
+    # ring - which looks exactly like the app being broken.
+    blocked = db.suppression_row(phone)
+    if blocked:
+        raise HTTPException(400, f"{compliance.pretty(phone)} is on your do-not-call list "
+                                 f"({blocked['reason']}), so it can't be called - not even for "
+                                 "a test. Remove it on the Do not call page first.")
+    return phone
 
-    task_id = dispatcher.enqueue_single(phone, body.message.strip(), body.voice, body.mode)
-    # Restricted to this one task: pressing "Call me now" must never also dial
+
+def _place_test(task_id: int) -> dict:
+    # Restricted to this one task: pressing a test button must never also dial
     # whoever is at the front of a campaign queue. The calling window is skipped
     # because the operator is deliberately calling their own number right now.
     placed = dispatcher.dispatch_pending(only_task_id=task_id, ignore_window=True)
@@ -581,14 +771,36 @@ def test_call(body: TestCallIn) -> dict:
     return {"task_id": task_id, "placed": placed, "task": task}
 
 
+@app.post("/api/test-call")
+def test_call(body: TestCallIn) -> dict:
+    phone = _test_number(body.phone)
+    _check_mode(body.mode)
+    voice = body.voice if body.voice in telephony.VOICE_IDS else telephony.DEFAULT_VOICE
+    return _place_test(dispatcher.enqueue_single(phone, body.message.strip(), voice, body.mode))
+
+
+@app.post("/api/campaigns/{campaign_id}/test-call")
+def test_campaign(campaign_id: int, body: CampaignTestIn) -> dict:
+    """Ring the operator with exactly this campaign's call - its script, voice,
+    call type and caller identity - before it goes to the list."""
+    campaign = require_campaign(campaign_id)
+    phone = _test_number(body.phone)
+    _check_mode(campaign["mode"])
+    return _place_test(dispatcher.enqueue_single(phone, "", "", campaign["mode"],
+                                                 campaign_id=campaign_id))
+
+
 # --- scripts ----------------------------------------------------------------
 
 @app.post("/api/script/preview")
 def preview_script(body: PreviewIn) -> dict:
+    # The campaign's own identity if the form has one, as the call will use it -
+    # and the keypress opt-out only where webhook mode can actually take it.
     final = compliance.build_script(
         body.message,
-        business_name=config.get("business_name"),
-        callback_number=config.get("callback_number"),
+        business_name=body.business_name.strip() or config.get("business_name"),
+        callback_number=compliance.normalize(body.callback_number) or config.get("callback_number"),
+        press_nine=bool(config.get("public_base_url")),
     )
     return {
         "script": final,
@@ -642,6 +854,52 @@ def setup_agent() -> dict:
     return agent.status()
 
 
+PHONE_SETTINGS = {"test_number": "My test number", "callback_number": "The opt-out callback number",
+                  "telnyx_from_number": "The 'call from' number"}
+
+
+def _validate_settings(values: dict[str, str]) -> dict[str, str]:
+    """Refuse values that would save fine and then quietly break calling."""
+    for key, label in PHONE_SETTINGS.items():
+        if key in values:
+            values[key] = _phone_field(values[key], label)
+    for key in ("window_start", "window_end"):
+        if key in values and not dispatcher.valid_hhmm(values[key]):
+            raise HTTPException(400, f"'{values[key]}' isn't a time of day - use HH:MM, like 09:00.")
+    start = values.get("window_start", config.get("window_start"))
+    end = values.get("window_end", config.get("window_end"))
+    if dispatcher.parse_hhmm(start) >= dispatcher.parse_hhmm(end):
+        raise HTTPException(400, f"The calling window {start}-{end} is empty: 'Don't call before' has "
+                                 "to be earlier than 'Don't call after', or nothing is ever dialled.")
+    for key, label, low, high in (("calls_per_minute", "Calls per minute", 1, 120),
+                                  ("ring_seconds", "Ring for", 10, 60)):
+        if key in values:
+            try:
+                number = int(str(values[key]).strip())
+            except ValueError:
+                raise HTTPException(400, f"{label} must be a whole number.") from None
+            if not low <= number <= high:
+                raise HTTPException(400, f"{label} must be between {low} and {high}.")
+            values[key] = str(number)
+    if values.get("public_base_url"):
+        url = values["public_base_url"].strip().rstrip("/")
+        parsed = urlparse(url)
+        local = parsed.hostname in ("localhost", "127.0.0.1")
+        if not parsed.netloc or not (parsed.scheme == "https" or (parsed.scheme == "http" and local)):
+            raise HTTPException(400, "The public base URL must be the https:// address of this "
+                                     "server, like https://robocaller.onrender.com.")
+        values["public_base_url"] = url
+    if "business_name" in values:
+        values["business_name"] = _business_field(values["business_name"])
+    if values.get("agent_llm") not in (None, *agent.ROUTES):
+        raise HTTPException(400, f"The agent's AI must run on one of {agent.ROUTES}.")
+    if values.get("script_provider") not in (None, "", "anthropic", "perplexity"):
+        raise HTTPException(400, "Scripts can be written by 'anthropic' or 'perplexity'.")
+    if values.get("dispatch_paused") not in (None, "0", "1"):
+        raise HTTPException(400, "dispatch_paused must be 0 or 1.")
+    return values
+
+
 @app.post("/api/settings")
 def save_settings(body: SettingsIn) -> dict:
     values = {k: v for k, v in body.values.items() if k in config.DEFAULTS}
@@ -649,25 +907,76 @@ def save_settings(body: SettingsIn) -> dict:
     for key in config.SECRET_KEYS:
         if key in values and not values[key].strip():
             values.pop(key)
-    for key in ("test_number", "callback_number", "telnyx_from_number"):
-        if values.get(key):
-            values[key] = compliance.normalize(values[key]) or values[key]
-    config.set_many(values)
+    config.set_many(_validate_settings(values))
     return config.public_view()
 
 
+def _inbound_url() -> str:
+    base = config.get("public_base_url").rstrip("/")
+    return f"{base}/telnyx/inbound" if base else ""
+
+
 @app.post("/api/settings/verify")
-def verify_settings() -> dict:
-    phone = config.telephony()
-    if phone is None:
+def verify_settings(body: VerifyIn | None = None) -> dict:
+    # Whatever is typed in the form right now, falling back to what's saved -
+    # checking the saved values while the person is looking at different ones
+    # gave a green tick to a number they hadn't saved.
+    typed = {k: (v or "").strip() for k, v in ((body.values if body else {}) or {}).items()}
+
+    def pick(key: str) -> str:
+        return typed.get(key) or config.get(key).strip()
+
+    from_number = compliance.normalize(pick("telnyx_from_number")) or pick("telnyx_from_number")
+    if not (pick("telnyx_api_key") and pick("telnyx_app_id") and from_number):
         raise HTTPException(400, "Enter the Telnyx API key, TeXML application ID and From number first.")
+    phone = telephony.Telephony(pick("telnyx_api_key"), pick("telnyx_app_id"), from_number,
+                                pick("public_base_url"))
     ok, detail = phone.verify()
     numbers, error = phone.owned_numbers() if ok else ([], "")
     from_ok, from_detail = phone.check_from_number() if ok else (False, "")
+    limits = phone.account_limits() if ok else {}
+    expected = (pick("public_base_url").rstrip("/") + "/telnyx/inbound") if pick("public_base_url") else ""
     return {
         "ok": ok, "detail": detail, "numbers": numbers, "error": error,
         "mode": phone.mode, "from_ok": from_ok, "from_detail": from_detail,
+        "limits": limits,
+        "inbound_ready": bool(expected) and limits.get("inbound_url") == expected,
+        "unsaved": sorted(k for k, v in typed.items() if v and v != config.get(k)),
     }
+
+
+@app.get("/api/inbound")
+def inbound_status() -> dict:
+    """Where calls to the caller-ID number go. Asks Telnyx, so only on demand."""
+    phone = config.telephony()
+    expected = _inbound_url()
+    if phone is None:
+        return {"ready": False, "can_setup": False, "url": "", "expected": expected,
+                "missing": ["Telnyx credentials"]}
+    limits = phone.account_limits()
+    missing = []
+    if not expected:
+        missing.append("a public base URL (webhook mode)")
+    if not _clean_key(config.get("telnyx_public_key")):
+        missing.append("the Telnyx public key, so callers' keypresses can be trusted")
+    return {"ready": bool(expected) and limits.get("inbound_url") == expected,
+            "can_setup": not missing, "missing": missing,
+            "url": limits.get("inbound_url", ""), "expected": expected,
+            "number": config.get("telnyx_from_number")}
+
+
+@app.post("/api/inbound/setup")
+def setup_inbound() -> dict:
+    """Point the caller-ID number's inbound calls at this server. Writes to Telnyx."""
+    status = inbound_status()
+    if not status["can_setup"]:
+        raise HTTPException(400, "Missing " + "; ".join(status["missing"]) + ".")
+    error = config.telephony().set_inbound_url(status["expected"])
+    if error:
+        raise HTTPException(400, f"Telnyx refused the change: {error}")
+    db.log_event(f"Calls to {compliance.pretty(status['number'])} now reach the callback line "
+                 "(press 9 to opt out, or leave a message).")
+    return inbound_status()
 
 
 @app.get("/api/suppression")
@@ -690,8 +999,12 @@ def add_suppression(body: SuppressIn) -> dict:
 
 @app.delete("/api/suppression/{phone}")
 def remove_suppression(phone: str) -> dict:
-    db.unsuppress(compliance.normalize(phone) or phone)
-    return {"ok": True}
+    removed = db.unsuppress(compliance.normalize(phone) or phone)
+    if removed:
+        # An opt-out is a legal record; taking one off the list leaves a trace.
+        db.log_event(f"{compliance.pretty(removed['phone'])} was removed from the do-not-call list "
+                     f"(it had been added {removed['created_at']} UTC: {removed['reason']}).", "warn")
+    return {"ok": True, "removed": bool(removed)}
 
 
 # --- documents --------------------------------------------------------------
@@ -837,7 +1150,8 @@ def _task_for(token: str) -> dict:
     # `amd` is needed by the voice webhook to decide whether to hang up on a
     # machine; a test call has no campaign, so every joined column can be NULL.
     task = db.query_one(
-        "SELECT t.*, c.message, c.voice, c.amd FROM call_tasks t "
+        "SELECT t.*, c.message, c.voice, c.amd, c.business_name AS campaign_business, "
+        "c.callback_number AS campaign_callback FROM call_tasks t "
         "LEFT JOIN campaigns c ON c.id = t.campaign_id WHERE t.token = ?",
         (token,),
     )
@@ -861,13 +1175,13 @@ async def texml_for_call(token: str, request: Request) -> Response:
         )
         return Response(telephony.build_texml("", hangup_first=True), media_type="text/xml")
 
-    script = compliance.build_script(
-        task.get("script_override") or task.get("message") or "",
-        business_name=config.get("business_name"),
-        callback_number=config.get("callback_number"),
-    )
     base = config.get("public_base_url").rstrip("/")
-    script += " To be removed from this list, press 9 now."
+    script = compliance.build_script(
+        task.get("script_override") or task.get("message") or dispatcher._fallback_message(),
+        business_name=task.get("campaign_business") or config.get("business_name"),
+        callback_number=task.get("campaign_callback") or config.get("callback_number"),
+        press_nine=bool(base),
+    )
     xml = telephony.build_texml(
         script,
         voice=task.get("voice_override") or task.get("voice")
@@ -897,6 +1211,121 @@ async def handle_optout(token: str, request: Request) -> Response:
             media_type="text/xml",
         )
     return Response("<Response><Hangup/></Response>", media_type="text/xml")
+
+
+# --- the callback line: people calling the caller-ID number back -------------
+#
+# Every recorded message without a callback number tells people to call the
+# number on their caller ID, and plenty redial a missed call anyway. Without
+# this the TeXML application's inbound URL pointed nowhere, so an opt-out by
+# phone - the one route a voicemail recipient has - went unanswered.
+
+def _texml(body: str) -> Response:
+    return Response(f"<Response>{body}</Response>", media_type="text/xml")
+
+
+def _caller(form: dict) -> str:
+    return compliance.normalize(str(form.get("From", "")))
+
+
+def _business_for_caller(phone: str) -> str:
+    """The name on the last campaign that called this number, else the default."""
+    row = db.query_one(
+        "SELECT c.business_name FROM call_tasks t JOIN campaigns c ON c.id = t.campaign_id "
+        "WHERE t.phone = ? AND t.attempts > 0 ORDER BY t.id DESC LIMIT 1", (phone,)) if phone else None
+    return (row or {}).get("business_name") or config.get("business_name") or "us"
+
+
+async def _signed_inbound(request: Request) -> dict:
+    """Like _signed_form, but never unsigned. These requests carry no per-call
+    token, and one of them adds the caller to the do-not-call list - so without a
+    public key to check Telnyx's signature against, they are refused outright."""
+    if not _clean_key(config.get("telnyx_public_key")):
+        raise HTTPException(403, "The callback line needs TELNYX_PUBLIC_KEY to verify Telnyx.")
+    body = await request.body()
+    _validate(request, body)
+    if body.lstrip().startswith(b"{"):
+        # Some Telnyx callbacks (transcriptions) can arrive as JSON events.
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return {}
+        inner = data.get("data") if isinstance(data, dict) else None
+        payload = inner.get("payload") if isinstance(inner, dict) else None
+        source = payload if isinstance(payload, dict) else data if isinstance(data, dict) else {}
+        return {k: v for k, v in source.items() if isinstance(v, (str, int, float))}
+    return dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
+
+
+def _inbound_say(text: str) -> str:
+    return f'<Say voice="{telephony.DEFAULT_VOICE}">{escape(text)}</Say>'
+
+
+@app.post("/telnyx/inbound")
+async def inbound_call(request: Request) -> Response:
+    form = await _signed_inbound(request)
+    base = config.get("public_base_url").rstrip("/")
+    business = _business_for_caller(_caller(form))
+    menu = (f"Thanks for calling {business}. You may have had an automated call from us. "
+            "To be removed from our calling list, press 9. To leave a message, press 1, "
+            "or just stay on the line.")
+    return _texml(
+        '<Pause length="1"/>'
+        f'<Gather numDigits="1" timeout="6" method="POST" action={quoteattr(base + "/telnyx/inbound/choice")}>'
+        f"{_inbound_say(menu)}</Gather>"
+        f'<Redirect method="POST">{escape(base + "/telnyx/inbound/message")}</Redirect>'
+    )
+
+
+@app.post("/telnyx/inbound/choice")
+async def inbound_choice(request: Request) -> Response:
+    form = await _signed_inbound(request)
+    phone = _caller(form)
+    if str(form.get("Digits", "")) == "9" and phone:
+        db.suppress(phone, "opted out by calling back")
+        db.log_event(f"{compliance.pretty(phone)} called back and opted out - added to the "
+                     "do-not-call list.")
+        return _texml(_inbound_say("You've been removed from our calling list, and you won't "
+                                   "be called again. Goodbye.") + "<Hangup/>")
+    return await _inbound_message_texml()
+
+
+@app.post("/telnyx/inbound/message")
+async def inbound_message(request: Request) -> Response:
+    await _signed_inbound(request)
+    return await _inbound_message_texml()
+
+
+async def _inbound_message_texml() -> Response:
+    base = config.get("public_base_url").rstrip("/")
+    return _texml(
+        _inbound_say("Please leave a message after the tone. Press pound when you're done.")
+        + f'<Record maxLength="120" timeout="5" finishOnKey="#" playBeep="true" '
+          f'trim="trim-silence" method="POST" action={quoteattr(base + "/telnyx/inbound/recorded")} '
+          f'transcription="true" transcriptionCallback={quoteattr(base + "/telnyx/inbound/transcript")}/>'
+        + _inbound_say("Goodbye.") + "<Hangup/>"
+    )
+
+
+@app.post("/telnyx/inbound/recorded")
+async def inbound_recorded(request: Request) -> Response:
+    form = await _signed_inbound(request)
+    seconds = str(form.get("RecordingDuration") or "").strip()
+    db.log_event(f"Voicemail from {compliance.pretty(_caller(form)) or 'an unknown caller'}"
+                 + (f" ({seconds}s)" if seconds else "")
+                 + " - listen in Telnyx Mission Control > Recordings.", "warn")
+    return _texml(_inbound_say("Thanks, we got your message. Goodbye.") + "<Hangup/>")
+
+
+@app.post("/telnyx/inbound/transcript")
+async def inbound_transcript(request: Request) -> Response:
+    form = await _signed_inbound(request)
+    text = next((str(form[k]) for k in ("TranscriptionText", "transcription_text", "Transcription")
+                 if form.get(k)), "").strip()
+    if text:
+        db.log_event(f"Voicemail from {compliance.pretty(_caller(form)) or 'an unknown caller'}: "
+                     f"\"{text[:400]}\"", "warn")
+    return PlainTextResponse("", status_code=204)
 
 
 @app.post("/telnyx/status/{token}")
@@ -1012,6 +1441,8 @@ async def agent_optout(token: str, request: Request) -> JSONResponse:
         raise HTTPException(403, "Bad agent token.")
     task = _task_for(token)
     db.suppress(task["phone"], "opted out on an AI call")
+    db.execute("UPDATE call_tasks SET status = 'opted-out', updated_at = ? WHERE id = ?",
+               (db.now_str(), task["id"]))
     db.log_event(f"{compliance.pretty(task['phone'])} asked the AI agent not to call again "
                  "- added to the do-not-call list.")
     return JSONResponse({"ok": True, "result": "Added to the do-not-call list. "

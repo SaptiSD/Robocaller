@@ -17,11 +17,22 @@ const OUTCOMES = [
   { key: "skipped",    label: "Screened out",      color: "var(--muted)" },
 ];
 
+// What the engine's internal status codes mean, in words.
+const STATUS_LABELS = {
+  "no-consent": "No consent on record", "suppressed": "On do-not-call list",
+  "campaign deleted": "Campaign deleted", "contact removed": "Contact removed",
+  "expired": "Test call dropped", "unknown local time": "Unknown local time",
+  "claimed": "Dialing", "machine-skipped": "Voicemail - hung up", "opted-out": "Opted out",
+};
+
 let SETTINGS = {};
 let META = { voices: [], amd_modes: [] };
+let CAMPAIGNS = new Map();     // id -> the last campaign row loaded, for confirmations
 let currentView = "dashboard";
 let currentCampaignId = null;
-let pollTimer = null;
+let editingId = null;          // the campaign the form is editing, or null for a new one
+let settingsDirty = false;
+let callsLimit = 100;
 
 // --- plumbing ---------------------------------------------------------------
 
@@ -32,9 +43,26 @@ async function api(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; }
+  catch {
+    // A host waking from sleep or a proxy error answers with HTML. Say that,
+    // not "Unexpected token <".
+    throw new Error(res.ok ? "The server sent something unexpected - reload the page."
+      : `The server isn't answering properly (HTTP ${res.status}). If it was asleep, give it 30 seconds and try again.`);
+  }
   if (!res.ok) throw new Error((data && data.error) || res.statusText);
   return data;
+}
+
+// Run an action once at a time per button: a double-click must never create two
+// campaigns or queue a list twice. Errors become a toast instead of vanishing.
+async function busy(button, fn) {
+  if (button && button.dataset.busy) return;
+  if (button) { button.dataset.busy = "1"; button.disabled = true; }
+  try { return await fn(); }
+  catch (err) { toast(err.message, true); }
+  finally { if (button) { delete button.dataset.busy; button.disabled = false; } }
 }
 
 // "Queued 0, skipped 1" left people guessing - say why, and what to do about it.
@@ -45,11 +73,12 @@ function runSummary(r) {
   if (r.queued === 0 && r.skipped) {
     let msg = `Nothing was dialled: ${reasons || r.skipped + " skipped"}.`;
     if ((r.skip_reasons || {})["no-consent"]) {
-      msg += " Add those numbers again with the consent box ticked - only if they really gave written consent.";
+      msg += " If they really gave written consent, mark them as consented under Contacts, then press Run now again.";
     }
     return msg;
   }
-  return `Queued ${r.queued} call(s)` + (r.skipped ? `, skipped ${r.skipped} (${reasons}).` : ".");
+  return `Queued ${r.queued} call(s)` + (r.skipped ? `, skipped ${r.skipped} (${reasons}).` : ".")
+    + (SETTINGS.dispatch_paused === "1" ? " Calling is paused, so they'll wait until you resume it." : "");
 }
 
 function toast(message, bad = false) {
@@ -60,9 +89,21 @@ function toast(message, bad = false) {
   el._t = setTimeout(() => (el.className = ""), Math.max(3600, message.length * 60));  // long enough to read
 }
 
+// Pages refresh every few seconds. Rewriting a section that hasn't changed would
+// swallow a click that lands mid-refresh and throw keyboard focus back to the
+// top, so a section is only replaced when its content actually differs.
+function setHtml(el, html) {
+  if (!el || el._html === html) return;
+  el._html = html;
+  el.innerHTML = html;
+}
+
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const notNumbers = (n) => n === 1 ? "1 line wasn't a phone number" : `${n} lines weren't phone numbers`;
+const plural = (n, word, many = word + "s") => `${n} ${n === 1 ? word : many}`;
 
 // `tz` renders the moment in the campaign's own scheduling timezone rather than
 // the viewer's. Without it a card reads "Every Fri at 10:30 (New York) · next run
@@ -73,7 +114,10 @@ function fmtWhen(utcString, tz) {
   if (isNaN(d)) return utcString;
   const mins = Math.round((d - Date.now()) / 60000);
   const opts = { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
-  if (tz) { opts.timeZone = tz; opts.timeZoneName = "short"; }
+  // Always name the zone: a tester abroad read a call placed at 11:51 CT as
+  // "12:51 AM" - their own clock, with nothing to say so.
+  opts.timeZoneName = "short";
+  if (tz) opts.timeZone = tz;
   let abs;
   try { abs = d.toLocaleString(undefined, opts); }
   catch { abs = d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); }
@@ -96,66 +140,129 @@ function fmtDay(utcString, tz) {
 function fmtTime(utcString) {
   if (!utcString) return "";
   const d = new Date(utcString.replace(" ", "T") + "Z");
-  return isNaN(d) ? "" : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return isNaN(d) ? "" : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
+}
+
+// A stored UTC moment as the "YYYY-MM-DDTHH:MM" a datetime-local input wants,
+// in the campaign's own timezone - the zone the form reads it back in.
+function toLocalInput(utcString, tz) {
+  if (!utcString) return "";
+  const d = new Date(utcString.replace(" ", "T") + "Z");
+  if (isNaN(d)) return "";
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz || "UTC", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(d).map((p) => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
 }
 
 function statusPill(task) {
   const s = task.status || task.state;
-  let cls = "muted", label = s || "—";
-  if (s === "completed" && task.played === 0) { cls = "critical"; label = "Answered, message not played"; }
+  let cls = "muted", label = STATUS_LABELS[s] || s || "—";
+  const waiting = ["pending", "deferred"].includes(task.state);
+  if (task.state === "skipped") { cls = "muted"; }
+  else if (s === "opted-out") { cls = "warning"; label = "Opted out"; }
+  else if (s === "machine-skipped") { cls = "muted"; }
+  else if (s === "completed" && task.played === 0) { cls = "critical"; label = "Answered, message not played"; }
   else if (s === "completed") { cls = "good"; label = "Delivered"; }
   else if (s === "busy") { cls = "warning"; label = "Busy"; }
   else if (s === "no-answer") { cls = "warning"; label = "No answer"; }
   else if (["failed", "canceled", "unknown"].includes(s)) { cls = "critical"; label = s === "unknown" ? "Lost track" : s[0].toUpperCase() + s.slice(1); }
-  else if (["queued", "ringing", "initiated", "in-progress"].includes(s)) { cls = "queued"; label = s === "in-progress" ? "Talking" : s[0].toUpperCase() + s.slice(1); }
+  else if (waiting && task.campaign_state === "paused" && !task.is_test) { cls = "muted"; label = "On hold - campaign paused"; }
+  else if (["queued", "ringing", "initiated", "in-progress", "claimed"].includes(s)) { cls = "queued"; label = s === "in-progress" ? "Talking" : STATUS_LABELS[s] || s[0].toUpperCase() + s.slice(1); }
   else if (task.state === "deferred") { cls = "muted"; label = "Deferred"; }
   else if (task.state === "pending") { cls = "queued"; label = "Queued"; }
-  else if (s === "opted-out") { cls = "critical"; label = "Opted out"; }
-  const machine = String(task.answered_by || "").startsWith("machine");
+  const machine = String(task.answered_by || "").startsWith("machine") && s !== "machine-skipped";
   return `<span class="pill ${cls}"><span class="dot"></span>${esc(label)}</span>` +
-         (machine ? ` <span class="pill muted">voicemail</span>` : "");
+         (machine ? ` <span class="pill muted">voicemail</span>` : "") +
+         (task.is_test ? ` <span class="pill muted">test</span>` : "");
 }
 
 // --- routing ----------------------------------------------------------------
+//
+// The hash carries the view and, for a campaign, its id - "#campaign/7" - so a
+// reload or a shared link lands on the same page instead of an empty shell.
 
-function show(view) {
+let currentRouteId = null;
+
+function parseHash() {
+  const [view, id] = (window.location.hash.slice(1) || "dashboard").split("/");
+  return { view, id: id ? Number(id) : null };
+}
+
+const routeHash = (view, id) => (id ? `${view}/${id}` : view);
+
+function leaveSettingsOk() {
+  if (currentView !== "settings" || !settingsDirty) return true;
+  if (!confirm("You have unsaved changes on the Settings page. Leave without saving them?")) return false;
+  settingsDirty = false;
+  return true;
+}
+
+function show(view, id = null) {
+  if (view !== currentView && !leaveSettingsOk()) {
+    // Put the address bar back without adding a history entry.
+    history.replaceState(null, "", "#" + routeHash(currentView, currentRouteId));
+    return;
+  }
+  // "#detail" was the old campaign page address, which never carried an id.
+  if (view === "detail" || (["campaign", "edit"].includes(view) && !id)) return show("campaigns");
+  const target = { campaign: "detail", edit: "new" }[view] || view;
+  if (!$("#view-" + target)) return show("dashboard");
   currentView = view;
-  $$(".view").forEach((el) => el.classList.toggle("hidden", el.id !== "view-" + view));
+  currentRouteId = id;
+  $$(".view").forEach((el) => el.classList.toggle("hidden", el.id !== "view-" + target));
+  const navView = { campaign: "campaigns", edit: "campaigns" }[view] || view;
   $$(".nav-item[data-view]").forEach((b) =>
-    b.setAttribute("aria-current", b.dataset.view === view ? "page" : "false"));
-  window.location.hash = view;
+    b.setAttribute("aria-current", b.dataset.view === navView ? "page" : "false"));
+  // A real history entry, so Back works; the hashchange it fires is ignored below.
+  if (window.location.hash.slice(1) !== routeHash(view, id)) window.location.hash = routeHash(view, id);
 
-  const loader = { dashboard: loadDashboard, campaigns: loadCampaigns,
-                   calls: loadCalls, dnc: loadDnc, docs: loadDocs,
-                   settings: loadSettings }[view];
+  const loader = {
+    dashboard: loadDashboard, campaigns: loadCampaigns, dnc: loadDnc,
+    docs: loadDocs, settings: loadSettings,
+    calls: () => loadCallCampaigns().then(loadCalls),
+    campaign: () => openCampaign(id), edit: () => openEditor(id), new: () => openEditor(null),
+  }[view];
   // An unhandled rejection here would leave the page showing stale data with no
   // hint that anything went wrong.
-  if (loader) loader().catch((err) => toast(err.message, true));
+  if (loader) Promise.resolve().then(loader).catch((err) => toast(err.message, true));
+  window.scrollTo(0, 0);
 }
 
 // --- dashboard --------------------------------------------------------------
 
-function setupBanner(data) {
+function setupBanners(data) {
   const s = data.settings;
+  const out = [];
+  // Every problem gets its own banner - one hiding another is how "calling is
+  // paused" went unnoticed behind a missing business name.
+  if (data.engine.paused) {
+    out.push(`<div class="banner warn"><span>&#9208;</span><span>
+      <b>Calling is paused.</b> Nothing is dialled and no scheduled runs are queued until you press
+      Resume calling. A run that comes due meanwhile goes out when you resume if it's only a little
+      late; one that's hours late is skipped, and Activity says so.</span></div>`);
+  }
   if (!s.telnyx_ready) {
-    return `<div class="banner bad"><span>&#9888;</span><span>
+    out.push(`<div class="banner bad"><span>&#9888;</span><span>
       <b>Telnyx isn't connected yet</b>, so no call can go out.
       Add your API key, TeXML application ID and a voice-capable From number on the
       <button class="link" data-view-jump="settings" style="padding:0">Settings page</button>.
-    </span></div>`;
+    </span></div>`);
   }
   if (!s.business_name) {
-    return `<div class="banner warn"><span>&#9888;</span><span>
-      No <b>business name</b> is set, so scripts go out without the caller identification
-      a pre-recorded marketing call is required to open with.
+    out.push(`<div class="banner warn"><span>&#9888;</span><span>
+      No <b>business name</b> is set, so a campaign without its own "Calling on behalf of" goes out
+      without the caller identification a pre-recorded marketing call is required to open with.
       <button class="link" data-view-jump="settings" style="padding:0">Add one</button>.
-    </span></div>`;
+    </span></div>`);
   }
-  if (data.engine.paused) {
-    return `<div class="banner warn"><span>&#9208;</span><span>
-      <b>Calling is paused.</b> Campaigns still queue up; nothing is dialled.</span></div>`;
+  if (data.held) {
+    out.push(`<div class="banner"><span>&#9432;</span><span>
+      ${plural(data.held, "call")} ${data.held === 1 ? "is" : "are"} on hold because ${data.held === 1 ? "its campaign is" : "their campaigns are"} paused.
+      ${data.held === 1 ? "It goes" : "They go"} out when the campaign is resumed.</span></div>`);
   }
-  return "";
+  return out.join("");
 }
 
 function renderTiles(data) {
@@ -168,17 +275,17 @@ function renderTiles(data) {
     { label: "Delivered", value: rate === null ? "—" : rate + "%",
       note: rate === null ? "no calls attempted yet" : `${t.completed} of ${attempted} attempts` },
     { label: "Waiting to dial", value: t.waiting + t.in_flight,
-      note: t.in_flight ? `${t.in_flight} on the line now` : "queued" },
+      note: t.in_flight ? `${t.in_flight} on the line now` : data.held ? `${data.held} on hold` : "queued" },
     { label: "Active campaigns", value: data.campaigns.active,
       note: `${data.campaigns.total} total` },
     { label: "Do not call", value: data.suppressed, note: "numbers blocked" },
   ];
-  $("#tiles").innerHTML = tiles.map((tile) => `
+  setHtml($("#tiles"), tiles.map((tile) => `
     <div class="tile">
       <div class="tile-label">${esc(tile.label)}</div>
       <div class="tile-value${tile.hero ? " hero" : ""}">${esc(tile.value)}</div>
       <div class="tile-note">${esc(tile.note)}</div>
-    </div>`).join("");
+    </div>`).join(""));
 }
 
 function renderOutcomes(totals) {
@@ -193,8 +300,7 @@ function renderOutcomes(totals) {
   $("#outcome-total").textContent = total ? `${total} calls` : "";
 
   if (!total) {
-    $("#outcome-chart").innerHTML =
-      `<div class="outcome-empty">No calls yet &mdash; run a test call to see this fill in.</div>`;
+    setHtml($("#outcome-chart"), `<div class="outcome-empty">No calls yet &mdash; run a test call to see this fill in.</div>`);
     return;
   }
 
@@ -215,8 +321,7 @@ function renderOutcomes(totals) {
       <span class="legend-pct">${total ? Math.round((values[o.key] / total) * 100) : 0}%</span>
     </div>`).join("");
 
-  $("#outcome-chart").innerHTML =
-    `<div class="outcome-bar">${bar}</div><div class="legend">${legend}</div>`;
+  setHtml($("#outcome-chart"), `<div class="outcome-bar">${bar}</div><div class="legend">${legend}</div>`);
 }
 
 function bindTooltip() {
@@ -231,12 +336,19 @@ function bindTooltip() {
   });
 }
 
+function awakeFor(startedUtc) {
+  if (!startedUtc) return "";
+  const mins = Math.round((Date.now() - new Date(startedUtc.replace(" ", "T") + "Z")) / 60000);
+  if (mins < 1) return "just started";
+  if (mins < 120) return `up ${mins} min`;
+  return `up ${Math.round(mins / 60)} h`;
+}
+
 async function loadDashboard() {
-  let data;
-  try { data = await api("/overview"); } catch (err) { return toast(err.message, true); }
+  const data = await api("/overview");
   SETTINGS = data.settings;
 
-  $("#setup-banner").innerHTML = setupBanner(data);
+  setHtml($("#setup-banner"), setupBanners(data));
   renderTiles(data);
   renderOutcomes(data.totals);
   $("#nav-campaigns").textContent = data.campaigns.total || "";
@@ -244,12 +356,16 @@ async function loadDashboard() {
 
   const e = data.engine;
   $("#btn-pause").textContent = e.paused ? "Resume calling" : "Pause all calling";
-  $("#engine-status").innerHTML = `
+  $("#btn-pause").dataset.paused = e.paused ? "1" : "0";
+  const pill = !e.running
+    ? `<span class="pill critical"><span class="dot"></span>Stopped</span>`
+    : e.paused
+      ? `<span class="pill warning"><span class="dot"></span>Paused</span>`
+      : `<span class="pill good"><span class="dot"></span>Running</span>`;
+  setHtml($("#engine-status"), `
     <div style="display:flex;flex-direction:column;gap:6px;font-size:13px">
-      <div>${e.running
-        ? `<span class="pill good"><span class="dot"></span>Running</span>`
-        : `<span class="pill critical"><span class="dot"></span>Stopped</span>`}
-        <span class="hint" style="display:inline">last tick ${esc(fmtWhen(e.last_tick))}</span></div>
+      <div>${pill}
+        <span class="hint" style="display:inline">${esc(awakeFor(e.started_at))} &middot; last tick ${esc(fmtWhen(e.last_tick))}</span></div>
       <div class="hint">Mode: <b>${esc(data.settings.delivery_mode)}</b> &middot;
         ${data.settings.delivery_mode === "webhook"
           ? "Telnyx fetches scripts from this server; opt-out keypresses work."
@@ -257,23 +373,24 @@ async function loadDashboard() {
       <div class="hint">Calling window ${esc(data.settings.window_start)}&ndash;${esc(data.settings.window_end)}
         local to each recipient, ${esc(data.settings.calls_per_minute)} calls/minute.</div>
       ${e.last_error ? `<div class="hint" style="color:var(--critical)">${esc(e.last_error)}</div>` : ""}
-    </div>`;
+    </div>`);
 
-  $("#upcoming").innerHTML = data.upcoming.length
+  setHtml($("#upcoming"), data.upcoming.length
     ? `<div class="feed">` + data.upcoming.map((c) => `
         <div class="feed-row">
           <span class="feed-time">${esc(fmtWhen(c.next_run_at, c.timezone))}</span>
-          <span class="feed-msg">${esc(c.name)} <span class="hint" style="display:inline">(${esc(c.frequency)})</span></span>
+          <span class="feed-msg"><button class="link" data-open="${c.id}" style="padding:0">${esc(c.name)}</button>
+            <span class="hint" style="display:inline">(${esc(c.frequency)})</span></span>
         </div>`).join("") + `</div>`
-    : `<div class="hint">Nothing scheduled.</div>`;
+    : `<div class="hint">Nothing scheduled.</div>`);
 
-  $("#feed").innerHTML = data.events.length
+  setHtml($("#feed"), data.events.length
     ? data.events.map((ev) => `
-        <div class="feed-row ${ev.level === "error" ? "error" : ""}">
+        <div class="feed-row ${ev.level === "error" ? "error" : ev.level === "warn" ? "warn" : ""}">
           <span class="feed-time">${esc(fmtTime(ev.ts))}</span>
           <span class="feed-msg">${esc(ev.message)}</span>
         </div>`).join("")
-    : `<div class="hint">Nothing yet.</div>`;
+    : `<div class="hint">Nothing yet.</div>`);
 
   if (!$("#test-phone").value && data.settings.test_number) {
     $("#test-phone").value = data.settings.test_number;
@@ -282,9 +399,7 @@ async function loadDashboard() {
 
 // --- campaigns --------------------------------------------------------------
 
-function campaignCard(c) {
-  const stateClass = { active: "good", paused: "warning", finished: "muted", draft: "muted" }[c.state] || "muted";
-  const done = c.calls_total ? Math.round((c.calls_completed / c.calls_total) * 100) : 0;
+function scheduleText(c) {
   let schedule = c.frequency === "once" ? "One time"
     : c.frequency === "hourly" ? "Every hour"
     : c.frequency === "daily" ? `Every day at ${c.call_time}`
@@ -295,101 +410,189 @@ function campaignCard(c) {
   if (c.ends_at) schedule += ` · until ${fmtDay(c.ends_at, c.timezone)}`;
   else if (c.frequency !== "once" && c.state === "active") schedule += " · no end date";
   if (c.mode === "agent") schedule = `AI conversation · ${schedule}`;
+  return schedule;
+}
 
+function nextRunText(c) {
+  if (c.state === "finished") return "finished";
+  if (c.state === "paused") return "paused";
+  return c.next_run_at ? `next run ${fmtWhen(c.next_run_at, c.timezone)}` : "nothing scheduled";
+}
+
+// Screened-out rows were never going to be dialled, so they are counted
+// separately instead of dragging "delivered" down.
+function statsText(c) {
+  const parts = [`${c.calls_completed} delivered of ${c.calls_finished} called`];
+  if (c.calls_in_flight) parts.push(`${c.calls_in_flight} on the line`);
+  if (c.calls_waiting) parts.push(c.state === "paused" ? `${c.calls_waiting} on hold while paused` : `${c.calls_waiting} waiting`);
+  if (c.calls_skipped) parts.push(`${c.calls_skipped} screened out`);
+  return parts.join(" · ");
+}
+
+function campaignWarning(c) {
+  if (c.state === "finished") return "";
+  if (!c.contacts) return "No contacts yet - add some before it runs.";
+  if (c.require_consent && !c.consented) return "None of its contacts is marked as consented, so nobody will be called.";
+  return "";
+}
+
+function stateActions(c, small = true) {
+  const cls = small ? "small" : "";
+  const toggle = c.state === "finished" ? ""
+    : `<button class="${cls}" data-toggle="${c.id}" data-state="${esc(c.state)}">${c.state === "active" ? "Pause" : "Resume"}</button>`;
+  return `<button class="${cls}" data-run="${c.id}" ${c.state === "paused" ? 'disabled title="Resume the campaign first"' : ""}>${c.state === "finished" ? "Run again" : "Run now"}</button>
+    ${toggle}
+    <button class="${cls}" data-edit="${c.id}">Edit</button>`;
+}
+
+function campaignCard(c) {
+  const stateClass = { active: "good", paused: "warning", finished: "muted", draft: "muted" }[c.state] || "muted";
+  const placed = c.calls_finished + c.calls_waiting + c.calls_in_flight;
+  const done = placed ? Math.round((c.calls_completed / placed) * 100) : 0;
+  const warning = campaignWarning(c);
   return `<div class="campaign">
     <div class="campaign-top">
-      <span class="campaign-name">${esc(c.name)}</span>
+      <button class="link campaign-name" data-open="${c.id}">${esc(c.name)}</button>
       <span class="pill ${stateClass}"><span class="dot"></span>${esc(c.state)}</span>
       <div style="flex:1"></div>
       <div class="btn-row">
         <button class="small" data-open="${c.id}">Open</button>
-        <button class="small" data-run="${c.id}">Run now</button>
-        <button class="small" data-toggle="${c.id}" data-state="${esc(c.state)}">${c.state === "active" ? "Pause" : "Resume"}</button>
-        <button class="small danger" data-delete="${c.id}">Delete</button>
+        ${stateActions(c)}
       </div>
     </div>
     <div class="campaign-meta">
-      ${schedule} &middot; ${esc(c.timezone)} &middot;
-      ${c.contacts} contact${c.contacts === 1 ? "" : "s"}
-      (${c.consented} consented) &middot;
-      next run ${esc(fmtWhen(c.next_run_at, c.timezone))}
+      ${esc(scheduleText(c))} &middot; ${esc(c.timezone)} &middot;
+      ${plural(c.contacts, "contact")} (${c.consented} consented) &middot;
+      ${esc(nextRunText(c))}${c.business_name ? ` &middot; from ${esc(c.business_name)}` : ""}
     </div>
+    ${warning ? `<div class="campaign-meta" style="color:var(--warning-ink)">&#9888; ${esc(warning)}</div>` : ""}
     <div class="campaign-msg">${esc(c.message || "No message set.")}</div>
     ${c.calls_total ? `<div class="progress"><div style="width:${done}%"></div></div>
-      <div class="campaign-meta">${c.calls_completed} delivered of ${c.calls_total} queued
-        ${c.calls_waiting ? `&middot; ${c.calls_waiting} waiting` : ""}</div>` : ""}
+      <div class="campaign-meta">${esc(statsText(c))}</div>` : ""}
   </div>`;
 }
 
 async function loadCampaigns() {
   const list = await api("/campaigns");
+  CAMPAIGNS = new Map(list.map((c) => [c.id, c]));
   $("#nav-campaigns").textContent = list.length || "";
-  $("#campaign-list").innerHTML = list.length
+  setHtml($("#campaign-list"), list.length
     ? list.map(campaignCard).join("")
     : `<div class="card"><div class="empty">No campaigns yet.
-        <button class="link" data-view-jump="new">Create the first one</button>.</div></div>`;
+        <button class="link" data-view-jump="new">Create the first one</button>.</div></div>`);
 }
 
-async function openCampaign(id) {
-  const [list, contacts, calls] = await Promise.all([
-    api("/campaigns"), api(`/campaigns/${id}/contacts`), api(`/calls?campaign_id=${id}&limit=100`),
-  ]);
-  // The soonest call still waiting - often deferred to the start of someone's calling window.
-  const nextCall = calls.filter((r) => ["pending", "deferred"].includes(r.state))
-    .map((r) => r.scheduled_for).sort()[0];
-  const c = list.find((x) => x.id === id);
-  if (!c) return show("campaigns");
-  currentCampaignId = id;
-
-  $("#detail-name").textContent = c.name;
-  $("#detail-sub").textContent =
-    `${c.contacts} contacts · ${c.calls_total} calls queued · next run ${fmtWhen(c.next_run_at, c.timezone)}`
-    + (nextCall ? ` · next call ${fmtWhen(nextCall)}` : "");
-
+// The detail page is drawn once as a skeleton, then its live parts are
+// refreshed in place every few seconds - without touching what's being typed.
+function renderCampaignSkeleton(id) {
   $("#detail-body").innerHTML = `
     <div class="card">
-      <div class="card-head"><h2>Script</h2><div class="spacer"></div>
-        <span class="pill ${c.state === "active" ? "good" : "muted"}"><span class="dot"></span>${esc(c.state)}</span>
-      </div>
-      <div class="campaign-msg">${esc(c.message)}</div>
+      <div class="card-head"><h2>Script</h2><div class="spacer"></div><span id="detail-state"></span></div>
+      <div class="campaign-msg" id="detail-message"></div>
+      <div class="hint" id="detail-identity" style="margin-top:8px"></div>
       <div class="btn-row" style="margin-top:12px">
-        <button data-run="${c.id}">Run now</button>
-        <button data-toggle="${c.id}" data-state="${esc(c.state)}">${c.state === "active" ? "Pause" : "Resume"}</button>
+        <span class="btn-row" id="detail-actions"></span>
+        <div style="flex:1"></div>
+        <button class="small danger" data-delete="${id}">Delete campaign</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Try it on your phone</h2></div>
+      <p class="hint" style="margin-bottom:10px">Rings one number with exactly this campaign's call &mdash;
+        its script, voice, caller identity and call type &mdash; without touching the list.
+        Telnyx bills it like any call.</p>
+      <div class="btn-row">
+        <input type="text" id="detail-test-phone" placeholder="+1 617 555 0142" style="max-width:220px">
+        <button class="primary" id="detail-test-btn">Call me with this campaign</button>
+        <span class="hint" id="detail-test-status"></span>
       </div>
     </div>
 
     <div class="card">
       <div class="card-head"><h2>Contacts</h2><div class="spacer"></div>
-        <span class="hint">${c.consented} of ${c.contacts} consented</span></div>
+        <span class="hint" id="detail-consent-count"></span></div>
       <div class="field">
-        <textarea id="detail-add" class="mono" rows="2" placeholder="Add more numbers, one per line"></textarea>
+        <textarea id="detail-add" class="mono" rows="2" placeholder="Add more numbers, one per line - number, name"></textarea>
         <label class="check" style="margin-top:8px">
           <input type="checkbox" id="detail-consent"> <span>These gave prior express written consent</span>
         </label>
       </div>
-      <button class="small" id="detail-add-btn">Add contacts</button>
-      <div class="table-wrap" style="margin-top:12px">
-        <table><thead><tr><th>Number</th><th>Name</th><th>Timezone</th><th>Consent</th><th></th></tr></thead>
-        <tbody>${contacts.map((ct) => `
-          <tr>
-            <td class="phone">${esc(ct.pretty)}${ct.suppressed ? ' <span class="pill critical"><span class="dot"></span>DNC</span>' : ""}</td>
-            <td>${esc(ct.name || "—")}</td>
-            <td class="hint">${esc(ct.timezone)}</td>
-            <td>${ct.consent
-              ? '<span class="pill good"><span class="dot"></span>yes</span>'
-              : '<span class="pill warning"><span class="dot"></span>no</span>'}</td>
-            <td><button class="link small" data-del-contact="${ct.id}" data-campaign="${c.id}">remove</button></td>
-          </tr>`).join("") || `<tr><td colspan="5" class="empty">No contacts yet.</td></tr>`}
-        </tbody></table>
+      <div class="btn-row">
+        <button class="small" id="detail-add-btn">Add contacts</button>
+        <button class="small" id="detail-consent-all">Mark all as consented&hellip;</button>
+        <span class="hint" id="detail-add-status"></span>
       </div>
+      <div class="table-wrap" style="margin-top:12px" id="detail-contacts"></div>
     </div>
 
     <div class="card">
-      <div class="card-head"><h2>Calls</h2></div>
-      <div class="table-wrap">${callsTable(calls, false, true)}</div>
+      <div class="card-head"><h2>Calls</h2><div class="spacer"></div>
+        <button class="small" id="detail-refresh">Refresh</button></div>
+      <div class="table-wrap" id="detail-calls"></div>
     </div>`;
+  $("#detail-test-phone").value = SETTINGS.test_number || "";
+}
 
-  show("detail");
+async function openCampaign(id) {
+  if (!id) return show("campaigns");
+  if (currentCampaignId !== id || !$("#detail-calls")) {
+    currentCampaignId = id;
+    $("#detail-name").textContent = "Campaign";
+    $("#detail-sub").textContent = "";
+    renderCampaignSkeleton(id);
+  }
+  await refreshCampaign(id);
+}
+
+async function refreshCampaign(id) {
+  let c, contacts, calls;
+  try {
+    [c, contacts, calls] = await Promise.all([
+      api(`/campaigns/${id}`), api(`/campaigns/${id}/contacts`), api(`/calls?campaign_id=${id}&limit=100`),
+    ]);
+  } catch (err) {
+    if (/No such campaign/.test(err.message)) { toast("That campaign no longer exists.", true); return show("campaigns"); }
+    throw err;
+  }
+  if (currentView !== "campaign" || currentCampaignId !== id) return;
+  CAMPAIGNS.set(c.id, c);
+  // The soonest call still waiting - often deferred to the start of someone's calling window.
+  const nextCall = calls.filter((r) => ["pending", "deferred"].includes(r.state) && !r.is_test)
+    .map((r) => r.scheduled_for).sort()[0];
+
+  $("#detail-name").textContent = c.name;
+  $("#detail-sub").textContent = `${plural(c.contacts, "contact")} · ${scheduleText(c)} · ${nextRunText(c)}`
+    + (nextCall && c.state !== "paused" ? ` · next call ${fmtWhen(nextCall)}` : "");
+  const stateClass = { active: "good", paused: "warning" }[c.state] || "muted";
+  setHtml($("#detail-state"), `<span class="pill ${stateClass}"><span class="dot"></span>${esc(c.state)}</span>`);
+  $("#detail-message").textContent = c.message;
+  const business = c.business_name || SETTINGS.business_name;
+  $("#detail-identity").innerHTML =
+    `${c.mode === "agent" ? "AI conversation" : "Recorded message"} &middot; calling on behalf of
+     <b>${esc(business || "(no business name set)")}</b>${c.business_name ? "" : " (from Settings)"} &middot;
+     callback ${esc(c.callback_number || SETTINGS.callback_number || "the caller-ID number")}
+     ${c.calls_total ? `<br>${esc(statsText(c))}` : ""}
+     ${campaignWarning(c) ? `<br><span style="color:var(--warning-ink)">&#9888; ${esc(campaignWarning(c))}</span>` : ""}`;
+  setHtml($("#detail-actions"), stateActions(c, false));
+
+  $("#detail-consent-count").textContent = `${c.consented} of ${c.contacts} consented`;
+  $("#detail-consent-all").classList.toggle("hidden", c.consented >= c.contacts);
+  setHtml($("#detail-contacts"), `
+    <table><thead><tr><th>Number</th><th>Name</th><th>Timezone</th><th>Consent</th><th></th></tr></thead>
+    <tbody>${contacts.map((ct) => `
+      <tr>
+        <td class="phone">${esc(ct.pretty)}${ct.suppressed ? ' <span class="pill critical"><span class="dot"></span>DNC</span>' : ""}</td>
+        <td>${esc(ct.name || "—")}</td>
+        <td class="hint">${esc(ct.timezone)}</td>
+        <td><button class="link pill-button" data-consent="${ct.id}" data-value="${ct.consent ? 0 : 1}"
+              title="${ct.consent ? "Mark as not consented" : "Mark as consented"}">${ct.consent
+          ? '<span class="pill good"><span class="dot"></span>yes</span>'
+          : '<span class="pill warning"><span class="dot"></span>no</span>'}</button></td>
+        <td><button class="link small" data-del-contact="${ct.id}" data-pretty="${esc(ct.pretty)}">remove</button></td>
+      </tr>`).join("") || `<tr><td colspan="5" class="empty">No contacts yet.</td></tr>`}
+    </tbody></table>`);
+  setHtml($("#detail-calls"), callsTable(calls, false, true));
 }
 
 // --- call log ---------------------------------------------------------------
@@ -471,23 +674,49 @@ function callsTable(rows, withCampaign = true, withSchedule = false) {
       // A missing name means either a test call (never had a campaign) or a
       // campaign deleted since - the id is what tells the two apart.
       const campaign = r.campaign_name || (r.campaign_id ? "Deleted campaign" : "Test call");
+      const detail = r.error || (["deferred", "pending"].includes(r.state) ? r.status : "") || "";
       return `
       <tr>
         <td class="hint when">${esc(fmtWhen(r.updated_at))}</td>
         ${withSchedule ? scheduleCell(r) : ""}
-        ${withCampaign ? `<td class="name" title="${esc(campaign)}">${esc(campaign)}</td>` : ""}
+        ${withCampaign ? `<td class="name" title="${esc(campaign)}">${r.campaign_name && r.campaign_id
+          ? `<button class="link" data-open="${r.campaign_id}" style="padding:0">${esc(campaign)}</button>` : esc(campaign)}</td>` : ""}
         <td class="phone">${esc(r.pretty)}</td>
         <td>${statusPill(r)}</td>
         <td class="num">${r.duration ? r.duration + "s" : "—"}</td>
         <td class="hint" style="font-family:var(--mono);font-size:11px">${esc(r.sid || "—")}</td>
-        <td class="hint">${esc(r.error || (["deferred", "pending"].includes(r.state) ? r.status : "") || "")}</td>
+        <td class="hint">${esc(detail)}</td>
       </tr>`;
     }).join("")}
     </tbody></table>`;
 }
 
+function callFilters() {
+  const params = new URLSearchParams();
+  if ($("#calls-campaign").value) params.set("campaign_id", $("#calls-campaign").value);
+  if ($("#calls-outcome").value) params.set("outcome", $("#calls-outcome").value);
+  if ($("#calls-q").value.trim()) params.set("q", $("#calls-q").value.trim());
+  return params;
+}
+
+async function loadCallCampaigns() {
+  const select = $("#calls-campaign");
+  const chosen = select.value;
+  const list = await api("/campaigns");
+  select.innerHTML = `<option value="">All campaigns</option>` +
+    list.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("");
+  select.value = list.some((c) => String(c.id) === chosen) ? chosen : "";
+}
+
 async function loadCalls() {
-  $("#calls-table").innerHTML = callsTable(await api("/calls?limit=300"));
+  const params = callFilters();
+  $("#calls-export").href = "/api/calls.csv" + (params.toString() ? "?" + params : "");
+  params.set("limit", String(callsLimit));
+  const filtered = [...params.keys()].length > 1;  // anything beyond the limit
+  const rows = await api("/calls?" + params);
+  setHtml($("#calls-table"), rows.length || !filtered
+    ? callsTable(rows) : `<div class="empty">No calls match these filters.</div>`);
+  $("#calls-more-row").classList.toggle("hidden", rows.length < callsLimit);
 }
 
 // --- do not call ------------------------------------------------------------
@@ -495,17 +724,25 @@ async function loadCalls() {
 async function loadDnc() {
   const rows = await api("/suppression");
   $("#nav-dnc").textContent = rows.length || "";
-  $("#dnc-table").innerHTML = rows.length
+  setHtml($("#dnc-table"), rows.length
     ? `<table><thead><tr><th>Number</th><th>Reason</th><th>Added</th><th></th></tr></thead>
        <tbody>${rows.map((r) => `
         <tr><td class="phone">${esc(r.pretty)}</td><td>${esc(r.reason)}</td>
         <td class="hint">${esc(fmtWhen(r.created_at))}</td>
-        <td><button class="link small" data-unsuppress="${esc(r.phone)}">remove</button></td></tr>`).join("")}
+        <td><button class="link small" data-unsuppress="${esc(r.phone)}" data-pretty="${esc(r.pretty)}"
+              data-reason="${esc(r.reason)}">remove</button></td></tr>`).join("")}
        </tbody></table>`
-    : `<div class="empty">The list is empty.</div>`;
+    : `<div class="empty">The list is empty.</div>`);
 }
 
 // --- settings ---------------------------------------------------------------
+
+const SETTING_FIELDS = {
+  telnyx_app_id: "#s-app-id", telnyx_from_number: "#s-from", test_number: "#s-test",
+  business_name: "#s-business", callback_number: "#s-callback", window_start: "#s-window-start",
+  window_end: "#s-window-end", calls_per_minute: "#s-cpm", ring_seconds: "#s-ring",
+  public_base_url: "#s-base-url", script_provider: "#s-script-provider",
+};
 
 async function loadSettings() {
   const data = await api("/settings");
@@ -531,8 +768,20 @@ async function loadSettings() {
   $("#s-perplexity").placeholder = data.settings.perplexity_api_key_set
     ? "saved — leave blank to keep it" : "pplx-...";
   $("#s-script-provider").value = data.settings.script_provider || "";
+  // A value coming from the server's environment comes back after being cleared
+  // here - say so next to it, rather than letting Save look broken.
+  $$(".env-note").forEach((el) => el.remove());
+  for (const [key, envVar] of Object.entries(data.settings.from_environment || {})) {
+    const input = SETTING_FIELDS[key] && $(SETTING_FIELDS[key]);
+    if (!input) continue;
+    input.insertAdjacentHTML("afterend", `<div class="hint env-note">From the server's environment
+      (<code>${esc(envVar)}</code>). Clearing it here won't remove it &mdash; change it where the server runs.</div>`);
+  }
   renderAgent(data.agent);
   const store = data.database;
+  $("#settings-sub").textContent = store.backend === "postgres"
+    ? `Saved in the hosted Postgres database. Each API key is only ever sent to the service it belongs to.`
+    : `Saved in a SQLite file on this machine. Each API key is only ever sent to the service it belongs to.`;
   $("#db-path").innerHTML = store.backend === "postgres"
     ? `Postgres &mdash; <code>${esc(store.host)}/${esc(store.dbname)}</code>,
        schema <code>${esc(store.schema)}</code><br>A hosted database: campaigns, contacts and
@@ -548,17 +797,20 @@ async function loadSettings() {
         Everything works without exposing this machine. Recipients can only opt out by calling
         the number in the script.</span></div>`;
   fillVoices();
+  settingsDirty = false;
+  loadInbound().catch(() => {});
 }
 
 function fillVoices() {
-  const select = $("#c-voice");
-  if (!META.voices || select.options.length) return;
-  select.innerHTML = META.voices
-    .map((v) => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join("");
+  for (const select of [$("#c-voice"), $("#test-voice")]) {
+    if (!META.voices || !META.voices.length || select.options.length) continue;
+    select.innerHTML = META.voices
+      .map((v) => `<option value="${esc(v.id)}">${esc(v.label)}</option>`).join("");
+  }
 }
 
-async function saveSettings() {
-  const values = {
+function settingsValues() {
+  return {
     telnyx_api_key: $("#s-api-key").value.trim(),
     telnyx_app_id: $("#s-app-id").value.trim(),
     telnyx_from_number: $("#s-from").value.trim(),
@@ -574,17 +826,19 @@ async function saveSettings() {
     perplexity_api_key: $("#s-perplexity").value.trim(),
     script_provider: $("#s-script-provider").value,
   };
-  try {
-    await api("/settings", { method: "POST", body: { values } });
-    $("#s-api-key").value = "";
-    $("#s-anthropic").value = "";
-    $("#s-perplexity").value = "";
-    toast("Settings saved.");
-    loadSettings();
-  } catch (err) { toast(err.message, true); }
 }
 
-// --- new campaign -----------------------------------------------------------
+async function saveSettings({ quiet = false } = {}) {
+  await api("/settings", { method: "POST", body: { values: settingsValues() } });
+  $("#s-api-key").value = "";
+  $("#s-anthropic").value = "";
+  $("#s-perplexity").value = "";
+  settingsDirty = false;
+  if (!quiet) toast("Settings saved.");
+  await loadSettings();
+}
+
+// --- new / edit campaign ----------------------------------------------------
 
 function fillFormOptions() {
   const tzSelect = $("#c-timezone");
@@ -593,6 +847,71 @@ function fillFormOptions() {
     .map((tz) => `<option value="${esc(tz)}">${esc(tz)}</option>`).join("");
   tzSelect.value = TIMEZONES.includes(chosen) ? chosen : "America/New_York";
   fillVoices();
+}
+
+// Which schedule fields apply depends on the frequency; called after every
+// change and every reset, so a reset form never shows a weekday picker for "Once".
+function refreshScheduleFields() {
+  const freq = $("#c-frequency").value;
+  $("#wrap-weekday").classList.toggle("hidden", freq !== "weekly");
+  $("#wrap-time").classList.toggle("hidden", freq === "hourly");
+  refreshWindowWarning();
+}
+
+function identityHints() {
+  $("#c-business").placeholder = SETTINGS.business_name ? `${SETTINGS.business_name} (from Settings)` : "No default set in Settings";
+  $("#c-callback").placeholder = SETTINGS.callback_number ? `${SETTINGS.callback_number} (from Settings)` : "The caller-ID number";
+}
+
+function resetCampaignForm() {
+  $("#campaign-form").reset();
+  $("#c-require-consent").checked = true;
+  $("#script-preview").textContent = "—";
+  $("#script-meter").textContent = "";
+  $("#draft-status").textContent = "";
+  $("#contacts-meter").textContent = "";
+  fillFormOptions();
+  refreshScheduleFields();
+  refreshModeHint();
+  refreshConsentWarning();
+  $("#c-agent-info").dispatchEvent(new Event("input"));
+}
+
+async function openEditor(id) {
+  if (!META.voices.length) await loadSettings();
+  editingId = id;
+  resetCampaignForm();
+  identityHints();
+  const editing = Boolean(id);
+  $("#form-title").textContent = editing ? "Edit campaign" : "New campaign";
+  $("#form-sub").textContent = editing
+    ? "Changes apply from the next call. Contacts are managed on the campaign's page."
+    : "A furniture store announcing a Memorial Day sale, for example.";
+  $("#btn-submit-campaign").textContent = editing ? "Save changes" : "Create campaign";
+  $("#card-contacts").classList.toggle("hidden", editing);
+  $("#wrap-start-now").classList.toggle("hidden", editing);
+  if (!editing) return;
+
+  const c = await api(`/campaigns/${id}`);
+  $("#c-name").value = c.name;
+  $("#c-agent").checked = c.mode === "agent";
+  $("#c-agent-info").value = c.agent_info || "";
+  $("#c-message").value = c.message;
+  $("#c-business").value = c.business_name || "";
+  $("#c-callback").value = c.callback_number || "";
+  $("#c-voice").value = c.voice;
+  $("#c-amd").value = c.amd;
+  $("#c-frequency").value = c.frequency;
+  $("#c-time").value = c.call_time;
+  $("#c-weekday").value = String(c.weekday);
+  $("#c-timezone").value = c.timezone;
+  $("#c-starts-at").value = toLocalInput(c.starts_at, c.timezone);
+  $("#c-ends-at").value = toLocalInput(c.ends_at, c.timezone);
+  $("#c-require-consent").checked = Boolean(c.require_consent);
+  refreshScheduleFields();
+  refreshModeHint();
+  $("#c-agent-info").dispatchEvent(new Event("input"));
+  schedulePreview();
 }
 
 let previewTimer = null;
@@ -606,7 +925,8 @@ function schedulePreview() {
       return;
     }
     try {
-      const p = await api("/script/preview", { method: "POST", body: { message } });
+      const p = await api("/script/preview", { method: "POST", body: {
+        message, business_name: $("#c-business").value, callback_number: $("#c-callback").value } });
       $("#script-preview").textContent = p.script;
       $("#script-meter").innerHTML =
         `About <b>${p.seconds} seconds</b> spoken · ${p.characters} characters` +
@@ -621,19 +941,21 @@ function schedulePreview() {
 function normalizePhone(raw) {
   const text = (raw || "").trim();
   if (!text) return "";
-  const digits = text.replace(/\D/g, "");
+  let digits = text.replace(/\D/g, "");
   if (!digits) return "";
-  if (text.startsWith("+")) return digits.length >= 8 && digits.length <= 15 ? "+" + digits : "";
-  if (digits.length === 10) return "+1" + digits;
-  if (digits.length === 11 && digits.startsWith("1")) return "+" + digits;
-  return "";
+  const plus = text.startsWith("+");
+  if (plus && !digits.startsWith("1")) return digits.length >= 8 && digits.length <= 15 ? "+" + digits : "";
+  if (digits.length === 10 && !plus) digits = "1" + digits;
+  if (digits.length !== 11 || !digits.startsWith("1")) return "";
+  // Area code and exchange never start with 0 or 1; N11 codes are services.
+  const area = digits.slice(1, 4), exchange = digits.slice(4, 7);
+  if (!/[2-9]/.test(area[0]) || !/[2-9]/.test(exchange[0]) || area.slice(1) === "11") return "";
+  return "+" + digits;
 }
 
-function countContacts() {
-  const meter = $("#contacts-meter");
+function contactStats() {
   const seen = new Set();
   let usable = 0, dupes = 0, bad = 0;
-
   for (let line of $("#c-contacts").value.split("\n")) {
     line = line.trim();
     if (!line || /^(phone|number|#)/i.test(line)) continue;
@@ -644,12 +966,31 @@ function countContacts() {
     seen.add(phone);
     usable++;
   }
+  return { usable, dupes, bad };
+}
 
+function countContacts() {
+  const meter = $("#contacts-meter");
+  const { usable, dupes, bad } = contactStats();
+  refreshConsentWarning();
   if (!usable && !dupes && !bad) return (meter.textContent = "");
   const parts = [`<b>${usable}</b> number${usable === 1 ? "" : "s"} to call`];
   if (dupes) parts.push(`${dupes} duplicate${dupes === 1 ? "" : "s"} ignored`);
   if (bad) parts.push(`<span style="color:var(--critical)">${bad} line${bad === 1 ? "" : "s"} not a phone number</span>`);
   meter.innerHTML = parts.join(" · ");
+}
+
+// Said before submitting, not after: with the boxes left as they are, every
+// number is screened out and a "start now" campaign finishes having called nobody.
+function refreshConsentWarning() {
+  const { usable } = contactStats();
+  const trapped = usable > 0 && $("#c-require-consent").checked && !$("#c-consent-have").checked;
+  $("#consent-warning").classList.toggle("hidden", !trapped);
+  if (trapped) {
+    $("#consent-warning-text").innerHTML = `<b>None of these ${plural(usable, "number")} will be called</b> unless
+      you tick the consent box above. Tick it only if they really gave written consent &mdash; or untick
+      "Refuse to dial" if you're only calling your own test numbers.`;
+  }
 }
 
 // Read one or more CSV/text files in the browser and append their rows to the
@@ -683,12 +1024,13 @@ async function draftScript() {
 
   const btn = $("#btn-draft");
   btn.disabled = true;
-  const writer = SETTINGS.script_provider_active === "perplexity" ? "Perplexity" : "Claude";
+  const writer = SETTINGS.script_provider_active === "perplexity" ? "Perplexity"
+    : SETTINGS.script_provider_active === "anthropic" ? "Claude" : "The AI";
   $("#draft-status").innerHTML = `<span class="spinner"></span> ${writer} is writing…`;
   try {
     const result = await api("/script/draft", {
       method: "POST",
-      body: { brief, existing, business_name: SETTINGS.business_name || "", seconds: 25 },
+      body: { brief, existing, business_name: $("#c-business").value.trim() || SETTINGS.business_name || "", seconds: 25 },
     });
     $("#c-message").value = result.message;
     $("#draft-status").textContent = `Drafted · about ${result.seconds} seconds. Edit freely.`;
@@ -698,14 +1040,15 @@ async function draftScript() {
   } finally { btn.disabled = false; }
 }
 
-async function submitCampaign(event) {
-  event.preventDefault();
-  const body = {
+function campaignBody() {
+  return {
     name: $("#c-name").value.trim(),
     message: $("#c-message").value.trim(),
     voice: $("#c-voice").value,
     mode: $("#c-agent").checked ? "agent" : "message",
     agent_info: $("#c-agent").checked ? $("#c-agent-info").value.trim() : "",
+    business_name: $("#c-business").value.trim(),
+    callback_number: $("#c-callback").value.trim(),
     amd: $("#c-amd").value,
     frequency: $("#c-frequency").value,
     call_time: $("#c-time").value || "10:00",
@@ -714,32 +1057,59 @@ async function submitCampaign(event) {
     require_consent: $("#c-require-consent").checked,
     starts_at: $("#c-starts-at").value,
     ends_at: $("#c-ends-at").value,
+  };
+}
+
+async function submitCampaign(event) {
+  event.preventDefault();
+  const body = campaignBody();
+  if (!body.message) return toast("The campaign needs a message.", true);
+  const button = $("#btn-submit-campaign");
+
+  if (editingId) {
+    return busy(button, async () => {
+      const id = editingId;
+      const result = await api(`/campaigns/${id}`, { method: "PATCH", body });
+      toast(result.note || "Changes saved.");
+      editingId = null;
+      show("campaign", id);
+    });
+  }
+
+  const { usable } = contactStats();
+  Object.assign(body, {
     start_now: $("#c-start-now").checked,
     contacts: $("#c-contacts").value,
     contacts_consented: $("#c-consent-have").checked,
-  };
-  if (!body.message) return toast("The campaign needs a message.", true);
+  });
+  if (usable && body.require_consent && !body.contacts_consented && !confirm(
+    `None of the ${plural(usable, "number")} is marked as having given consent, so nobody will be called.\n\nCreate the campaign anyway? You can mark consent later on its page.`)) return;
 
-  try {
+  await busy(button, async () => {
     const result = await api("/campaigns", { method: "POST", body });
     let note = `Campaign created with ${result.contacts_added} contact(s).`;
-    if (result.invalid.length) note += ` ${result.invalid.length} line(s) weren't valid numbers.`;
-    if (result.unconsented) {
-      note += ` None are marked as having given consent, so they won't be called. Add them again with the consent box ticked - only if they really did consent.`;
-    }
-    toast(note, Boolean(result.unconsented));
-    $("#campaign-form").reset();
-    refreshModeHint();
-    $("#c-agent-info").dispatchEvent(new Event("input"));
-    $("#script-preview").textContent = "—";
-    $("#c-require-consent").checked = true;
-    refreshWindowWarning();
-    fillFormOptions();
-    show("campaigns");
-  } catch (err) { toast(err.message, true); }
+    if (result.invalid.length) note += ` ${result.invalid.length} line(s) weren't valid numbers: ${result.invalid.slice(0, 3).join("; ")}${result.invalid.length > 3 ? "…" : ""}.`;
+    if (result.unconsented) note += " None are marked as consented, so they won't be called until you mark them.";
+    else if (!result.contacts_added) note += " Add contacts on its page before it runs.";
+    toast(note, Boolean(result.unconsented || !result.contacts_added));
+    resetCampaignForm();
+    show("campaign", result.id);
+  });
 }
 
 // --- actions ----------------------------------------------------------------
+
+function confirmRun(c) {
+  if (!c) return true;
+  const eligible = c.require_consent ? c.consented : c.contacts;
+  const screened = c.contacts - eligible;
+  const schedule = c.frequency === "once"
+    ? (c.state === "active" && c.next_run_at ? `\n\nThis takes the place of its scheduled run (${fmtWhen(c.next_run_at, c.timezone)}).` : "")
+    : "\n\nIts regular schedule carries on as well.";
+  return confirm(`Call ${plural(eligible, "person", "people")} on "${c.name}" now?`
+    + (screened ? `\n\n${screened} without consent will be skipped.` : "")
+    + "\n\nCalls go out at the paced rate, inside each person's calling window." + schedule);
+}
 
 async function handleClick(event) {
   const jump = event.target.closest("[data-view-jump]");
@@ -752,61 +1122,109 @@ async function handleClick(event) {
   if (doc) return openDoc(doc.dataset.doc, doc.dataset.docTitle);
 
   const open = event.target.closest("[data-open]");
-  if (open) return openCampaign(Number(open.dataset.open));
+  if (open) return show("campaign", Number(open.dataset.open));
+
+  const edit = event.target.closest("[data-edit]");
+  if (edit) return show("edit", Number(edit.dataset.edit));
 
   const run = event.target.closest("[data-run]");
   if (run) {
-    try {
-      const r = await api(`/campaigns/${run.dataset.run}/run`, { method: "POST" });
-      toast(runSummary(r), r.queued === 0 && r.skipped > 0);
-      currentView === "detail" ? openCampaign(Number(run.dataset.run)) : loadCampaigns();
-    } catch (err) { toast(err.message, true); }
-    return;
+    const id = Number(run.dataset.run);
+    if (!confirmRun(CAMPAIGNS.get(id))) return;
+    return busy(run, async () => {
+      const r = await api(`/campaigns/${id}/run`, { method: "POST" });
+      toast(runSummary(r) + (r.note ? " " + r.note : ""), r.queued === 0 && r.skipped > 0);
+      currentView === "campaign" ? refreshCampaign(id) : loadCampaigns();
+    });
   }
 
   const toggle = event.target.closest("[data-toggle]");
   if (toggle) {
     const id = Number(toggle.dataset.toggle);
-    await api(`/campaigns/${id}`, {
-      method: "PATCH",
-      body: { state: toggle.dataset.state === "active" ? "paused" : "active" },
+    const pausing = toggle.dataset.state === "active";
+    return busy(toggle, async () => {
+      const r = await api(`/campaigns/${id}`, { method: "PATCH", body: { state: pausing ? "paused" : "active" } });
+      toast(r.note || (pausing ? "Paused - its queued calls are on hold too." : "Resumed."));
+      currentView === "campaign" ? refreshCampaign(id) : loadCampaigns();
     });
-    currentView === "detail" ? openCampaign(id) : loadCampaigns();
-    return;
   }
 
   const del = event.target.closest("[data-delete]");
   if (del) {
-    if (!confirm("Delete this campaign and its recipient list? Queued calls are cancelled.")) return;
-    await api(`/campaigns/${del.dataset.delete}`, { method: "DELETE" });
-    toast("Campaign deleted.");
-    loadCampaigns();
-    return;
+    if (!confirm("Delete this campaign and its recipient list? Queued calls are cancelled. This can't be undone.")) return;
+    return busy(del, async () => {
+      await api(`/campaigns/${del.dataset.delete}`, { method: "DELETE" });
+      toast("Campaign deleted.");
+      show("campaigns");
+    });
+  }
+
+  const consent = event.target.closest("[data-consent]");
+  if (consent) {
+    const giving = consent.dataset.value === "1";
+    if (giving && !confirm("Mark this person as having given prior express written consent to automated calls?\n\nOnly do this if you have their consent on record.")) return;
+    return busy(consent, async () => {
+      await api(`/campaigns/${currentCampaignId}/contacts/${consent.dataset.consent}`,
+        { method: "PATCH", body: { consent: giving } });
+      refreshCampaign(currentCampaignId);
+    });
   }
 
   const delContact = event.target.closest("[data-del-contact]");
   if (delContact) {
-    await api(`/campaigns/${delContact.dataset.campaign}/contacts/${delContact.dataset.delContact}`,
-      { method: "DELETE" });
-    openCampaign(Number(delContact.dataset.campaign));
-    return;
+    if (!confirm(`Remove ${delContact.dataset.pretty} from this campaign? A call already queued for them is cancelled.`)) return;
+    return busy(delContact, async () => {
+      const r = await api(`/campaigns/${currentCampaignId}/contacts/${delContact.dataset.delContact}`,
+        { method: "DELETE" });
+      if (r.cancelled) toast(`Removed, and their queued call was cancelled.`);
+      refreshCampaign(currentCampaignId);
+    });
   }
 
   const unsuppress = event.target.closest("[data-unsuppress]");
   if (unsuppress) {
-    await api(`/suppression/${encodeURIComponent(unsuppress.dataset.unsuppress)}`, { method: "DELETE" });
-    loadDnc();
-    return;
+    // An opt-out is a legal record. Taking one off the list should be deliberate.
+    if (!confirm(`Remove ${unsuppress.dataset.pretty} from the do-not-call list?\n\nIt was added because: ${unsuppress.dataset.reason}.\nOnly do this if they asked to be called again. The removal is recorded under Activity.`)) return;
+    return busy(unsuppress, async () => {
+      await api(`/suppression/${encodeURIComponent(unsuppress.dataset.unsuppress)}`, { method: "DELETE" });
+      toast("Removed from the do-not-call list.");
+      loadDnc();
+    });
   }
 
   if (event.target.closest("#detail-add-btn")) {
     const id = currentCampaignId;
-    const r = await api(`/campaigns/${id}/contacts`, {
-      method: "POST",
-      body: { raw: $("#detail-add").value, consented: $("#detail-consent").checked },
+    return busy($("#detail-add-btn"), async () => {
+      const r = await api(`/campaigns/${id}/contacts`, {
+        method: "POST",
+        body: { raw: $("#detail-add").value, consented: $("#detail-consent").checked },
+      });
+      $("#detail-add").value = r.invalid.join("\n");
+      $("#detail-add-status").innerHTML = (r.added ? `Added or updated ${plural(r.added, "contact")}.` : "")
+        + (r.invalid.length ? ` <span style="color:var(--critical)">${notNumbers(r.invalid.length)} - left in the box to fix.</span>` : "");
+      refreshCampaign(id);
     });
-    toast(`Added ${r.added} contact(s).`);
-    openCampaign(id);
+  }
+
+  if (event.target.closest("#detail-consent-all")) {
+    const c = CAMPAIGNS.get(currentCampaignId);
+    const missing = c ? c.contacts - c.consented : 0;
+    if (!confirm(`Mark all ${plural(missing, "remaining contact")} as having given prior express written consent?\n\nOnly do this if you have consent on record for every one of them.`)) return;
+    return busy($("#detail-consent-all"), async () => {
+      const r = await api(`/campaigns/${currentCampaignId}/contacts/consent-all`, { method: "POST" });
+      toast(`${plural(r.changed, "contact")} marked as consented.`);
+      refreshCampaign(currentCampaignId);
+    });
+  }
+
+  if (event.target.closest("#detail-test-btn")) {
+    return busy($("#detail-test-btn"), () =>
+      runTestCall(`/campaigns/${currentCampaignId}/test-call`, { phone: $("#detail-test-phone").value },
+                  $("#detail-test-status")).then(() => refreshCampaign(currentCampaignId)));
+  }
+
+  if (event.target.closest("#detail-refresh")) {
+    return busy($("#detail-refresh"), () => refreshCampaign(currentCampaignId));
   }
 }
 
@@ -822,7 +1240,7 @@ function renderAgent(info) {
        voice <code>${esc(info.voice)}</code>, Telnyx assistant <code>${esc(info.assistant_id)}</code>.`
     : info.needs_update && !info.missing.length
       ? `<span style="color:var(--critical)">Switched to ${where} &mdash; press Update in Telnyx to apply it.
-         AI calls are paused until then.</span>`
+         AI campaign calls wait until then.</span>`
     : info.missing.length
       ? `Not ready yet. Still needed: ${info.missing.map(esc).join("; ")}.`
       : "Everything it needs is in place &mdash; press the button to create the agent in Telnyx.";
@@ -834,6 +1252,7 @@ async function changeAgentLlm() {
     await api("/settings", { method: "POST", body: { values: { agent_llm: $("#s-agent-llm").value } } });
     META.agent = (await api("/settings")).agent;
     renderAgent(META.agent);
+    toast("Saved - press Update in Telnyx to apply it.");
   } catch (err) { toast(err.message, true); }
 }
 
@@ -842,11 +1261,42 @@ async function setupAgent() {
   btn.disabled = true;
   $("#agent-setup-status").innerHTML = `<span class="spinner"></span> setting up in Telnyx…`;
   try {
+    // Setup reads the saved settings, so anything typed but unsaved goes first.
+    if (settingsDirty) await saveSettings({ quiet: true });
     META.agent = await api("/agent/setup", { method: "POST" });
     renderAgent(META.agent);
     $("#agent-setup-status").textContent = "Done.";
   } catch (err) {
     $("#agent-setup-status").innerHTML = `<span style="color:var(--critical)">${esc(err.message)}</span>`;
+    btn.disabled = false;
+  }
+}
+
+async function loadInbound() {
+  const info = await api("/inbound");
+  const btn = $("#btn-inbound-setup");
+  btn.disabled = !info.can_setup;
+  btn.textContent = info.ready ? "Set up again" : "Set up callback line";
+  $("#inbound-status").innerHTML = info.ready
+    ? `<span style="color:var(--good)">&#10003; Set up.</span> Calls to ${esc(info.number)} hear: press 9 to be
+       removed from the list, or leave a message.`
+    : info.missing && info.missing.length
+      ? `Not set up. Still needed: ${info.missing.map(esc).join("; ")}.`
+      : `<span style="color:var(--critical)">Not set up</span> &mdash; calls to ${esc(info.number)} currently go to
+         <code>${esc(info.url || "nowhere")}</code>, so nobody who calls back can opt out or reach you.`;
+}
+
+async function setupInbound() {
+  const btn = $("#btn-inbound-setup");
+  btn.disabled = true;
+  $("#inbound-setup-status").innerHTML = `<span class="spinner"></span> updating Telnyx…`;
+  try {
+    if (settingsDirty) await saveSettings({ quiet: true });
+    await api("/inbound/setup", { method: "POST" });
+    $("#inbound-setup-status").textContent = "Done.";
+    await loadInbound();
+  } catch (err) {
+    $("#inbound-setup-status").innerHTML = `<span style="color:var(--critical)">${esc(err.message)}</span>`;
     btn.disabled = false;
   }
 }
@@ -869,28 +1319,36 @@ function refreshModeHint() {
     : ready
       ? "The agent says up front that it's an automated AI assistant, answers only from your talking points, and honours opt-outs. Each minute costs more than a recorded message."
       : `<span style="color:var(--critical)">The AI phone agent isn't set up yet &mdash; finish Settings &rsaquo; AI phone agent first.</span>`;
+  $("#wrap-test-voice").style.display = $("#test-mode").value === "agent" ? "none" : "";
+}
+
+// Shared by "Call me now" and a campaign's "Call me with this campaign": place
+// it, then say plainly what happened - including when it didn't ring.
+async function runTestCall(path, body, statusEl) {
+  statusEl.innerHTML = `<span class="spinner"></span> dialling…`;
+  try {
+    const r = await api(path, { method: "POST", body });
+    const task = r.task || {};
+    statusEl.innerHTML = task.sid
+      ? `<span style="color:var(--good)">Call placed — your phone should ring.</span> <span class="hint">SID ${esc(task.sid)}</span>`
+      : task.error
+        ? `<span style="color:var(--critical)">${esc(task.error)}</span>`
+        : task.state === "skipped"
+          ? `<span style="color:var(--critical)">Not called: ${esc(STATUS_LABELS[task.status] || task.status)}.</span>`
+          : `Queued — ${esc(task.status || "waiting for the dispatcher")}.`;
+  } catch (err) {
+    statusEl.innerHTML = `<span style="color:var(--critical)">${esc(err.message)}</span>`;
+  }
 }
 
 async function testCall() {
-  const btn = $("#btn-test-call");
-  btn.disabled = true;
-  $("#test-status").innerHTML = `<span class="spinner"></span> dialling…`;
-  try {
-    const r = await api("/test-call", {
-      method: "POST",
-      body: { phone: $("#test-phone").value, message: $("#test-message").value,
-              voice: "Polly.Joanna-Neural", mode: $("#test-mode").value },
-    });
-    const task = r.task || {};
-    $("#test-status").innerHTML = task.sid
-      ? `Call placed — your phone should ring. <span class="hint">SID ${esc(task.sid)}</span>`
-      : task.error
-        ? `<span style="color:var(--critical)">${esc(task.error)}</span>`
-        : `Queued — ${esc(task.status || "waiting for the dispatcher")}.`;
-    loadDashboard();
-  } catch (err) {
-    $("#test-status").innerHTML = `<span style="color:var(--critical)">${esc(err.message)}</span>`;
-  } finally { btn.disabled = false; }
+  await busy($("#btn-test-call"), async () => {
+    await runTestCall("/test-call", {
+      phone: $("#test-phone").value, message: $("#test-message").value,
+      voice: $("#test-voice").value || "Polly.Joanna-Neural", mode: $("#test-mode").value,
+    }, $("#test-status"));
+    loadDashboard().catch(() => {});
+  });
 }
 
 async function verifyTelnyx() {
@@ -898,14 +1356,25 @@ async function verifyTelnyx() {
   btn.disabled = true;
   $("#verify-status").innerHTML = `<span class="spinner"></span> checking…`;
   try {
-    const r = await api("/settings/verify", { method: "POST" });
+    // What is typed now, saved or not - that's what the person is looking at.
+    const v = settingsValues();
+    const r = await api("/settings/verify", { method: "POST", body: { values: {
+      telnyx_api_key: v.telnyx_api_key, telnyx_app_id: v.telnyx_app_id,
+      telnyx_from_number: v.telnyx_from_number, public_base_url: v.public_base_url } } });
     const fromNote = r.ok && r.from_detail
       ? `<div style="color:${r.from_ok ? "var(--ink-2)" : "var(--critical)"};margin-top:4px">
            ${r.from_ok ? "✓" : "✗"} ${esc(r.from_detail)}</div>`
       : "";
+    const limits = r.limits || {};
+    const limitNotes = [];
+    if (limits.channel_limit) limitNotes.push(`At most <b>${limits.channel_limit}</b> call${limits.channel_limit === 1 ? "" : "s"} at once on this account` + (limits.channel_limit < 4 ? " &mdash; raise the channel limit in Telnyx to call faster." : "."));
+    if (limits.daily_spend_limit) limitNotes.push(`Daily spend cap of <b>$${esc(limits.daily_spend_limit)}</b> &mdash; Telnyx refuses calls for the rest of the day once it's reached.`);
+    if (r.ok && "inbound_url" in limits) limitNotes.push(r.inbound_ready ? "Callback line: set up." : "Callback line: <b>not set up</b> &mdash; see Callback line below.");
     $("#verify-status").innerHTML = (r.ok
       ? `<span style="color:var(--good)">✓ ${esc(r.detail)}</span>`
-      : `<span style="color:var(--critical)">${esc(r.detail)}</span>`) + fromNote;
+      : `<span style="color:var(--critical)">${esc(r.detail)}</span>`) + fromNote
+      + limitNotes.map((n) => `<div style="margin-top:4px">${n}</div>`).join("")
+      + (r.unsaved && r.unsaved.length ? `<div style="margin-top:4px;color:var(--warning-ink)">Checked what's typed, which isn't saved yet &mdash; press Save settings to keep it.</div>` : "");
     const voiceNumbers = (r.numbers || []).filter((n) => n.voice);
     $("#from-options").innerHTML = voiceNumbers.length
       ? "Voice-capable numbers on this account: " +
@@ -919,30 +1388,45 @@ async function verifyTelnyx() {
 
 // --- boot -------------------------------------------------------------------
 
+const THEMES = ["", "dark", "light"];  // "" follows the system setting
+
 function applyTheme() {
-  const saved = localStorage.getItem("robocall-theme");
+  let saved = "";
+  try { saved = localStorage.getItem("robocall-theme") || ""; } catch { /* storage blocked */ }
   if (saved) document.documentElement.dataset.theme = saved;
+  else delete document.documentElement.dataset.theme;
+  $("#theme-label").textContent = `Theme: ${saved || "system"}`;
 }
 
-document.addEventListener("click", handleClick);
+document.addEventListener("click", (event) => {
+  handleClick(event).catch?.((err) => toast(err.message, true));
+});
 document.addEventListener("click", (e) => {
   const pick = e.target.closest("[data-pick]");
-  if (pick) { $("#s-from").value = pick.dataset.pick; toast("From number set - save to keep it."); }
+  if (pick) { $("#s-from").value = pick.dataset.pick; settingsDirty = true; toast("From number set - save to keep it."); }
 });
 
 $("#theme-toggle").addEventListener("click", () => {
-  const now = document.documentElement.dataset.theme;
-  const next = now === "dark" ? "light" : now === "light" ? "" : "dark";
-  if (next) { document.documentElement.dataset.theme = next; localStorage.setItem("robocall-theme", next); }
-  else { delete document.documentElement.dataset.theme; localStorage.removeItem("robocall-theme"); }
+  const now = document.documentElement.dataset.theme || "";
+  const next = THEMES[(THEMES.indexOf(now) + 1) % THEMES.length];
+  try { next ? localStorage.setItem("robocall-theme", next) : localStorage.removeItem("robocall-theme"); }
+  catch { /* storage blocked - the change still applies for this visit */ }
+  if (next) document.documentElement.dataset.theme = next;
+  else delete document.documentElement.dataset.theme;
+  $("#theme-label").textContent = `Theme: ${next || "system"}`;
 });
 
 $("#btn-test-call").addEventListener("click", testCall);
+$("#test-mode").addEventListener("change", refreshModeHint);
 $("#btn-verify").addEventListener("click", verifyTelnyx);
-$("#btn-save-settings").addEventListener("click", saveSettings);
+$("#btn-save-settings").addEventListener("click", () => busy($("#btn-save-settings"), () => saveSettings()));
 $("#btn-draft").addEventListener("click", draftScript);
 $("#btn-agent-setup").addEventListener("click", setupAgent);
+$("#btn-inbound-setup").addEventListener("click", setupInbound);
 $("#s-agent-llm").addEventListener("change", changeAgentLlm);
+$("#view-settings").addEventListener("input", (e) => {
+  if (e.target.id !== "s-agent-llm") settingsDirty = true;
+});
 $("#c-agent").addEventListener("change", refreshModeHint);
 $("#c-agent-info").addEventListener("input", () => {
   const n = $("#c-agent-info").value.length;
@@ -950,14 +1434,32 @@ $("#c-agent-info").addEventListener("input", () => {
     ? `${n.toLocaleString()} / 4,000 characters. Sent with every reply, so shorter is faster and cheaper.`
     : "The AI only states what's here or in the talking points. Anything else, it hands off to your callback number.";
 });
-$("#btn-refresh-calls").addEventListener("click", loadCalls);
+$("#btn-refresh-calls").addEventListener("click", () => busy($("#btn-refresh-calls"), loadCalls));
+$("#btn-calls-more").addEventListener("click", () => { callsLimit += 100; busy($("#btn-calls-more"), loadCalls); });
+let callsSearchTimer = null;
+for (const id of ["#calls-campaign", "#calls-outcome"]) {
+  $(id).addEventListener("change", () => { callsLimit = 100; loadCalls().catch((err) => toast(err.message, true)); });
+}
+$("#calls-q").addEventListener("input", () => {
+  clearTimeout(callsSearchTimer);
+  callsSearchTimer = setTimeout(() => { callsLimit = 100; loadCalls().catch((err) => toast(err.message, true)); }, 300);
+});
 $("#btn-refresh-docs").addEventListener("click", () => {
   loadDocs().catch((err) => toast(err.message, true));
 });
 $("#btn-close-doc").addEventListener("click", closeDoc);
 $("#campaign-form").addEventListener("submit", submitCampaign);
+$("#btn-cancel-campaign").addEventListener("click", () => {
+  const id = editingId;
+  editingId = null;
+  id ? show("campaign", id) : show("campaigns");
+});
 $("#c-message").addEventListener("input", schedulePreview);
+$("#c-business").addEventListener("input", schedulePreview);
+$("#c-callback").addEventListener("input", schedulePreview);
 $("#c-contacts").addEventListener("input", countContacts);
+$("#c-consent-have").addEventListener("change", refreshConsentWarning);
+$("#c-require-consent").addEventListener("change", refreshConsentWarning);
 $("#btn-import-csv").addEventListener("click", () => $("#c-contacts-file").click());
 $("#c-contacts-file").addEventListener("change", (e) => {
   importContactFiles(e.target.files);
@@ -985,39 +1487,51 @@ function refreshWindowWarning() {
     { hourly: "hour", daily: "day", weekly: "week" }[freq] || "run";
 }
 
-$("#c-frequency").addEventListener("change", (e) => {
-  $("#wrap-weekday").classList.toggle("hidden", e.target.value !== "weekly");
-  $("#wrap-time").classList.toggle("hidden", e.target.value === "hourly");
-  refreshWindowWarning();
-});
+$("#c-frequency").addEventListener("change", refreshScheduleFields);
 $("#c-ends-at").addEventListener("input", refreshWindowWarning);
 
-$("#btn-pause").addEventListener("click", async () => {
-  const paused = $("#btn-pause").textContent.startsWith("Pause");
-  await api("/settings", { method: "POST", body: { values: { dispatch_paused: paused ? "1" : "0" } } });
-  toast(paused ? "Calling paused." : "Calling resumed.");
-  loadDashboard();
+$("#btn-pause").addEventListener("click", () => {
+  const pausing = $("#btn-pause").dataset.paused !== "1";
+  if (pausing && !confirm("Pause all calling? Nothing is dialled until you resume. Runs that come due meanwhile go out on resume if only a little late, and are skipped if hours late.")) return;
+  busy($("#btn-pause"), async () => {
+    await api("/settings", { method: "POST", body: { values: { dispatch_paused: pausing ? "1" : "0" } } });
+    toast(pausing ? "Calling paused." : "Calling resumed.");
+    await loadDashboard();
+  });
 });
 
-$("#btn-add-dnc").addEventListener("click", async () => {
+$("#btn-add-dnc").addEventListener("click", () => busy($("#btn-add-dnc"), async () => {
   const r = await api("/suppression", { method: "POST", body: { raw: $("#dnc-input").value } });
-  $("#dnc-input").value = "";
-  toast(`Added ${r.added} number(s).`);
+  // Keep anything that couldn't be read in the box, so it can be fixed.
+  $("#dnc-input").value = r.invalid.join("\n");
+  $("#dnc-status").innerHTML = `Added ${plural(r.added, "number")}.`
+    + (r.invalid.length ? ` <span style="color:var(--critical)">${notNumbers(r.invalid.length)} - left in the box to fix.</span>` : "");
   loadDnc();
+}));
+
+window.addEventListener("beforeunload", (e) => {
+  if (currentView === "settings" && settingsDirty) { e.preventDefault(); e.returnValue = ""; }
 });
 
 applyTheme();
 bindTooltip();
 fillFormOptions();
-loadSettings().then(() => show(window.location.hash.slice(1) || "dashboard"));
+loadSettings()
+  .catch((err) => toast(err.message, true))
+  .then(() => { const { view, id } = parseHash(); show(view, id); });
 
 // show() writes the hash, so a view can be linked to and the back button works.
-// Guarding on currentView stops show()'s own write from bouncing back through here.
+// Guarding on the current view stops show()'s own write from bouncing back here.
 window.addEventListener("hashchange", () => {
-  const view = window.location.hash.slice(1) || "dashboard";
-  if (view !== currentView) show(view);
+  const { view, id } = parseHash();
+  if (view !== currentView || id !== currentRouteId) show(view, id);
 });
-pollTimer = setInterval(() => {
-  if (currentView === "dashboard") loadDashboard();
-  if (currentView === "calls") loadCalls();
+
+// Keep whatever is on screen current. Pages with a form being typed into are
+// left alone; the campaign page refreshes only its live parts.
+setInterval(() => {
+  if (document.hidden) return;
+  const refresh = { dashboard: loadDashboard, calls: loadCalls, campaigns: loadCampaigns,
+                    campaign: () => refreshCampaign(currentCampaignId) }[currentView];
+  if (refresh) Promise.resolve().then(refresh).catch(() => {});
 }, 5000);

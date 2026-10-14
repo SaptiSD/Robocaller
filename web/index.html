@@ -15,7 +15,7 @@
       <div class="brand-mark">&#9742;</div>
       <div>
         <div class="brand-name">RoboCall AI</div>
-        <div class="brand-sub">Phase 1 &middot; read-only calls</div>
+        <div class="brand-sub">Outbound calling</div>
       </div>
     </div>
 
@@ -27,7 +27,7 @@
     <div class="nav-spacer"></div>
     <button class="nav-item" data-view="docs"><span class="nav-icon">&#9636;</span> Documents <span class="nav-count" id="nav-docs"></span></button>
     <button class="nav-item" data-view="settings"><span class="nav-icon">&#9881;</span> Settings</button>
-    <button class="nav-item" id="theme-toggle"><span class="nav-icon">&#9681;</span> Theme</button>
+    <button class="nav-item" id="theme-toggle"><span class="nav-icon">&#9681;</span> <span id="theme-label">Theme: system</span></button>
   </nav>
 
   <main class="main">
@@ -37,7 +37,7 @@
       <div class="page-head">
         <div>
           <h1>Dashboard</h1>
-          <div class="sub">Outbound calls placed by this machine.</div>
+          <div class="sub">Outbound calls placed by this server.</div>
         </div>
         <div class="spacer"></div>
         <div class="btn-row">
@@ -76,6 +76,10 @@ Telnyx bills each call against your account balance.
               <option value="message">Recorded message &mdash; a voice reads the message</option>
               <option value="agent">AI conversation &mdash; the AI agent talks with you</option>
             </select>
+          </div>
+          <div class="field" id="wrap-test-voice">
+            <label for="test-voice">Voice</label>
+            <select id="test-voice"></select>
           </div>
           <div class="field">
             <label for="test-message">Message <span class="hint" style="display:inline">(blank uses a stock test script; for an AI call, what it should talk about)</span></label>
@@ -133,8 +137,8 @@ Telnyx bills each call against your account balance.
     <section id="view-new" class="view hidden">
       <div class="page-head">
         <div>
-          <h1>New campaign</h1>
-          <div class="sub">A furniture store announcing a Memorial Day sale, for example.</div>
+          <h1 id="form-title">New campaign</h1>
+          <div class="sub" id="form-sub">A furniture store announcing a Memorial Day sale, for example.</div>
         </div>
       </div>
 
@@ -186,6 +190,19 @@ Telnyx bills each call against your account balance.
           </div>
 
           <div class="field-row">
+            <div class="field">
+              <label for="c-business">Calling on behalf of <span class="hint" style="display:inline">&mdash; optional</span></label>
+              <input type="text" id="c-business" maxlength="120">
+              <div class="hint" id="c-business-hint">Who the call says it's from. Blank uses the business name in Settings.</div>
+            </div>
+            <div class="field">
+              <label for="c-callback">Callback number <span class="hint" style="display:inline">&mdash; optional</span></label>
+              <input type="text" id="c-callback">
+              <div class="hint" id="c-callback-hint">The number people are told to call to opt out or reply. Blank uses Settings.</div>
+            </div>
+          </div>
+
+          <div class="field-row">
             <div class="field" id="wrap-voice">
               <label for="c-voice">Voice</label>
               <select id="c-voice"></select>
@@ -201,7 +218,7 @@ Telnyx bills each call against your account balance.
           </div>
         </div>
 
-        <div class="card">
+        <div class="card" id="card-contacts">
           <div class="card-head"><h2>2 &middot; Who to call</h2></div>
           <div class="field">
             <label for="c-contacts">Phone numbers <span class="hint" style="display:inline">&mdash; one per line, optionally <code>number, name</code></span></label>
@@ -226,6 +243,9 @@ Telnyx bills each call against your account balance.
                 </span>
               </span>
             </label>
+            <div class="banner warn hidden" id="consent-warning" style="margin:10px 0 0">
+              <span>&#9888;</span><span id="consent-warning-text"></span>
+            </div>
           </div>
           <div class="field" style="margin-bottom:0">
             <label class="check">
@@ -271,12 +291,12 @@ Telnyx bills each call against your account balance.
             <div class="field">
               <label for="c-starts-at">Begins</label>
               <input type="datetime-local" id="c-starts-at">
-              <span class="hint" style="display:block">Optional. Nothing is dialled before this. Blank = as soon as the first slot comes round.</span>
+              <span class="hint" style="display:block">Optional, in the schedule timezone. Nothing is dialled before this. Blank = as soon as the first slot comes round.</span>
             </div>
             <div class="field">
               <label for="c-ends-at">Ends</label>
               <input type="datetime-local" id="c-ends-at">
-              <span class="hint" style="display:block">Optional but recommended. Blank = repeats until you pause it.</span>
+              <span class="hint" style="display:block">Optional but recommended, in the schedule timezone. Blank = repeats until you pause it.</span>
             </div>
           </div>
           <div class="banner warn hidden" id="window-warning">
@@ -285,7 +305,7 @@ Telnyx bills each call against your account balance.
               &mdash; and keep billing &mdash; every
               <span id="window-warning-freq">day</span> until you pause it.</span>
           </div>
-          <div class="field" style="margin-bottom:0">
+          <div class="field" style="margin-bottom:0" id="wrap-start-now">
             <label class="check">
               <input type="checkbox" id="c-start-now">
               <span>Start calling as soon as I save
@@ -295,8 +315,8 @@ Telnyx bills each call against your account balance.
         </div>
 
         <div class="btn-row" style="margin-top:16px">
-          <button type="submit" class="primary">Create campaign</button>
-          <button type="button" data-view-jump="campaigns">Cancel</button>
+          <button type="submit" class="primary" id="btn-submit-campaign">Create campaign</button>
+          <button type="button" id="btn-cancel-campaign">Cancel</button>
           <span id="form-status" class="hint"></span>
         </div>
       </form>
@@ -310,9 +330,30 @@ Telnyx bills each call against your account balance.
           <div class="sub">Every attempt, with the Telnyx call SID and outcome.</div>
         </div>
         <div class="spacer"></div>
-        <button id="btn-refresh-calls">Refresh</button>
+        <div class="btn-row">
+          <a class="button" id="calls-export" href="/api/calls.csv">Export CSV</a>
+          <button id="btn-refresh-calls">Refresh</button>
+        </div>
       </div>
-      <div class="card"><div class="table-wrap" id="calls-table"></div></div>
+      <div class="filters">
+        <select id="calls-campaign" aria-label="Campaign"><option value="">All campaigns</option></select>
+        <select id="calls-outcome" aria-label="Outcome">
+          <option value="">Every outcome</option>
+          <option value="delivered">Delivered</option>
+          <option value="unanswered">No answer / busy</option>
+          <option value="failed">Failed</option>
+          <option value="opted-out">Opted out</option>
+          <option value="waiting">Waiting or on the line</option>
+          <option value="skipped">Screened out</option>
+          <option value="test">Test calls</option>
+        </select>
+        <input type="search" id="calls-q" placeholder="Search a number" aria-label="Search a number">
+      </div>
+      <div class="card"><div class="table-wrap" id="calls-table"></div>
+        <div class="btn-row hidden" id="calls-more-row" style="margin-top:12px;justify-content:center">
+          <button id="btn-calls-more">Show more</button>
+        </div>
+      </div>
     </section>
 
     <!-- ================= DO NOT CALL ================= -->
@@ -334,7 +375,10 @@ Telnyx bills each call against your account balance.
           <label for="dnc-input">Add numbers</label>
           <textarea id="dnc-input" class="mono" rows="3" placeholder="One per line"></textarea>
         </div>
-        <button class="primary" id="btn-add-dnc">Add to list</button>
+        <div class="btn-row">
+          <button class="primary" id="btn-add-dnc">Add to list</button>
+          <span class="hint" id="dnc-status"></span>
+        </div>
       </div>
       <div class="card"><div class="table-wrap" id="dnc-table"></div></div>
     </section>
@@ -369,7 +413,7 @@ Telnyx bills each call against your account balance.
       <div class="page-head">
         <div>
           <h1>Settings</h1>
-          <div class="sub">Stored locally in SQLite. Nothing is sent anywhere but Telnyx and Anthropic.</div>
+          <div class="sub" id="settings-sub">Saved in this app's database. Each API key is only ever sent to the service it belongs to.</div>
         </div>
       </div>
 
@@ -447,6 +491,8 @@ Telnyx bills each call against your account balance.
           <div class="field">
             <label for="s-ring">Ring for (seconds)</label>
             <input type="number" id="s-ring" min="10" max="60">
+            <div class="hint">Voicemail usually answers after 25&ndash;35 seconds. Under that, an unanswered
+              call ends as "No answer" before a message can be left &mdash; 50 is a good setting.</div>
           </div>
         </div>
       </div>
@@ -488,6 +534,18 @@ Telnyx bills each call against your account balance.
         <div class="btn-row" style="margin-top:12px">
           <button id="btn-agent-setup">Set up in Telnyx</button>
           <span id="agent-setup-status" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Callback line</h2></div>
+        <div class="hint" style="margin-bottom:12px">What people hear when they call your caller-ID number back &mdash;
+          which every message without a callback number tells them to do. Once set up, they can press 9 to
+          be removed from the list or leave a message; both show up under Activity.</div>
+        <div id="inbound-status" class="hint">Checking&hellip;</div>
+        <div class="btn-row" style="margin-top:12px">
+          <button id="btn-inbound-setup" disabled>Set up callback line</button>
+          <span id="inbound-setup-status" class="hint"></span>
         </div>
       </div>
 

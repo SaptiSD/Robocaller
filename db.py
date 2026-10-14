@@ -31,8 +31,25 @@ from typing import Any, Iterable
 
 # Read once at import. Flipping backends mid-process would leave the open
 # connection and the schema pointing at different databases.
+#
+# Only the real environment counts - never the .env file. On Render the variable
+# is set in the dashboard and this picks it up. On a laptop, .env often carries
+# the production URL too (for scripts that want it), and honouring it would make
+# every local run - a second dispatcher included - work on live campaigns and the
+# live do-not-call list. To use Postgres locally, set it in the shell instead.
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 IS_PG = bool(DATABASE_URL)
+
+
+def dotenv_database_ignored() -> bool:
+    """True when .env names a DATABASE_URL that this process is deliberately not using."""
+    if IS_PG:
+        return False
+    try:
+        from dotenv import dotenv_values
+    except ImportError:  # pragma: no cover - python-dotenv is a requirement
+        return False
+    return bool((dotenv_values(Path(__file__).parent / ".env").get("DATABASE_URL") or "").strip())
 
 # Optional Postgres schema to put the app's tables in. Blank means `public`.
 #
@@ -80,6 +97,11 @@ CREATE TABLE IF NOT EXISTS campaigns (
     mode         TEXT NOT NULL DEFAULT 'message',
     -- Extra facts the AI agent may draw on to answer questions (agent mode).
     agent_info   TEXT NOT NULL DEFAULT '',
+    -- Who the call says it is from, and the number it gives for opting out.
+    -- Blank uses the Settings page's values; set when a campaign calls on
+    -- behalf of someone other than the usual business.
+    business_name   TEXT NOT NULL DEFAULT '',
+    callback_number TEXT NOT NULL DEFAULT '',
     frequency    TEXT NOT NULL DEFAULT 'once',
     call_time    TEXT NOT NULL DEFAULT '10:00',
     weekday      INTEGER NOT NULL DEFAULT 0,
@@ -618,8 +640,15 @@ def suppress(phone: str, reason: str = "manual") -> None:
     )
 
 
-def unsuppress(phone: str) -> None:
+def unsuppress(phone: str) -> dict | None:
+    """Remove a number from the list. Returns the row that was removed, if any."""
+    row = query_one("SELECT * FROM suppression WHERE phone = ?", (phone,))
     execute("DELETE FROM suppression WHERE phone = ?", (phone,))
+    return row
+
+
+def suppression_row(phone: str) -> dict | None:
+    return query_one("SELECT * FROM suppression WHERE phone = ?", (phone,))
 
 
 def is_suppressed(phone: str) -> bool:

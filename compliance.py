@@ -31,13 +31,24 @@ def normalize(raw: str) -> str:
     digits = _DIGITS.sub("", raw)
     if not digits:
         return ""
-    if has_plus:
+    if has_plus and not digits.startswith("1"):
         return "+" + digits if 8 <= len(digits) <= 15 else ""
-    if len(digits) == 10:  # bare NANP
-        return "+1" + digits
-    if len(digits) == 11 and digits.startswith("1"):
+    if len(digits) == 10 and not has_plus:  # bare NANP
+        digits = "1" + digits
+    if len(digits) == 11 and digits.startswith("1") and _nanp_shaped(digits[1:]):
         return "+" + digits
     return ""
+
+
+def _nanp_shaped(ten: str) -> bool:
+    """Could this be a real North American number?
+
+    Area codes and exchanges never start with 0 or 1, and N11 codes (411, 911)
+    are service numbers, not area codes. The cheap check catches placeholders
+    like 123-456-7890 before Telnyx bills an attempt to reject them.
+    """
+    area, exchange = ten[:3], ten[3:6]
+    return area[0] in "23456789" and exchange[0] in "23456789" and area[1:] != "11"
 
 
 def area_code(e164: str) -> str:
@@ -158,8 +169,36 @@ NON_GEOGRAPHIC = {"800", "833", "844", "855", "866", "877", "888", "900"}
 # window in every mainland US zone before dialing.
 _FALLBACK_ZONES = ("America/New_York", "America/Los_Angeles")
 
+# Outside North America the country code is the only location signal, and it is
+# only good enough where the whole country keeps one clock. Countries spanning
+# several zones (Australia, Brazil, Mexico, Russia) are deliberately absent: a
+# number there has no knowable local time, so it is not dialled at all rather
+# than being called at 1am because the US fallback said it was midday.
+COUNTRY_TZ: dict[str, str] = {
+    "44": "Europe/London", "353": "Europe/Dublin", "33": "Europe/Paris",
+    "49": "Europe/Berlin", "34": "Europe/Madrid", "39": "Europe/Rome",
+    "31": "Europe/Amsterdam", "32": "Europe/Brussels", "41": "Europe/Zurich",
+    "43": "Europe/Vienna", "45": "Europe/Copenhagen", "46": "Europe/Stockholm",
+    "47": "Europe/Oslo", "48": "Europe/Warsaw", "351": "Europe/Lisbon",
+    "30": "Europe/Athens", "972": "Asia/Jerusalem", "971": "Asia/Dubai",
+    "91": "Asia/Kolkata", "65": "Asia/Singapore", "852": "Asia/Hong_Kong",
+    "81": "Asia/Tokyo", "82": "Asia/Seoul", "86": "Asia/Shanghai",
+    "63": "Asia/Manila", "64": "Pacific/Auckland", "27": "Africa/Johannesburg",
+    "234": "Africa/Lagos", "254": "Africa/Nairobi",
+}
+
+
+def is_nanp(e164: str) -> bool:
+    return e164.startswith("+1") and len(e164) == 12
+
 
 def timezone_for(e164: str) -> str | None:
+    if e164.startswith("+") and not e164.startswith("+1"):
+        for size in (3, 2, 1):
+            zone = COUNTRY_TZ.get(e164[1:1 + size])
+            if zone:
+                return zone
+        return None
     code = area_code(e164)
     if not code or code in NON_GEOGRAPHIC:
         return None
@@ -185,12 +224,16 @@ def window_check(
     """Is `when_utc` inside the recipient's local calling window?
 
     Returns (allowed, next_open_utc, zone_label). When not allowed,
-    `next_open_utc` is the next moment the window opens for this recipient.
+    `next_open_utc` is the next moment the window opens for this recipient -
+    or None when there is no knowable local time at all (an international
+    number from a country with several time zones), which means never.
     """
     start_t = _parse_hhmm(start, time(9, 0))
     end_t = _parse_hhmm(end, time(20, 0))
 
     zone = timezone_for(e164)
+    if not zone and not is_nanp(e164):
+        return False, None, "unknown (outside North America)"
     zones = [zone] if zone else list(_FALLBACK_ZONES)
     label = zone or "unknown (conservative)"
 
@@ -218,12 +261,37 @@ def window_check(
 MAX_MESSAGE_CHARS = 3000  # Keeps the inline TeXML document comfortably small.
 
 
+# Sign-offs that should stay the last thing said. The opt-out line goes in front
+# of them, so a call doesn't say "Goodbye." and then keep talking.
+_CLOSING = re.compile(
+    r"^(good\s?-?bye|bye( now| for now)?|thank you( for your time| so much)?|thanks( again| so much)?"
+    r"|have a (great|good|nice|wonderful|lovely) (day|evening|night|weekend|one)|take care)"
+    r"[\s,.!]*$",
+    re.I,
+)
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def opt_out_line(callback_number: str = "", press_nine: bool = False) -> str:
+    """The one sentence telling a recipient how to get off the list.
+
+    Webhook mode can take a keypress as well, and that goes in the same sentence
+    rather than a second "To be removed..." straight after the first.
+    """
+    call = (f"call {spell_number(callback_number)}" if callback_number
+            else "call us back at the number shown on your caller ID")
+    if press_nine:
+        return f"To be removed from this calling list, press 9 now, or {call}."
+    return f"To be removed from this calling list, please {call}."
+
+
 def build_script(
     message: str,
     business_name: str = "",
     callback_number: str = "",
     add_identification: bool = True,
     add_opt_out: bool = True,
+    press_nine: bool = False,
 ) -> str:
     """Wrap the campaign message in the language the FCC requires.
 
@@ -239,32 +307,39 @@ def build_script(
         if business_name.lower() not in lower:
             parts.append(f"Hello. This is an automated message from {business_name}.")
 
-    parts.append(body)
-
+    closing: list[str] = []
     if add_opt_out:
-        if callback_number:
-            parts.append(
-                "To be removed from this calling list, please call "
-                f"{spell_number(callback_number)}."
-            )
-        else:
-            parts.append(
-                "To be removed from this calling list, please contact us at the "
-                "number shown on your caller ID."
-            )
+        sentences = [s for s in _SENTENCE_END.split(body) if s.strip()]
+        while len(sentences) > 1 and _CLOSING.match(sentences[-1].strip()):
+            closing.insert(0, sentences.pop())
+        body = " ".join(sentences)
+
+    parts.append(body)
+    if add_opt_out:
+        parts.append(opt_out_line(callback_number, press_nine))
+    parts.extend(closing)
 
     return " ".join(p for p in parts if p).strip()
 
 
 def spell_number(raw: str) -> str:
-    """Render a phone number so text-to-speech reads it as digits, not a quantity."""
+    """Render a phone number so text-to-speech reads it as digits, not a quantity.
+
+    Grouped the way people say them - 3, 3, 4 - so 601-526-1129 is read as
+    "6 0 1, 5 2 6, 1 1 2 9" and not with a lone "9" hanging off the end.
+    """
     e164 = normalize(raw) or raw
     digits = _DIGITS.sub("", e164)
     if e164.startswith("+1") and len(digits) == 11:
         digits = digits[1:]
     if not digits:
         return raw
-    grouped = [digits[i:i + 3] for i in range(0, len(digits), 3)]
+    if len(digits) == 10:
+        grouped = [digits[:3], digits[3:6], digits[6:]]
+    else:
+        grouped = [digits[i:i + 3] for i in range(0, len(digits), 3)]
+        if len(grouped) > 1 and len(grouped[-1]) == 1:
+            grouped[-2:] = [grouped[-2] + grouped[-1]]
     return ", ".join(" ".join(g) for g in grouped)
 
 

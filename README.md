@@ -25,7 +25,7 @@ is Phase 3, and it is a different architecture (see *Roadmap*).
 | **Voice** | **AWS Polly** neural voices through Telnyx, with Telnyx's own engines as the cheaper option | Polly does not sound like a 2005 IVR. |
 | **Script writer** | **Claude** (`anthropic`), optional | Drafts a compliant script from a one-line brief. Everything else works without it. |
 | **Reports** | **ReportLab** | The PDFs in `docs/` are generated from code, so they can be rebuilt. |
-| **Tests** | Two plain Python scripts, no framework | 283 checks against a fake Telnyx. No credentials, no real calls, no cost. |
+| **Tests** | Two plain Python scripts, no framework | 456 checks against a fake Telnyx. No credentials, no real calls, no cost. |
 
 Dependencies are deliberately few: FastAPI, uvicorn, httpx, pydantic and
 python-dotenv, plus `anthropic` and `reportlab` for the two optional pieces.
@@ -46,11 +46,14 @@ Verify the whole engine without touching Telnyx:
 python smoke_test.py && python pressure_test.py
 ```
 
-**283 checks against a fake Telnyx.** No credentials, no real calls, no cost.
+**456 checks against a fake Telnyx.** No credentials, no real calls, no cost.
 
-`smoke_test.py` (75) walks the happy path: phone parsing, timezone resolution,
+`smoke_test.py` (248) walks the happy path: phone parsing, timezone resolution,
 calling windows, schedule arithmetic across a DST change, consent and
-do-not-call screening, pacing, and the HTTP API.
+do-not-call screening, pacing, and the HTTP API - plus the operator's controls:
+that Pause holds calls already queued, that removing a contact or withdrawing
+consent cancels their call, that missed runs are skipped rather than sent hours
+late, that an opt-out stays in the call log, and the callback line.
 
 `pressure_test.py` (208) tries to break it: eight threads racing the same queue,
 the exact parameter names sent to Telnyx's TeXML endpoint, every failure that
@@ -308,11 +311,30 @@ Two things must be settled before this is on a public URL:
 2. **SQLite on an ephemeral filesystem is lost on every redeploy.** Free tiers on
    Render and Fly.io reset the disk when the container restarts. Either attach a
    persistent volume and point `ROBOCALL_DB` at it, or move to Postgres.
+3. **A free Render instance sleeps after 15 minutes without a request**, and the
+   dispatcher sleeps with it: nothing scheduled goes out until someone opens the
+   site, which then takes about 30 seconds to wake. A run found up to 3 hours late
+   (30 minutes for hourly) still goes out and is flagged in Activity; one later
+   than that is skipped and flagged, rather than calling people at 6pm about an
+   11am message. The real fix is a paid instance (Render Starter, about $7 a
+   month). The free stopgap is `.github/workflows/keepalive.yml`, which pings
+   `/healthz` every 10 minutes once you add a repository variable named
+   `KEEPALIVE_URL` (Settings > Secrets and variables > Actions > Variables) set to
+   the site's address. GitHub's schedule can lag at busy times, so it narrows the
+   gaps rather than closing them.
 
 The upside of deploying is real, though: a public HTTPS URL is exactly what
 **webhook mode** needs. Set `PUBLIC_BASE_URL` to the deployed origin and the
 system gains press-9-to-opt-out, hanging up on voicemail, and live status
 callbacks — the three things direct mode cannot do.
+
+It also makes the **callback line** possible. A message without a callback
+number tells people to call the number on their caller ID, and plenty redial a
+missed call anyway. Settings > Callback line points the TeXML application's
+inbound calls at this server, so callers hear who they reached, can press 9 to
+be added to the do-not-call list, or can leave a message (logged, with Telnyx's
+transcript, under Activity). It needs the Telnyx public key, because these calls
+carry no per-call token and the signature is the only proof they came from Telnyx.
 
 ---
 
@@ -328,7 +350,7 @@ callbacks — the three things direct mode cannot do.
 | `db.py` | SQLite persistence |
 | `config.py` | Settings resolution (database over environment) |
 | `web/` | The dashboard — plain HTML/CSS/JS, no build step |
-| `smoke_test.py` | 75 happy-path checks against a fake Telnyx |
+| `smoke_test.py` | 248 happy-path checks against a fake Telnyx |
 | `pressure_test.py` | 208 adversarial checks - concurrency, Telnyx errors, forged webhooks |
 | `docs/` | Generated PDF reports and the code that builds them, plus `frequency_check.py` and `capture_screens.py` |
 | `_legacy_streamlit/` | The previous Streamlit prototype, kept for reference |

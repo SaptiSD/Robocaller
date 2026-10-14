@@ -44,7 +44,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "window_start": ("CALLING_WINDOW_START", "09:00"),
     "window_end": ("CALLING_WINDOW_END", "20:00"),
     "calls_per_minute": ("CALLS_PER_MINUTE", "12"),
-    "ring_seconds": ("RING_SECONDS", "30"),
+    # Long enough for the recipient's voicemail to pick up (usually 25-35s);
+    # at 30 an unanswered call often ended as "no-answer" with no message left.
+    "ring_seconds": ("RING_SECONDS", "50"),
     "dispatch_paused": ("", "0"),
 }
 
@@ -91,13 +93,23 @@ def set_many(values: dict[str, str]) -> None:
 def public_view() -> dict[str, object]:
     """Settings shaped for the dashboard - secrets reduced to a set/unset flag."""
     out: dict[str, object] = {}
+    saved = db.all_settings()
+    # Clearing a field on the Settings page falls back to the environment, and a
+    # value that reappears after being cleared looks like a broken Save unless
+    # the page can say where it comes from.
+    sources: dict[str, str] = {}
     for key in DEFAULTS:
         value = get(key)
+        env_var = DEFAULTS[key][0]
+        if not saved.get(key) and env_var and os.getenv(env_var, ""):
+            sources[key] = env_var
         if key in SECRET_KEYS:
             out[key] = ""
             out[f"{key}_set"] = bool(value)
         else:
             out[key] = value
+    # key -> environment variable name, for the settings currently coming from one.
+    out["from_environment"] = sources
     out["telnyx_ready"] = bool(
         get("telnyx_api_key") and get("telnyx_app_id") and get("telnyx_from_number")
     )

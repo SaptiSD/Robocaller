@@ -94,6 +94,12 @@ _HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
         "must be a voice-capable number you own on Telnyx, assigned to the same "
         "TeXML application.",
     ),
+    (
+        ("spend limit", "spending limit", "daily_spend", "daily spend"),
+        "The daily spend limit on the Telnyx outbound voice profile has been "
+        "reached, so Telnyx is refusing calls until tomorrow. Raise or turn it off "
+        "under Voice -> Outbound Voice Profiles in the Telnyx portal.",
+    ),
 )
 
 
@@ -443,6 +449,58 @@ class Telephony:
             "Twilio, Telnyx has no 'verified caller ID' route - buy the number "
             "under Numbers -> Search & Buy, or change the 'call from' number."
         )
+
+    def account_limits(self) -> dict:
+        """The account settings that quietly cap what a campaign can do.
+
+        Each is a common surprise: a 2-call channel limit makes "12 calls a
+        minute" mean about 2, a daily spend cap stops a campaign mid-list, and
+        an inbound URL left at a placeholder means nobody who calls back - to
+        opt out, or just to ask who called - reaches anything. Best effort: a
+        failure here leaves the field out rather than failing the check.
+        """
+        out: dict = {}
+        app, error = self._call_api("GET", f"/texml_applications/{self.application_id}")
+        if error:
+            return out
+        data = app.get("data") or {}
+        out["inbound_url"] = data.get("voice_url") or ""
+        outbound = data.get("outbound") or {}
+        if outbound.get("channel_limit"):
+            out["channel_limit"] = outbound["channel_limit"]
+        profile_id = outbound.get("outbound_voice_profile_id")
+        if profile_id:
+            profile, error = self._call_api("GET", f"/outbound_voice_profiles/{profile_id}")
+            p = profile.get("data") or {}
+            if not error and p:
+                if p.get("concurrent_call_limit"):
+                    limit = p["concurrent_call_limit"]
+                    out["channel_limit"] = min(limit, out.get("channel_limit") or limit)
+                if p.get("daily_spend_limit_enabled"):
+                    out["daily_spend_limit"] = str(p.get("daily_spend_limit") or "")
+        return out
+
+    def set_inbound_url(self, url: str) -> str:
+        """Point the TeXML application's inbound calls at `url`. Returns an error or "".
+
+        Telnyx requires the name alongside the URL on every update, and the
+        outbound settings are sent back exactly as read so that changing where
+        inbound calls go can never disturb the profile outbound calls depend on.
+        """
+        app, error = self._call_api("GET", f"/texml_applications/{self.application_id}")
+        if error:
+            return error
+        data = app.get("data") or {}
+        body: dict = {
+            "friendly_name": data.get("friendly_name") or "RoboCall AI",
+            "voice_url": url,
+            "voice_method": "post",
+        }
+        outbound = {k: v for k, v in (data.get("outbound") or {}).items() if v is not None}
+        if outbound:
+            body["outbound"] = outbound
+        _, error = self._call_api("PATCH", f"/texml_applications/{self.application_id}", json=body)
+        return error
 
     def owned_numbers(self) -> tuple[list[dict], str]:
         payload, error = self._call_api(

@@ -38,6 +38,20 @@ DEFER_GRACE = timedelta(minutes=1)
 # Telnyx caps how many calls an account can have up at once ("channel limit").
 # Hitting it is a full line, not a failed call: wait and try again.
 LINE_RETRY = timedelta(seconds=30)
+# A test call is someone holding their phone right now. One that couldn't go out
+# straight away (a crash between queueing and dialling) is dropped rather than
+# ringing them, unannounced, minutes or hours later.
+TEST_CALL_TTL = timedelta(minutes=5)
+# AI calls wait this long, and retry, while the AI agent isn't ready.
+AGENT_RETRY = timedelta(minutes=5)
+# How late a recurring run may still go out. Past this it is skipped and the next
+# slot is waited for: a daily 11:00 call landing at 6pm is a surprise, and it
+# would also land within hours of the next day's run. A one-off always goes out,
+# however late - there is no next slot to wait for.
+MISSED_RUN_GRACE = {"hourly": timedelta(minutes=30), "daily": timedelta(hours=3),
+                    "weekly": timedelta(hours=3)}
+# Statuses set on purpose mid-call that a later "completed" must not erase.
+STICKY_STATUSES = ("opted-out", "machine-skipped")
 
 # Schedule timezones offered in the UI. Kept here so the server can reject
 # anything else rather than silently falling back to Eastern.
@@ -253,20 +267,27 @@ def describe_skips(reasons: dict[str, int]) -> str:
     return ", ".join(f"{n} {SKIP_LABELS.get(r, r)}" for r, n in reasons.items())
 
 
-def enqueue_single(phone: str, script: str = "", voice: str = "", mode: str = "message") -> int:
-    """Queue a one-off call (the dashboard's test button).
+def enqueue_single(phone: str, script: str = "", voice: str = "", mode: str = "message",
+                   campaign_id: int | None = None) -> int:
+    """Queue a one-off test call (the dashboard's test button).
 
-    It has no campaign, so the script, voice and call type ride on the task row.
+    Without a campaign, the script, voice and call type ride on the task row.
+    With one, it is that campaign's "call me with this" test: the campaign
+    supplies everything, and run_key 'test' keeps it out of the campaign's stats.
     """
     now = db.to_utc(db.utcnow())
     return db.insert(
         "INSERT INTO call_tasks (campaign_id, contact_id, phone, run_key, token, "
         "script_override, voice_override, mode_override, state, status, scheduled_for, "
         "created_at, updated_at) "
-        "VALUES (NULL, NULL, ?, 'manual', ?, ?, ?, ?, 'pending', '', ?, ?, ?)",
-        (phone, secrets.token_urlsafe(16), script, voice,
-         mode if mode in db.CALL_MODES else "message", now, now, now),
+        "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'pending', '', ?, ?, ?)",
+        (campaign_id, phone, "test" if campaign_id else "manual", secrets.token_urlsafe(16),
+         script, voice, mode if mode in db.CALL_MODES else "message", now, now, now),
     )
+
+
+def is_test(task: dict) -> bool:
+    return task.get("campaign_id") is None or task.get("run_key") in ("manual", "test")
 
 
 # --- the three phases -------------------------------------------------------
@@ -284,6 +305,19 @@ def materialize_due_campaigns(now: datetime | None = None) -> int:
         "WHERE state = 'active' AND ends_at IS NOT NULL AND ends_at <= ?",
         (stamp,),
     )
+    # A one-off with nothing scheduled has nothing left to do. Without this it
+    # shows as "active" forever - which is how a resumed, already-sent one-off
+    # used to look.
+    db.execute(
+        "UPDATE campaigns SET state = 'finished' "
+        "WHERE state = 'active' AND frequency = 'once' AND next_run_at IS NULL"
+    )
+
+    # Paused means paused: no new runs are queued either, so resuming doesn't
+    # release a pile of calls that came due in the meantime. Missed recurring
+    # slots are skipped below on the first tick after resuming.
+    if config.get("dispatch_paused") == "1":
+        return 0
 
     due = db.query(
         "SELECT * FROM campaigns WHERE state = 'active' "
@@ -293,20 +327,59 @@ def materialize_due_campaigns(now: datetime | None = None) -> int:
         "AND (starts_at IS NULL OR starts_at <= ?)",
         (stamp, stamp),
     )
+    fired = 0
     for campaign in due:
-        enqueue_campaign(campaign["id"], now)
+        due_at = db.from_utc(campaign["next_run_at"]) or now
+        late = now - due_at
+        frequency = (campaign.get("frequency") or "once").lower()
+        missed = late > MISSED_RUN_GRACE.get(frequency, timedelta.max)
         next_run = compute_next_run(campaign, now)
-        db.execute(
-            "UPDATE campaigns SET last_run_at = ?, next_run_at = ?, runs = runs + 1, "
-            "state = ? WHERE id = ?",
-            (
-                db.to_utc(now),
-                db.to_utc(next_run) if next_run else None,
-                "active" if next_run else "finished",
-                campaign["id"],
-            ),
-        )
-    return len(due)
+        # Roll the schedule forward BEFORE queueing, and only if no one else has
+        # (the WHERE pins the slot we read). Two servers on one database - a
+        # deploy overlapping the old instance, or a laptop pointed at production
+        # - would otherwise both queue the same run and call everyone twice.
+        if missed:
+            claimed = db.execute(
+                "UPDATE campaigns SET next_run_at = ?, state = ? "
+                "WHERE id = ? AND state = 'active' AND next_run_at = ?",
+                (db.to_utc(next_run) if next_run else None,
+                 "active" if next_run else "finished", campaign["id"], campaign["next_run_at"]),
+            )
+        else:
+            claimed = db.execute(
+                "UPDATE campaigns SET last_run_at = ?, next_run_at = ?, runs = runs + 1, "
+                "state = ? WHERE id = ? AND state = 'active' AND next_run_at = ?",
+                (db.to_utc(now), db.to_utc(next_run) if next_run else None,
+                 "active" if next_run else "finished", campaign["id"], campaign["next_run_at"]),
+            )
+        if claimed != 1:
+            continue
+        slot = _local_slot(due_at, campaign.get("timezone"))
+        if missed:
+            db.log_event(
+                f"Campaign '{campaign['name']}' missed its {slot} run - nothing was running "
+                f"at that time (the server was asleep, or calling was paused). It was skipped "
+                f"rather than sent {_ago(late)} late; use Run now to send it anyway.", "error")
+            continue
+        enqueue_campaign(campaign["id"], now)
+        fired += 1
+        if late > timedelta(minutes=10):
+            db.log_event(f"Campaign '{campaign['name']}' ran {_ago(late)} late - its {slot} run "
+                         "found the server asleep or calling paused.", "warn")
+    return fired
+
+
+def _local_slot(moment: datetime, tz_name: str | None) -> str:
+    local = moment.astimezone(_zone(tz_name))
+    return local.strftime("%a %b %d, %I:%M %p %Z").replace(" 0", " ")
+
+
+def _ago(delta: timedelta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 120:
+        return f"{minutes} min"
+    hours = minutes / 60
+    return f"{hours:.0f} hours" if hours < 48 else f"{hours / 24:.0f} days"
 
 
 def claim(task_id: int, now: datetime) -> bool:
@@ -350,22 +423,23 @@ def dispatch_pending(
         per_minute = max(1, config.get_int("calls_per_minute", 12))
         budget = max(1, math.ceil(per_minute * TICK_SECONDS / 60))
 
+    select = (
+        "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.agent_info, c.state AS campaign_state, "
+        "c.business_name AS campaign_business, c.callback_number AS campaign_callback, "
+        "c.require_consent, ct.consent AS contact_consent, "
+        "c.name AS campaign_name, ct.name AS contact_name, ct.id AS contact_row FROM call_tasks t "
+        "LEFT JOIN campaigns c ON c.id = t.campaign_id "
+        "LEFT JOIN contacts ct ON ct.id = t.contact_id "
+    )
     if only_task_id is not None:
-        tasks = db.query(
-            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.agent_info, "
-            "c.name AS campaign_name, ct.name AS contact_name FROM call_tasks t "
-            "LEFT JOIN campaigns c ON c.id = t.campaign_id "
-            "LEFT JOIN contacts ct ON ct.id = t.contact_id "
-            "WHERE t.id = ? AND t.state IN ('pending', 'deferred')",
-            (only_task_id,),
-        )
+        tasks = db.query(select + "WHERE t.id = ? AND t.state IN ('pending', 'deferred')",
+                         (only_task_id,))
     else:
         tasks = db.query(
-            "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.agent_info, "
-            "c.name AS campaign_name, ct.name AS contact_name FROM call_tasks t "
-            "LEFT JOIN campaigns c ON c.id = t.campaign_id "
-            "LEFT JOIN contacts ct ON ct.id = t.contact_id "
-            "WHERE t.state IN ('pending', 'deferred') AND t.scheduled_for <= ? "
+            select + "WHERE t.state IN ('pending', 'deferred') AND t.scheduled_for <= ? "
+            # A paused campaign's queued calls wait with it - Pause has to mean
+            # nobody else gets called, including people already in the queue.
+            "AND (c.state IS NULL OR c.state <> 'paused' OR t.run_key = 'test') "
             "ORDER BY t.scheduled_for, t.id LIMIT ?",
             (db.to_utc(now), budget),
         )
@@ -373,20 +447,53 @@ def dispatch_pending(
     window_start = config.get("window_start")
     window_end = config.get("window_end")
     ring_seconds = config.get_int("ring_seconds", 30)
-    business = config.get("business_name")
-    callback = config.get("callback_number")
+    default_business = config.get("business_name")
+    default_callback = config.get("callback_number")
+    agent_ready: bool | None = None  # looked up once, and only if an AI call is in the batch
     placed = 0
 
     for task in tasks:
+        test = is_test(task)
         # Someone may have opted out since this task was queued.
         if db.is_suppressed(task["phone"]):
             _finish(task["id"], "skipped", "suppressed")
             continue
+        # Or been taken off the list since.
+        if task["contact_id"] is not None and task["contact_row"] is None:
+            _finish(task["id"], "skipped", "contact removed")
+            continue
+        # Or had their consent withdrawn - checked here as well as at queue time,
+        # for the same reason as the do-not-call list.
+        if task["contact_row"] is not None and task["require_consent"] and not task["contact_consent"]:
+            _finish(task["id"], "skipped", "no-consent")
+            continue
+        if test and only_task_id is None and \
+                now - (db.from_utc(task["created_at"]) or now) > TEST_CALL_TTL:
+            _finish(task["id"], "skipped", "expired",
+                    "This test call couldn't be placed straight away, so it was dropped "
+                    "rather than ringing later. Press Call me now again.")
+            continue
 
-        if not ignore_window:
+        mode = task.get("mode_override") or task.get("mode") or "message"
+        if mode == "agent" and not test:
+            if agent_ready is None:
+                agent_ready = agent.status()["ready"]
+            if not agent_ready:
+                db.execute(
+                    "UPDATE call_tasks SET status = ?, scheduled_for = ?, updated_at = ? WHERE id = ?",
+                    ("waiting for the AI agent - finish Settings > AI phone agent",
+                     db.to_utc(now + AGENT_RETRY), db.to_utc(now), task["id"]))
+                continue
+
+        # A test call is the operator ringing themselves, so quiet hours don't apply.
+        if not ignore_window and not test:
             allowed, next_open, zone = compliance.window_check(
                 task["phone"], now, window_start, window_end
             )
+            if not allowed and next_open is None:
+                _finish(task["id"], "skipped", "unknown local time",
+                        "No way to tell the local time for this number, so it isn't called.")
+                continue
             if not allowed:
                 db.execute(
                     "UPDATE call_tasks SET state = 'deferred', status = ?, "
@@ -404,23 +511,24 @@ def dispatch_pending(
         if not claim(task["id"], now):
             continue  # another thread got there first
 
+        business = task.get("campaign_business") or default_business
+        callback = task.get("campaign_callback") or default_callback
         script = compliance.build_script(
             task["script_override"] or task["message"] or _fallback_message(),
             business_name=business,
             callback_number=callback,
         )
-        # A task with no campaign is the dashboard's "call me now" button: a
-        # person is holding the phone, waiting for it to ring. Answering-machine
+        # A test call - "Call me now", or a campaign's "call me with this" - is a
+        # person holding the phone, waiting for it to ring. Answering-machine
         # detection is exactly wrong there - it withholds the script until it has
         # decided whether a greeting has finished, and a live "hello" is routinely
         # classified as a machine, so the whole detection window burns down and
         # the call hangs up having said nothing at all.
-        default_amd = "voicemail" if task["campaign_id"] else "off"
-        amd = task["amd"] or default_amd
+        default_amd = "off" if test else "voicemail"
+        amd = default_amd if test else (task["amd"] or default_amd)
         if not phone.supports(amd):
             amd = default_amd
 
-        mode = task.get("mode_override") or task.get("mode") or "message"
         try:
             if mode == "agent":
                 result = phone.place_ai_call(
@@ -463,6 +571,13 @@ def dispatch_pending(
                 (result.sid, 0 if fetched_later else 1, db.to_utc(now), task["id"]),
             )
             placed += 1
+        elif _line_full(result.error) and only_task_id is not None:
+            # Someone pressed a button and is watching for the result. Say so now,
+            # rather than ringing them whenever a line happens to free up.
+            _finish(task["id"], "done", "failed",
+                    "Every line on your Telnyx account is in use right now (it limits how "
+                    "many calls can be up at once). Try again when a call ends.")
+            db.execute("UPDATE call_tasks SET attempts = attempts + 1 WHERE id = ?", (task["id"],))
         elif _line_full(result.error):
             db.execute(
                 "UPDATE call_tasks SET state = 'pending', status = 'waiting for a free line', "
@@ -542,15 +657,27 @@ def record_status(task_id: int, status: str, answered_by: str = "", duration: in
 
     if not status:
         return
-    state = "done" if status in FINAL_STATUSES else "dialing"
+    final = status in FINAL_STATUSES
+    state = "done" if final else "dialing"
     duration = int(duration or 0)
+    sticky = ", ".join(f"'{s}'" for s in STICKY_STATUSES)
+    # Two rules on top of "latest wins":
+    # - an opt-out keypress or a deliberate hang-up on a machine is what the call
+    #   log should keep saying, even after Telnyx's closing "completed" arrives;
+    # - webhooks can arrive out of order, and a late "ringing" must not reopen a
+    #   call that has already finished.
     # CASE rather than SQLite's two-argument MAX(), which Postgres doesn't have
     # (its MAX is aggregate-only); GREATEST is the reverse problem.
     db.execute(
-        "UPDATE call_tasks SET state = ?, status = ?, answered_by = COALESCE(NULLIF(?, ''), "
-        "answered_by), duration = CASE WHEN ? > duration THEN ? ELSE duration END, "
+        "UPDATE call_tasks SET "
+        "state = CASE WHEN state = 'done' THEN 'done' ELSE ? END, "
+        f"status = CASE WHEN status IN ({sticky}) THEN status "
+        "WHEN state = 'done' AND ? = 0 THEN status ELSE ? END, "
+        "answered_by = COALESCE(NULLIF(?, ''), answered_by), "
+        "duration = CASE WHEN ? > duration THEN ? ELSE duration END, "
         "updated_at = ? WHERE id = ?",
-        (state, status, answered_by, duration, duration, db.to_utc(db.utcnow()), task_id),
+        (state, 1 if final else 0, status, answered_by, duration, duration,
+         db.to_utc(db.utcnow()), task_id),
     )
 
 
@@ -570,6 +697,13 @@ def _fallback_message() -> str:
     return "This is a test call from your RoboCall AI dashboard. Goodbye."
 
 
+# Outcome buckets shared by the dashboard, the campaign cards and the call log.
+# An opt-out keypress happened while the message was playing, so it was delivered.
+DELIVERED_SQL = "state = 'done' AND status IN ('completed', 'opted-out')"
+UNANSWERED_SQL = "state = 'done' AND status IN ('busy', 'no-answer', 'machine-skipped')"
+FAILED_SQL = "state = 'done' AND status IN ('failed', 'canceled', 'unknown')"
+
+
 # --- the loop ---------------------------------------------------------------
 
 class Dispatcher(threading.Thread):
@@ -577,6 +711,7 @@ class Dispatcher(threading.Thread):
         super().__init__(name="dispatcher", daemon=True)
         self._stop = threading.Event()
         self.ticks = 0
+        self.started_at = db.utcnow()
         self.last_tick: datetime | None = None
         self.last_error = ""
 
@@ -603,6 +738,9 @@ class Dispatcher(threading.Thread):
         return {
             "running": self.is_alive(),
             "ticks": self.ticks,
+            # On a host that sleeps when idle, this is how long it has been awake -
+            # and so whether anything scheduled before then can have gone out.
+            "started_at": db.to_utc(self.started_at),
             "last_tick": db.to_utc(self.last_tick) if self.last_tick else None,
             "last_error": self.last_error,
             "paused": config.get("dispatch_paused") == "1",

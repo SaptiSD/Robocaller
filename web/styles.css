@@ -87,7 +87,9 @@ a { color: var(--accent); }
 
 /* --- shell --------------------------------------------------------------- */
 
-.shell { display: grid; grid-template-columns: 216px 1fr; min-height: 100vh; }
+/* minmax(0, 1fr), not 1fr: a wide table must scroll inside its card instead of
+   stretching the column and pushing the page sideways. */
+.shell { display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100vh; }
 
 .sidebar {
   background: var(--surface);
@@ -149,7 +151,7 @@ a { color: var(--accent); }
 .card-head .spacer { flex: 1; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
 @media (max-width: 900px) {
-  .shell { grid-template-columns: 1fr; }
+  .shell { grid-template-columns: minmax(0, 1fr); }
   .sidebar {
     position: static; height: auto;
     flex-direction: row; flex-wrap: wrap; align-items: center;
@@ -231,7 +233,7 @@ label { display: block; font-size: 12px; font-weight: 500; color: var(--ink-2); 
 .hint { font-size: 11px; color: var(--muted); font-weight: 400; margin-top: 3px; }
 
 input[type="text"], input[type="password"], input[type="number"], input[type="time"],
-textarea, select {
+input[type="search"], input[type="datetime-local"], textarea, select {
   width: 100%; padding: 7px 10px; font: inherit; color: var(--ink);
   background: var(--page); border: 1px solid var(--line);
   border-radius: 7px; outline: none;
@@ -332,6 +334,7 @@ td.name { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-spa
 .feed-row { display: flex; gap: 10px; }
 .feed-time { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
 .feed-row.error .feed-msg { color: var(--critical); }
+.feed-row.warn .feed-msg { color: var(--warning-ink); }
 
 .campaign {
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -367,3 +370,12 @@ td.name { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-spa
 
 .hidden { display: none !important; }
 code { font-family: var(--mono); font-size: 12.5px; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+
+/* --- additions: call-log filters, campaign links, notes --------------------- */
+
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.filters select, .filters input { width: auto; min-width: 170px; flex: 0 1 220px; }
+button.link.campaign-name { padding: 0; color: var(--ink); text-align: left; }
+button.link.campaign-name:hover { color: var(--accent); background: none; }
+button.pill-button { padding: 0; }
+.env-note { color: var(--warning-ink); }

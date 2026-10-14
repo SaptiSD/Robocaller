@@ -1125,6 +1125,326 @@ def test_api() -> None:
               orphans and all(r["campaign_name"] is None for r in orphans), str(orphans[:1]))
 
 
+# --- 7. what the operator controls -------------------------------------------
+#
+# Each of these is a way the dashboard used to do something other than what it
+# said: a Pause that kept calling, a removed contact who still got called, an
+# opt-out that the call log forgot.
+
+def _signed_headers(private, body: bytes) -> dict:
+    import base64
+    import time as _time
+    stamp = str(int(_time.time()))
+    return {"content-type": "application/x-www-form-urlencoded",
+            "telnyx-signature-ed25519": base64.b64encode(private.sign(stamp.encode() + b"|" + body)).decode(),
+            "telnyx-timestamp": stamp}
+
+
+def test_numbers_and_wording() -> None:
+    print("\nnumbers and what recipients hear")
+    check("a placeholder like 123-456-7890 is rejected", compliance.normalize("+1 123 456 7890") == "")
+    check("an exchange starting with 0 is rejected", compliance.normalize("(555) 012-3456") == "")
+    check("an N11 service code isn't an area code", compliance.normalize("911-555-1234") == "")
+    check("a +1 number with too few digits is rejected", compliance.normalize("+1617555014") == "")
+    check("a real number still normalizes", compliance.normalize("425-205-5800") == "+14252055800")
+    check("a UK number gets London time", compliance.timezone_for("+442079460958") == "Europe/London")
+    ok, nxt, _ = compliance.window_check("+442079460958", datetime(2026, 10, 14, 23, 30, tzinfo=timezone.utc))
+    check("so it isn't called at 12:30am London time", not ok and nxt is not None)
+    ok, nxt, _ = compliance.window_check("+61291234567", datetime(2026, 10, 14, 16, 0, tzinfo=timezone.utc))
+    check("a number with no knowable local time is never in the window", not ok and nxt is None)
+    check("phone numbers are read 3-3-4",
+          compliance.spell_number("601-526-1129") == "6 0 1, 5 2 6, 1 1 2 9")
+    script = compliance.build_script("This is a test. Goodbye.", callback_number="601-526-1129")
+    check("the opt-out comes before the goodbye", script.endswith("1 1 2 9. Goodbye."), script)
+    pressed = compliance.build_script("Sale Friday.", callback_number="601-526-1129", press_nine=True)
+    check("webhook mode has one opt-out sentence, with the keypress in it",
+          pressed.count("To be removed") == 1 and "press 9 now, or call 6 0 1" in pressed, pressed)
+    plain = compliance.build_script("Sale Friday.")
+    check("without a callback number it points to the caller-ID number",
+          "call us back at the number shown on your caller ID" in plain, plain)
+
+
+def test_operator_controls() -> None:
+    print("\noperator controls")
+    from fastapi.testclient import TestClient
+    import server
+
+    fake = install_fake()
+    midday = datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc)
+    db.execute("UPDATE call_tasks SET state = 'done' WHERE state IN ('pending', 'deferred')")
+    db.set_setting("dispatch_paused", "0")
+
+    client = TestClient(server.app)  # no lifespan: the app's dispatcher thread would race these checks
+    # Pause holds what is already queued.
+    cid = make_campaign(name="Held")
+    add_contact(cid, "617-555-0301")
+    dispatcher.enqueue_campaign(cid, midday)
+    client.patch(f"/api/campaigns/{cid}", json={"state": "paused"})
+    check("a paused campaign's queued calls are held",
+          dispatcher.dispatch_pending(now=midday, budget=10) == 0 and not fake.placed)
+    res = client.post(f"/api/campaigns/{cid}/run")
+    check("Run now on a paused campaign says to resume first",
+          res.status_code == 409 and "Resume" in res.json()["error"], res.text[:160])
+    client.patch(f"/api/campaigns/{cid}", json={"state": "active"})
+    check("resuming releases them", dispatcher.dispatch_pending(now=midday, budget=10) == 1)
+
+    # Removing a contact, or withdrawing consent, takes them out of the queue.
+    cid = make_campaign(name="Removed")
+    add_contact(cid, "617-555-0302")
+    add_contact(cid, "617-555-0303")
+    dispatcher.enqueue_campaign(cid, midday)
+    rows = db.query("SELECT id, phone FROM contacts WHERE campaign_id = ? ORDER BY id", (cid,))
+    res = client.delete(f"/api/campaigns/{cid}/contacts/{rows[0]['id']}")
+    check("removing a contact cancels their queued call", res.json()["cancelled"] == 1)
+    res = client.patch(f"/api/campaigns/{cid}/contacts/{rows[1]['id']}", json={"consent": False})
+    check("withdrawing consent cancels theirs", res.json()["cancelled"] == 1)
+    fake.placed.clear()
+    dispatcher.dispatch_pending(now=midday, budget=10)
+    check("so neither is dialled", not fake.placed, str(fake.placed))
+    client.patch(f"/api/campaigns/{cid}/contacts/{rows[1]['id']}", json={"consent": True})
+    dispatcher.enqueue_campaign(cid, midday)
+    db.execute("UPDATE contacts SET consent = 0 WHERE id = ?", (rows[1]["id"],))
+    dispatcher.dispatch_pending(now=midday, budget=10)
+    check("consent is re-checked at dial time too", not fake.placed)
+
+    # A one-off that has gone out is finished, not "active" forever.
+    cid = make_campaign(name="Sent once")
+    dispatcher.materialize_due_campaigns()  # due now, so it goes out now
+    client.patch(f"/api/campaigns/{cid}", json={"state": "paused"})
+    res = client.patch(f"/api/campaigns/{cid}", json={"state": "active"})
+    check("resuming a one-off that already went out marks it finished, and says why",
+          res.json()["state"] == "finished" and "Run now" in res.json()["note"], res.text[:200])
+    cid = client.post("/api/campaigns", json={
+        "name": "Sent early", "message": "Hello.", "contacts": "617-555-0310",
+        "contacts_consented": True}).json()["id"]
+    res = client.post(f"/api/campaigns/{cid}/run").json()
+    row = db.query_one("SELECT state, next_run_at FROM campaigns WHERE id = ?", (cid,))
+    check("Run now on a scheduled one-off replaces its scheduled run, so nobody is called twice",
+          res["queued"] == 1 and row["state"] == "finished" and row["next_run_at"] is None
+          and bool(res["note"]), str(res))
+
+    # Editing a campaign: identity, schedule and message.
+    cid = client.post("/api/campaigns", json={
+        "name": "Edit me", "message": "Hello there.", "frequency": "daily", "call_time": "10:00",
+        "ends_at": "2099-01-01 00:00"}).json()["id"]
+    res = client.patch(f"/api/campaigns/{cid}", json={
+        "message": "Hello again.", "business_name": "Bitcoin Education Institute",
+        "callback_number": "601-526-1129", "call_time": "14:30"})
+    row = db.query_one("SELECT * FROM campaigns WHERE id = ?", (cid,))
+    local = db.from_utc(row["next_run_at"]).astimezone(compliance.ZoneInfo("America/New_York"))
+    check("an edit saves the new message and caller identity",
+          row["message"] == "Hello again." and row["business_name"] == "Bitcoin Education Institute"
+          and row["callback_number"] == "+16015261129", str(res.json())[:200])
+    check("and reschedules to the new time", (local.hour, local.minute) == (14, 30), str(local))
+    res = client.patch(f"/api/campaigns/{cid}", json={"callback_number": "123-456-7890"})
+    check("a bad callback number is refused", res.status_code == 400)
+
+    # The campaign's own identity is what the call says.
+    fake.placed.clear()
+    db.set_setting("business_name", "SwIRL Research Lab")
+    add_contact(cid, "617-555-0304")
+    dispatcher.enqueue_campaign(cid, midday)
+    dispatcher.dispatch_pending(now=midday, budget=10)
+    said = fake.placed[-1]["script"] if fake.placed else ""
+    check("a campaign's own business name replaces the default",
+          "Bitcoin Education Institute" in said and "SwIRL" not in said, said)
+    check("and its own callback number", "6 0 1, 5 2 6, 1 1 2 9" in said, said)
+    preview = client.post("/api/script/preview", json={
+        "message": "Hello.", "business_name": "Bitcoin Education Institute"}).json()["script"]
+    check("the preview uses the form's identity", "Bitcoin Education Institute" in preview, preview)
+    db.set_setting("business_name", "")
+
+    # "Call me with this campaign".
+    db.set_setting("test_number", "+14252055800")
+    fake.placed.clear()
+    res = client.post(f"/api/campaigns/{cid}/test-call", json={})
+    call = fake.placed[-1] if fake.placed else {}
+    check("a campaign test call rings the saved test number with the campaign's script",
+          res.json()["placed"] == 1 and call.get("to") == "+14252055800"
+          and "Hello again." in call.get("script", ""), str(res.json())[:200])
+    check("with machine detection off, like any test call", call.get("amd") == "off")
+    stats = client.get(f"/api/campaigns/{cid}").json()
+    check("and it isn't counted in the campaign's stats",
+          stats["calls_total"] == 1, str(stats["calls_total"]))
+    db.set_setting("test_number", "")
+
+    # Test calls that can't ring say so instead.
+    db.suppress("+16175550305", "opted out by keypress")
+    res = client.post("/api/test-call", json={"phone": "617-555-0305"})
+    check("a test call to a blocked number explains itself",
+          res.status_code == 400 and "do-not-call" in res.json()["error"], res.text[:160])
+
+    class LineFull(type(fake)):
+        def place_call(self, **kwargs):
+            return telephony.CallResult(False, error="[90042] OB profile channel limit exceeded D2.")
+    config.telephony = lambda: LineFull()  # type: ignore[assignment]
+    task_id = dispatcher.enqueue_single("+16175550306", "late test")
+    dispatcher.dispatch_pending(only_task_id=task_id, ignore_window=True)
+    task = db.query_one("SELECT * FROM call_tasks WHERE id = ?", (task_id,))
+    check("a test call that finds every line busy fails now, rather than ringing later",
+          task["state"] == "done" and "in use" in task["error"], str(task["state"]))
+    fake = install_fake()
+
+    # Settings that would save and then quietly break calling.
+    for values, label in (({"window_start": "20:00", "window_end": "09:00"}, "an empty calling window"),
+                          ({"calls_per_minute": "lots"}, "a non-numeric rate"),
+                          ({"ring_seconds": "999"}, "a ring time Telnyx refuses"),
+                          ({"public_base_url": "robocaller.onrender.com"}, "a base URL without https"),
+                          ({"test_number": "123-456-7890"}, "a placeholder test number")):
+        res = client.post("/api/settings", json={"values": values})
+        check(f"{label} is refused", res.status_code == 400 and res.json().get("error"), res.text[:120])
+
+    # The call log can be narrowed down and exported.
+    res = client.get("/api/calls", params={"q": "555-0304"}).json()
+    check("the call log searches by number", res and all("5550304" in r["phone"] for r in res))
+    res = client.get("/api/calls", params={"outcome": "test"}).json()
+    check("and filters to test calls", res and all(r["is_test"] for r in res))
+    res = client.get("/api/calls.csv")
+    check("and exports as CSV", res.status_code == 200 and res.text.startswith("id,updated_utc")
+          and "attachment" in res.headers.get("content-disposition", ""))
+
+    # Removing an opt-out leaves a trace.
+    client.delete("/api/suppression/+16175550305")
+    check("removing a number from the do-not-call list is recorded",
+          "removed from the do-not-call list" in db.recent_events(1)[0]["message"])
+
+
+def test_schedule_resilience() -> None:
+    print("\nmissed runs and global pause")
+    install_fake()
+    db.execute("UPDATE call_tasks SET state = 'done' WHERE state IN ('pending', 'deferred')")
+    start = datetime(2026, 6, 1, 14, 0, tzinfo=timezone.utc)  # 10:00 ET
+
+    def daily(name: str, due: datetime) -> int:
+        cid = make_campaign(name=name, frequency="daily", call_time="10:00")
+        db.execute("UPDATE campaigns SET next_run_at = ? WHERE id = ?", (db.to_utc(due), cid))
+        add_contact(cid, f"617-555-{400 + cid % 100:04d}")
+        return cid
+
+    db.set_setting("dispatch_paused", "1")
+    cid = daily("Paused daily", start)
+    dispatcher.materialize_due_campaigns(start + timedelta(minutes=1))
+    queued = db.query_one("SELECT COUNT(*) AS n FROM call_tasks WHERE campaign_id = ?", (cid,))["n"]
+    check("while calling is paused, scheduled runs aren't queued", queued == 0)
+    db.set_setting("dispatch_paused", "0")
+    fired = dispatcher.materialize_due_campaigns(start + timedelta(minutes=40))
+    check("a run that's only a little late goes out on resume", fired >= 1)
+
+    cid = daily("Slept through", start)
+    dispatcher.materialize_due_campaigns(start + timedelta(hours=8))
+    row = db.query_one("SELECT * FROM campaigns WHERE id = ?", (cid,))
+    queued = db.query_one("SELECT COUNT(*) AS n FROM call_tasks WHERE campaign_id = ?", (cid,))["n"]
+    check("a daily run found 8 hours late is skipped, not sent at 6pm", queued == 0 and row["runs"] == 0)
+    check("its schedule moves on to the next slot",
+          db.from_utc(row["next_run_at"]) > start + timedelta(hours=8))
+    check("and Activity says it was missed", "missed its" in db.recent_events(1)[0]["message"])
+
+    cid = make_campaign(name="Late one-off")
+    db.execute("UPDATE campaigns SET next_run_at = ? WHERE id = ?", (db.to_utc(start), cid))
+    add_contact(cid, "617-555-0499")
+    dispatcher.materialize_due_campaigns(start + timedelta(hours=8))
+    queued = db.query_one("SELECT COUNT(*) AS n FROM call_tasks WHERE campaign_id = ?", (cid,))["n"]
+    check("a one-off still goes out late - it has no next slot to wait for", queued == 1)
+
+    db.execute("UPDATE campaigns SET state = 'active', next_run_at = NULL WHERE id = ?", (cid,))
+    dispatcher.materialize_due_campaigns(start + timedelta(hours=9))
+    check("a one-off with nothing scheduled retires itself",
+          db.query_one("SELECT state FROM campaigns WHERE id = ?", (cid,))["state"] == "finished")
+
+
+def test_call_records() -> None:
+    print("\nwhat the call log keeps")
+    from fastapi.testclient import TestClient
+    import server
+
+    install_fake(mode="webhook")
+    db.set_setting("public_base_url", "https://robocaller.example.com")
+    try:
+        client = TestClient(server.app)  # no lifespan: the app's dispatcher thread would race these checks
+        task_id = dispatcher.enqueue_single("+16175550501", "hello")
+        dispatcher.dispatch_pending(only_task_id=task_id, ignore_window=True)
+        token = db.query_one("SELECT token FROM call_tasks WHERE id = ?", (task_id,))["token"]
+        xml = client.post(f"/telnyx/voice/{token}", data={"AnsweredBy": "human"}).text
+        check("the webhook script has one opt-out sentence",
+              xml.count("To be removed") == 1 and "press 9 now" in xml, xml[:300])
+        client.post(f"/telnyx/optout/{token}", data={"Digits": "9"})
+        client.post(f"/telnyx/status/{token}", data={"CallStatus": "completed", "CallDuration": "21"})
+        row = db.query_one("SELECT * FROM call_tasks WHERE id = ?", (task_id,))
+        check("an opt-out survives Telnyx's closing 'completed'",
+              row["status"] == "opted-out" and row["state"] == "done" and row["duration"] == 21)
+        client.post(f"/telnyx/status/{token}", data={"CallStatus": "ringing"})
+        row = db.query_one("SELECT * FROM call_tasks WHERE id = ?", (task_id,))
+        check("a late 'ringing' doesn't reopen a finished call", row["state"] == "done")
+
+        cid = make_campaign(name="Live only", amd="live_only")
+        add_contact(cid, "617-555-0502")
+        dispatcher.enqueue_campaign(cid, datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc))
+        task = db.query_one("SELECT id, token FROM call_tasks WHERE campaign_id = ?", (cid,))
+        client.post(f"/telnyx/voice/{task['token']}", data={"AnsweredBy": "machine_start"})
+        client.post(f"/telnyx/status/{task['token']}", data={"CallStatus": "completed"})
+        check("a deliberate hang-up on a machine keeps saying so",
+              db.query_one("SELECT status FROM call_tasks WHERE id = ?", (task["id"],))["status"]
+              == "machine-skipped")
+
+        os.environ["AGENT_PROXY_TOKEN"] = "proxy-secret"
+        task_id = dispatcher.enqueue_single("+16175550503", "ai", mode="agent")
+        token = db.query_one("SELECT token FROM call_tasks WHERE id = ?", (task_id,))["token"]
+        client.post(f"/telnyx/agent/optout/{token}", json={}, headers={"X-Agent-Token": "proxy-secret"})
+        check("an opt-out on an AI call shows in the call log",
+              db.query_one("SELECT status FROM call_tasks WHERE id = ?", (task_id,))["status"]
+              == "opted-out")
+    finally:
+        os.environ.pop("AGENT_PROXY_TOKEN", None)
+        db.set_setting("public_base_url", "")
+
+
+def test_callback_line() -> None:
+    print("\nthe callback line")
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from fastapi.testclient import TestClient
+    import server
+
+    private = Ed25519PrivateKey.generate()
+    public = base64.b64encode(private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+    db.set_setting("public_base_url", "https://robocaller.example.com")
+    try:
+        client = TestClient(server.app)  # no lifespan: the app's dispatcher thread would race these checks
+        body = b"From=%2B14252055811&To=%2B15085550100"
+        res = client.post("/telnyx/inbound", content=body,
+                          headers={"content-type": "application/x-www-form-urlencoded"})
+        check("without a public key the callback line refuses everything", res.status_code == 403)
+
+        db.set_setting("telnyx_public_key", public)
+        db.set_setting("business_name", "Danvers Furniture")
+        res = client.post("/telnyx/inbound", content=body, headers=_signed_headers(private, body))
+        check("a caller hears who they reached and how to opt out",
+              res.status_code == 200 and "Danvers Furniture" in res.text and "press 9" in res.text
+              and "/telnyx/inbound/choice" in res.text, res.text[:300])
+        choice = b"From=%2B14252055811&Digits=9"
+        res = client.post("/telnyx/inbound/choice", content=choice, headers=_signed_headers(private, choice))
+        check("pressing 9 adds them to the do-not-call list",
+              "removed from our calling list" in res.text and db.is_suppressed("+14252055811"))
+        db.unsuppress("+14252055811")
+        res = client.post("/telnyx/inbound/choice", content=b"From=%2B14252055811&Digits=1",
+                          headers=_signed_headers(private, b"From=%2B14252055811&Digits=1"))
+        check("pressing 1 goes to a voicemail prompt", "<Record" in res.text, res.text[:200])
+        done = b"From=%2B14252055811&RecordingDuration=12"
+        client.post("/telnyx/inbound/recorded", content=done, headers=_signed_headers(private, done))
+        check("a voicemail shows up in Activity",
+              "Voicemail from (425) 205-5811 (12s)" in db.recent_events(1)[0]["message"])
+        forged = b"From=%2B16175550600&Digits=9"
+        res = client.post("/telnyx/inbound/choice", content=forged,
+                          headers={**_signed_headers(private, b"other"), })
+        check("a forged opt-out is refused", res.status_code == 403 and not db.is_suppressed("+16175550600"))
+    finally:
+        for key in ("public_base_url", "telnyx_public_key", "business_name"):
+            db.set_setting(key, "")
+        server._warned.clear()
+
+
 def main() -> int:
     print(f"scratch database: {db.DB_PATH}")
     test_numbers()
@@ -1142,6 +1462,11 @@ def main() -> int:
     test_agent_http()
     test_webhook_signatures()
     test_api()
+    test_numbers_and_wording()
+    test_operator_controls()
+    test_schedule_resilience()
+    test_call_records()
+    test_callback_line()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
