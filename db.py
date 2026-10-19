@@ -65,7 +65,7 @@ if PG_SCHEMA and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", PG_SCHEMA):
 # Tables whose primary key is a generated `id`. Postgres only returns a new row
 # id if the INSERT asks for it, and asking on a table without that column is an
 # error - so `insert()` needs to know which is which.
-_ID_TABLES = {"campaigns", "contacts", "call_tasks", "events"}
+_ID_TABLES = {"campaigns", "contacts", "call_tasks", "events", "downtime"}
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -174,6 +174,16 @@ CREATE TABLE IF NOT EXISTS events (
     ts      TEXT NOT NULL,
     level   TEXT NOT NULL DEFAULT 'info',
     message TEXT NOT NULL
+);
+
+-- Stretches when no server was running, worked out from the dispatcher's
+-- heartbeat when the next one starts. Nothing is dialled in them, so they are
+-- the record of whether the host slept through a scheduled run.
+CREATE TABLE IF NOT EXISTS downtime (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    down_from  TEXT NOT NULL,
+    down_until TEXT NOT NULL,
+    seconds    INTEGER NOT NULL DEFAULT 0
 );
 """
 

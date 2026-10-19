@@ -808,6 +808,44 @@ UNANSWERED_SQL = "state = 'done' AND status IN ('busy', 'no-answer', 'machine-sk
 FAILED_SQL = "state = 'done' AND status IN ('failed', 'canceled', 'unknown')"
 
 
+# --- uptime -----------------------------------------------------------------
+#
+# A host that sleeps leaves no trace of having slept: the process just stops, and
+# the next one starts as if nothing happened. So the dispatcher writes a heartbeat
+# every minute, and each new one compares it with the clock. A gap is downtime,
+# and it is recorded - which is how "the server was asleep at 11:00" becomes a
+# fact on the dashboard instead of an inference from a late call.
+
+HEARTBEAT_KEY = "engine_heartbeat"
+HEARTBEAT_EVERY = timedelta(minutes=1)
+# Longer than a heartbeat interval plus a restart, so a deploy - where the new
+# process starts while the old one is still beating - is never counted.
+DOWNTIME_AFTER = timedelta(minutes=3)
+
+
+def beat(now: datetime) -> None:
+    db.set_setting(HEARTBEAT_KEY, db.to_utc(now))
+
+
+def note_start(now: datetime) -> timedelta | None:
+    """Record any downtime since the last heartbeat. Returns its length, if any."""
+    last = db.from_utc(db.get_setting(HEARTBEAT_KEY, "") or None)
+    beat(now)
+    if last is None or now - last <= DOWNTIME_AFTER:
+        return None
+    gap = now - last
+    db.insert("INSERT INTO downtime (down_from, down_until, seconds) VALUES (?, ?, ?)",
+              (db.to_utc(last), db.to_utc(now), int(gap.total_seconds())))
+    db.log_event(f"The server was down for {_ago(gap)} before this start - nothing could be "
+                 "dialled in that time.", "warn")
+    return gap
+
+
+def recent_downtime(now: datetime, within: timedelta = timedelta(days=7)) -> list[dict]:
+    return db.query("SELECT down_from, down_until, seconds FROM downtime WHERE down_until >= ? "
+                    "ORDER BY id DESC LIMIT 10", (db.to_utc(now - within),))
+
+
 # --- the loop ---------------------------------------------------------------
 
 class Dispatcher(threading.Thread):
@@ -817,6 +855,7 @@ class Dispatcher(threading.Thread):
         self.ticks = 0
         self.started_at = db.utcnow()
         self.last_tick: datetime | None = None
+        self.last_beat: datetime | None = None
         self.last_error = ""
 
     def run(self) -> None:
@@ -825,6 +864,12 @@ class Dispatcher(threading.Thread):
             try:
                 self.ticks += 1
                 self.last_tick = db.utcnow()
+                if self.last_beat is None:
+                    note_start(self.last_tick)
+                    self.last_beat = self.last_tick
+                elif self.last_tick - self.last_beat >= HEARTBEAT_EVERY:
+                    beat(self.last_tick)
+                    self.last_beat = self.last_tick
                 materialize_due_campaigns()
                 dispatch_pending()
                 if self.ticks % SYNC_EVERY_TICKS == 0:

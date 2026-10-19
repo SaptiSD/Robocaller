@@ -35,10 +35,10 @@ import compliance
 import config
 import db
 import dispatcher
-import keepawake
 import llm_proxy
 import scriptwriter
 import telephony
+import wakeup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("robocall")
@@ -46,9 +46,10 @@ log = logging.getLogger("robocall")
 WEB_DIR = Path(__file__).parent / "web"
 DOCS_DIR = Path(__file__).parent / "docs"
 _engine: dispatcher.Dispatcher | None = None
-# The running KeepAwake, if any. A list rather than a global so overlapping
-# lifespans (the test suites open several) each remove only their own.
-_keepers: list[keepawake.KeepAwake] = []
+# wakeup.status() reads pg_cron's tables, and every open dashboard asks for the
+# overview every few seconds - once a minute is plenty for something that
+# changes every five.
+_wake_cache: tuple[float, dict] | None = None
 
 
 @asynccontextmanager
@@ -69,12 +70,7 @@ async def lifespan(app: FastAPI):
         )
     _engine = dispatcher.Dispatcher()
     _engine.start()
-    _awake = keepawake.KeepAwake()
-    _awake.start()
-    _keepers.append(_awake)
     yield
-    _awake.stop()
-    _keepers.remove(_awake)
     if _engine:
         _engine.stop()
 
@@ -365,7 +361,8 @@ def overview() -> dict:
         "upcoming": upcoming,
         "suppressed": len(db.suppression_set()),
         "engine": {**(_engine.health() if _engine else {"running": False}),
-                   "keep_awake": _keepers[-1].status() if _keepers else None},
+                   "wake_up": _wake_status(),
+                   "downtime": dispatcher.recent_downtime(db.utcnow())},
         "settings": config.public_view(),
         "events": db.recent_events(12),
         "server_time": db.now_str(),
@@ -375,6 +372,13 @@ def overview() -> dict:
             "WHERE t.state IN ('pending', 'deferred') AND c.state = 'paused' "
             "AND t.run_key <> 'test'") or {}).get("n") or 0,
     }
+
+
+def _wake_status() -> dict:
+    global _wake_cache
+    if _wake_cache is None or time.monotonic() - _wake_cache[0] > 60:
+        _wake_cache = (time.monotonic(), wakeup.status())
+    return _wake_cache[1]
 
 
 # --- campaigns --------------------------------------------------------------

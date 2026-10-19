@@ -344,20 +344,35 @@ function awakeFor(startedUtc) {
   return `up ${Math.round(mins / 60)} h`;
 }
 
-// Whether the server is holding itself awake for scheduled calls. On a host that
-// sleeps when idle, this is the difference between a schedule that fires and one
-// that only fires when someone happens to have this page open.
-function keepAwakeText(k) {
-  if (!k || !k.url) return "";
-  if (!k.holding) {
-    return `<div class="hint">Nothing scheduled, so the host may let the server sleep - opening this page wakes it.</div>`;
+// What wakes the server for scheduled runs. On a host that sleeps when idle this
+// is the difference between a schedule that fires and one that only fires when
+// someone happens to have this page open.
+function wakeUpText(w) {
+  if (!w || !w.needed) return "";
+  if (!w.installed) {
+    return `<div class="hint" style="color:var(--critical)">Nothing wakes this server for scheduled runs.
+      On a host that sleeps when idle (Render's free plan does), they only go out while someone has
+      this page open. Set up the wake-up job: <code>python wakeup.py install</code>.</div>`;
   }
-  if (k.last_error) {
-    return `<div class="hint" style="color:var(--critical)">Can't keep itself awake: checking in with
-      ${esc(k.url)} failed (${esc(k.last_error)}). If the host puts it to sleep, scheduled calls won't go out.</div>`;
+  if (!w.active || (w.last_run_status && w.last_run_status !== "succeeded")) {
+    return `<div class="hint" style="color:var(--critical)">The wake-up job is ${w.active ? "failing" : "switched off"}${
+      w.last_run_message ? ` (${esc(w.last_run_message)})` : ""} - scheduled runs may find the server asleep.</div>`;
   }
-  return `<div class="hint">Staying awake for scheduled calls (${esc(k.holding)}) &middot; ${k.last_ok
-    ? `last checked in ${esc(fmtWhen(k.last_ok))}` : `checks in every ${k.every_minutes} min`}.</div>`;
+  const call = w.last_call
+    ? ` &middot; last woke it ${esc(fmtWhen(w.last_call))}${w.last_call_status && w.last_call_status !== 200
+      ? ` (${esc(w.last_call_error || "HTTP " + w.last_call_status)})` : ""}` : "";
+  return `<div class="hint">Woken before each run by the database: it calls this server every
+    ${w.every_minutes} min from ${w.lead_minutes} min before a run until its calls are done${call}.</div>`;
+}
+
+// When no server was running - the record of whether the host slept through a run.
+function downtimeText(rows) {
+  if (!rows || !rows.length) return "";
+  const last = rows[0];
+  const mins = Math.round(last.seconds / 60);
+  const length = mins < 120 ? `${mins} min` : `${Math.round(mins / 60)} h`;
+  return `<div class="hint">Last down ${esc(fmtWhen(last.down_from))} until ${esc(fmtWhen(last.down_until))}
+    (${length})${rows.length > 1 ? ` &middot; ${rows.length} times this week` : ""}.</div>`;
 }
 
 async function loadDashboard() {
@@ -388,7 +403,8 @@ async function loadDashboard() {
           : "Scripts ride along with each call; nothing needs to be internet-reachable."}</div>
       <div class="hint">Calling window ${esc(data.settings.window_start)}&ndash;${esc(data.settings.window_end)}
         local to each recipient, ${esc(data.settings.calls_per_minute)} calls/minute.</div>
-      ${keepAwakeText(e.keep_awake)}
+      ${wakeUpText(e.wake_up)}
+      ${downtimeText(e.downtime)}
       ${e.last_error ? `<div class="hint" style="color:var(--critical)">${esc(e.last_error)}</div>` : ""}
     </div>`);
 

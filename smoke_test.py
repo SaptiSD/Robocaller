@@ -1455,7 +1455,8 @@ def test_sleeping_server() -> None:
 
     test_schedule_edges()
     test_ring_floor(fake)
-    test_keep_awake()
+    test_wake_up()
+    test_downtime()
 
 
 def test_schedule_edges() -> None:
@@ -1613,147 +1614,93 @@ def test_ring_floor(fake) -> None:
     db.set_setting("ring_seconds", "")
 
 
-def test_keep_awake() -> None:
-    print("\nstaying awake while calls are scheduled")
-    import keepawake
-
-    db.execute("UPDATE call_tasks SET state = 'done' WHERE state IN ('pending', 'deferred', 'dialing')")
-    db.execute("UPDATE campaigns SET state = 'finished', next_run_at = NULL WHERE state = 'active'")
-    db.set_setting("dispatch_paused", "0")
+def test_wake_up() -> None:
+    print("\nwaking the server for scheduled runs")
+    import wakeup
 
     db.set_setting("public_base_url", "")
-    check("with no public address there is nothing to check in with", keepawake.own_url() == "")
+    check("with no public address there is nothing to wake", wakeup.own_url() == "")
     db.set_setting("public_base_url", "http://localhost:8000")
-    check("nor with a local one", keepawake.own_url() == "")
+    check("nor with a local one", wakeup.own_url() == "")
     db.set_setting("public_base_url", "https://robocaller.example.com/")
-    check("the public base URL is this server's address", keepawake.own_url() == "https://robocaller.example.com")
+    check("the public base URL is this server's address", wakeup.own_url() == "https://robocaller.example.com")
     os.environ["RENDER_EXTERNAL_URL"] = "https://robocaller-abc.onrender.com"
     check("on Render, the address Render gives the service wins",
-          keepawake.own_url() == "https://robocaller-abc.onrender.com")
+          wakeup.own_url() == "https://robocaller-abc.onrender.com")
     os.environ["RENDER_EXTERNAL_URL"] = ""
 
-    pinged: list[str] = []
-    answer = {"ok": True}
+    sql = wakeup.job_sql("https://robocaller.onrender.com")
+    check("the job calls the server's /healthz", "url := 'https://robocaller.onrender.com/healthz'" in sql, sql)
+    check("and waits out a cold start", "timeout_milliseconds := 60000" in sql)
+    check("only when a run is due within 20 minutes or calls are waiting",
+          "interval '20 minutes'" in sql and "next_run_at <=" in sql
+          and "t.state IN ('pending', 'deferred', 'dialing')" in sql, sql)
+    check("never while calling is paused", "'dispatch_paused'" in sql)
+    check("never for a paused campaign's held calls", "c.state <> 'paused'" in sql)
+    check("and never for a campaign with nobody on its list", "FROM public.contacts ct" in sql)
+    check("it reads the app's own tables", "public.campaigns" in sql and "public.call_tasks" in sql)
+    check("or another schema, when the app uses one",
+          "robocall_test.campaigns" in wakeup.job_sql("https://x.example.com", "robocall_test"))
+    check("a test can stand in its own tables", "FROM campaigns c" in wakeup.wake_condition(None))
+    try:
+        wakeup.job_sql("http://localhost:8000")
+        check("a local address is refused", False)
+    except ValueError:
+        check("a local address is refused", True)
 
-    def fake_get(url: str) -> tuple[bool, str]:
-        pinged.append(url)
-        return (True, "") if answer["ok"] else (False, "HTTP 502")
+    status = wakeup.status()
+    check("on SQLite the dashboard is told there is no wake-up job",
+          status["installed"] is False and status["why_not"] == "sqlite", str(status))
+    check("and that this deployment needs one", status["needed"] is True)
+    try:
+        wakeup.install("https://robocaller.example.com")
+        check("installing on SQLite says why it can't", False)
+    except RuntimeError as exc:
+        check("installing on SQLite says why it can't", "Postgres" in str(exc), str(exc))
+    db.set_setting("public_base_url", "")
 
-    keeper = keepawake.KeepAwake(get=fake_get)
-    check("with nothing scheduled it lets the server sleep", keeper.check() is False and not pinged)
 
-    cid = make_campaign(name="Every morning", frequency="daily", call_time="11:00")
-    add_contact(cid, "617-555-0801")
-    check("a scheduled campaign is a reason to stay up",
-          "Every morning" in keepawake.work_scheduled(), keepawake.work_scheduled())
-    check("so it checks in with its own /healthz",
-          keeper.check() and pinged == ["https://robocaller.example.com/healthz"], str(pinged))
-    check("and Activity says it is holding the server awake",
-          "Keeping the server awake" in db.recent_events(1)[0]["message"])
-    before = db.recent_events(1)[0]["id"]
-    keeper.check()
-    check("without repeating that every five minutes", db.recent_events(1)[0]["id"] == before)
-    check("the dashboard can see when it last checked in",
-          keeper.status()["last_ok"] and keeper.status()["holding"], str(keeper.status()))
+def test_downtime() -> None:
+    print("\nrecording downtime")
+    now = _utc(2026, 10, 19, 16, 36, 46)
+    db.set_setting(dispatcher.HEARTBEAT_KEY, "")
+    check("a first start has nothing to compare with", dispatcher.note_start(now) is None)
+    check("and leaves a heartbeat", db.get_setting(dispatcher.HEARTBEAT_KEY) == "2026-10-19 16:36:46")
+    later = now + timedelta(seconds=50)
+    check("a restart within a heartbeat - a deploy - isn't downtime",
+          dispatcher.note_start(later) is None)
 
-    answer["ok"] = False
-    check("a failed check-in is reported", keeper.check() is False and keeper.status()["last_error"] == "HTTP 502")
+    before = db.query_one("SELECT COUNT(*) AS n FROM downtime")["n"]
+    db.set_setting(dispatcher.HEARTBEAT_KEY, "2026-10-19 15:20:12")  # the Oct 19 sleep, roughly
+    gap = dispatcher.note_start(now)
+    check("a start after the heartbeat went quiet records the gap",
+          gap == timedelta(hours=1, minutes=16, seconds=34), str(gap))
+    row = db.query_one("SELECT * FROM downtime ORDER BY id DESC LIMIT 1")
+    check("with when it stopped, when it came back and for how long",
+          db.query_one("SELECT COUNT(*) AS n FROM downtime")["n"] == before + 1
+          and row["down_from"] == "2026-10-19 15:20:12" and row["down_until"] == "2026-10-19 16:36:46"
+          and row["seconds"] == 4594, str(dict(row)))
     event = db.recent_events(1)[0]
-    check("loudly, once", event["level"] == "error" and "couldn't reach itself" in event["message"])
-    before = db.recent_events(1)[0]["id"]
-    keeper.check()
-    check("not on every retry", db.recent_events(1)[0]["id"] == before)
-    answer["ok"] = True
-    keeper.check()
-    check("and recovery is reported too", "again" in db.recent_events(1)[0]["message"]
-          and keeper.status()["last_error"] == "")
+    check("and Activity says the server was down", event["level"] == "warn"
+          and "was down for 76 min" in event["message"], event["message"])
+    check("the dashboard can list this week's",
+          dispatcher.recent_downtime(now)[0]["down_until"] == "2026-10-19 16:36:46")
+    check("but not last month's", not dispatcher.recent_downtime(now + timedelta(days=30)))
 
-    check("a failed check-in is retried within a minute, not five",
-          keeper.next_wait(False) == keepawake.RETRY_SECONDS == 60)
-    check("a good one waits the full five", keeper.next_wait(True) == keepawake.INTERVAL_SECONDS)
-
-    # The database going away must not stop the check-ins: if the host slept
-    # through the outage, nothing would be awake to notice it had ended.
-    real_scheduled = keepawake.work_scheduled
-
-    def outage() -> str:
-        raise RuntimeError("could not connect to the database")
-
-    keepawake.work_scheduled = outage
-    pinged.clear()
-    try:
-        check("while the database is down it keeps checking in", keeper.check() and len(pinged) == 1,
-              str(pinged))
-    finally:
-        keepawake.work_scheduled = real_scheduled
-    cold = keepawake.KeepAwake(get=fake_get)
-    keepawake.work_scheduled = outage
-    try:
-        cold.check()
-        check("but a server that never knew of any work doesn't invent some", False)
-    except RuntimeError:
-        check("but a server that never knew of any work doesn't invent some", True)
-    finally:
-        keepawake.work_scheduled = real_scheduled
-
-    # Work it can never do is no reason to stay up.
-    empty = make_campaign(name="No contacts yet", frequency="daily", call_time="11:00")
-    db.execute("UPDATE campaigns SET state = 'paused' WHERE id = ?", (cid,))
-    check("a campaign with nobody on its list doesn't hold the server up",
-          keepawake.work_scheduled() == "", keepawake.work_scheduled())
-    add_contact(empty, "617-555-0803", consent=0)
-    check("nor one whose only contacts haven't consented", keepawake.work_scheduled() == "",
-          keepawake.work_scheduled())
-    db.execute("UPDATE campaigns SET require_consent = 0 WHERE id = ?", (empty,))
-    check("unless it doesn't require consent", "No contacts yet" in keepawake.work_scheduled())
-    real_phone = config.telephony
-    config.telephony = lambda: None  # type: ignore[assignment]
-    check("and nothing holds it up while Telnyx isn't set up to dial", keepawake.work_scheduled() == "")
-    config.telephony = real_phone  # type: ignore[assignment]
-    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (empty,))
-    db.execute("UPDATE campaigns SET state = 'active' WHERE id = ?", (cid,))
-
-    db.set_setting("dispatch_paused", "1")
-    check("while calling is paused there is nothing to stay up for", keepawake.work_scheduled() == "")
-    db.set_setting("dispatch_paused", "0")
-    db.execute("UPDATE campaigns SET state = 'paused' WHERE id = ?", (cid,))
-    dispatcher.enqueue_campaign(cid, _utc(2026, 5, 20, 16, 0))
-    check("nor for a paused campaign's held calls", keepawake.work_scheduled() == "",
-          keepawake.work_scheduled())
-    db.execute("UPDATE campaigns SET state = 'active' WHERE id = ?", (cid,))
-    db.execute("UPDATE campaigns SET next_run_at = NULL WHERE id = ?", (cid,))
-    check("but calls still waiting to go out are", "1 call(s)" in keepawake.work_scheduled(),
-          keepawake.work_scheduled())
-    db.execute("UPDATE call_tasks SET state = 'done' WHERE campaign_id = ?", (cid,))
-    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
-    pinged.clear()
-    check("once the work is done it stops checking in", keeper.check() is False and not pinged)
-    check("and says the server may sleep again", "no longer keeps itself awake" in db.recent_events(1)[0]["message"])
-
-    # The real thread, on a short fuse.
-    pinged.clear()
-    cid = make_campaign(name="Threaded", frequency="daily", call_time="11:00")
-    add_contact(cid, "617-555-0802")
-    fast = keepawake.KeepAwake(interval=0.02, get=fake_get)
-    fast.start()
-    import time as _time
-    _time.sleep(0.3)
-    fast.stop()
-    fast.join(2)
-    check("the background thread keeps checking in on its own", len(pinged) >= 3, str(len(pinged)))
-    check("and stops when the server shuts down", not fast.is_alive())
-    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
-
-    # Wired into the server.
+    # The real thread keeps beating.
     from fastapi.testclient import TestClient
     import server
+    db.set_setting(dispatcher.HEARTBEAT_KEY, "")
     with TestClient(server.app) as client:
+        import time as _time
+        _time.sleep(0.5)
+        beat = db.from_utc(db.get_setting(dispatcher.HEARTBEAT_KEY) or None)
+        check("a running server writes a heartbeat",
+              beat is not None and abs((db.utcnow() - beat).total_seconds()) < 30, str(beat))
         engine = client.get("/api/overview").json()["engine"]
-        check("the dashboard's engine status carries the keep-awake state",
-              engine.get("keep_awake", {}).get("url") == "https://robocaller.example.com", str(engine))
+        check("the dashboard's engine status carries the wake-up and the downtime",
+              "wake_up" in engine and isinstance(engine.get("downtime"), list), str(engine)[:300])
         check("the health check still reveals nothing else", client.get("/healthz").json() == {"ok": True})
-    check("and the server's keep-awake thread stops with it", not server._keepers)
-    db.set_setting("public_base_url", "")
 
 
 def test_call_records() -> None:

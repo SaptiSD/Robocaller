@@ -25,7 +25,7 @@ is Phase 3, and it is a different architecture (see *Roadmap*).
 | **Voice** | **AWS Polly** neural voices through Telnyx, with Telnyx's own engines as the cheaper option | Polly does not sound like a 2005 IVR. |
 | **Script writer** | **Claude** (`anthropic`), optional | Drafts a compliant script from a one-line brief. Everything else works without it. |
 | **Reports** | **ReportLab** | The PDFs in `docs/` are generated from code, so they can be rebuilt. |
-| **Tests** | Two plain Python scripts, no framework | 551 checks against a fake Telnyx. No credentials, no real calls, no cost. |
+| **Tests** | Two plain Python scripts, no framework | 562 checks against a fake Telnyx. No credentials, no real calls, no cost. |
 
 Dependencies are deliberately few: FastAPI, uvicorn, httpx, pydantic and
 python-dotenv, plus `anthropic` and `reportlab` for the two optional pieces.
@@ -46,9 +46,9 @@ Verify the whole engine without touching Telnyx:
 python smoke_test.py && python pressure_test.py
 ```
 
-**551 checks against a fake Telnyx.** No credentials, no real calls, no cost.
+**562 checks against a fake Telnyx.** No credentials, no real calls, no cost.
 
-`smoke_test.py` (322) walks the happy path: phone parsing, timezone resolution,
+`smoke_test.py` (318) walks the happy path: phone parsing, timezone resolution,
 calling windows, schedule arithmetic across a DST change, consent and
 do-not-call screening, pacing, and the HTTP API - plus the operator's controls:
 that Pause holds calls already queued, that removing a contact or withdrawing
@@ -57,9 +57,9 @@ late, that an opt-out stays in the call log, and the callback line. It also
 replays the week in October 2026 when a sleeping server sent one call in five
 days, checking every run now lands as sent or as counted-and-missed, that calls
 meant for voicemail ring long enough to reach it, late wakes on hourly schedules,
-the night the clocks go back, end dates, and the keep-awake check-in.
+the night the clocks go back, end dates, the wake-up job and the downtime record.
 
-`pressure_test.py` (229) tries to break it: eight threads racing the same queue,
+`pressure_test.py` (244) tries to break it: eight threads racing the same queue,
 the exact parameter names sent to Telnyx's TeXML endpoint, every failure that
 strands a first-run account (bad API key, wrong application ID, empty balance,
 missing outbound voice profile), forged and replayed Ed25519 webhook signatures,
@@ -67,7 +67,8 @@ a provider that throws mid-dial, schema drift from an older database, malformed
 phone numbers and times, TeXML injection, and the API's rejection paths - and a
 host that sleeps: random sleep/wake schedules across two DST changes checked
 against an oracle, two servers waking to the same stale campaign, and the
-keep-awake check-in over real HTTP against hung, refusing and wrong addresses.
+wake-up job against hostile addresses that would otherwise land in its SQL (and,
+on Postgres, its wake condition against fifteen fixture cases).
 
 Then check the deployment itself - the real host, database and settings:
 
@@ -76,8 +77,8 @@ python live_check.py https://robocaller.onrender.com --write
 ```
 
 It confirms the dispatcher is ticking, that no active campaign is overdue (the
-sign of a schedule that has quietly stopped firing), that the server is keeping
-itself awake while runs are scheduled, and that every dashboard endpoint loads.
+sign of a schedule that has quietly stopped firing), that the database's
+wake-up job is installed and running, and that every dashboard endpoint loads.
 `--write` also takes a throwaway campaign through create, edit, pause, Run now,
 resume and delete. It cannot ring anyone: its one contact is a fictional
 555-0123 number saved without consent, and it is deleted even if a check fails.
@@ -336,23 +337,36 @@ Two things must be settled before this is on a public URL:
    dispatcher sleeps with it. In October 2026 that cost a daily campaign four
    days of calls: each 11:00 run came due with nobody on the dashboard.
 
-   So the server now keeps itself awake while it has work: whenever a campaign
-   has a run scheduled and someone it could call, or a call is still waiting to
-   go out, `keepawake.py`
-   requests its own public `/healthz` every 5 minutes (Render's own
-   `RENDER_EXTERNAL_URL`, else `PUBLIC_BASE_URL`). That request comes back in
-   through Render's proxy, which is what Render counts as traffic. With nothing
-   scheduled it stops, and the host may sleep again. The dashboard's Engine card
-   shows which it is doing, and Activity reports it if a check-in fails.
+   A first fix had the server request its own public `/healthz` every five
+   minutes. Render let it sleep anyway (Oct 19: the check-ins succeeded, and the
+   11:00 run still went out 36 minutes late), so the wake-up now comes from
+   outside. `wakeup.py` installs a **pg_cron job in the Supabase database**,
+   which runs whether or not Render is awake. Every 5 minutes it checks the same
+   tables the dispatcher reads, and uses pg_net to call `/healthz` only when a
+   run is due within 20 minutes (or overdue), or calls are still waiting to go
+   out or finish. The server is woken before each run, kept up until its calls
+   are done, then left to sleep - so Render's 750 free instance-hours a month
+   are spent around the runs, not around the clock.
 
-   Two costs to know about. Staying up uses Render's free instance hours - 750
-   per workspace per month, which one always-on service fits inside but two do
-   not. And it only works while the server is up: if it is ever down when a run
-   comes due, a run found up to 3 hours late (30 minutes for hourly) still goes
-   out and is flagged; one later than that is skipped, flagged in Activity, and
-   counted on the campaign as missed, rather than calling people at 6pm about an
-   11am message. The fix that removes both is a paid instance (Render Starter,
-   about $7 a month), which never sleeps.
+   ```bash
+   DATABASE_URL=... python wakeup.py install https://robocaller.onrender.com
+   ```
+
+   `status` and `remove` do what they say. The dashboard's Engine card shows the
+   job and when it last woke the server, and turns red if it is missing or
+   failing; `live_check.py` fails if it hasn't run in the last 6 minutes.
+
+   The dispatcher also writes a heartbeat every minute, and each start compares
+   it with the clock: any gap is recorded as **downtime** (the `downtime`
+   table, Activity, and the Engine card). That is how "the server was asleep at
+   11:00" became a fact rather than an inference from a late call.
+
+   If the server is ever down when a run comes due anyway, a run found up to 3
+   hours late (30 minutes for hourly) still goes out and is flagged; one later
+   than that is skipped, flagged in Activity, and counted on the campaign as
+   missed, rather than calling people at 6pm about an 11am message. The fix
+   that removes the sleeping altogether is a paid instance (Render Starter,
+   about $7 a month).
 
    `.github/workflows/keepalive.yml` is an optional outside backup (set a
    repository variable named `KEEPALIVE_URL` to the site's address). On its own
@@ -380,15 +394,15 @@ carry no per-call token and the signature is the only proof they came from Telny
 |---|---|
 | `server.py` | FastAPI — dashboard, JSON API, Telnyx webhooks |
 | `dispatcher.py` | The call engine: materialize → dispatch → sync |
-| `keepawake.py` | Keeps a sleeping host up while calls are scheduled |
+| `wakeup.py` | Installs the database job that wakes a sleeping host before each run |
 | `telephony.py` | Telnyx provider (TeXML), document construction, voices |
 | `compliance.py` | Numbers, area-code timezones, calling windows, script hygiene |
 | `scriptwriter.py` | Claude-backed script drafting (optional) |
 | `db.py` | SQLite persistence |
 | `config.py` | Settings resolution (database over environment) |
 | `web/` | The dashboard — plain HTML/CSS/JS, no build step |
-| `smoke_test.py` | 322 happy-path checks against a fake Telnyx |
-| `pressure_test.py` | 229 adversarial checks - concurrency, Telnyx errors, forged webhooks, a sleeping host |
+| `smoke_test.py` | 318 happy-path checks against a fake Telnyx |
+| `pressure_test.py` | 244 adversarial checks - concurrency, Telnyx errors, forged webhooks, a sleeping host |
 | `live_check.py` | Checks a deployed server end to end, without placing a call |
 | `docs/` | Generated PDF reports and the code that builds them, plus `frequency_check.py` and `capture_screens.py` |
 | `_legacy_streamlit/` | The previous Streamlit prototype, kept for reference |

@@ -1089,91 +1089,88 @@ def test_sleep_and_wake() -> None:
           datetime(2026, 10, 19, 13, 0, tzinfo=timezone.utc), str(dict(row)))
     db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
 
-    test_keep_awake_for_real()
+    test_wake_up_job()
 
 
-def test_keep_awake_for_real() -> None:
-    import keepawake
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+# Fixture rows for the wake-up condition, as (campaigns, contacts, call_tasks,
+# settings) CTEs. Each case says whether the server should be woken. Times are
+# offsets from now in minutes; the CTEs shadow the real tables by name.
+WAKE_CASES = (
+    ("a run due in 10 minutes", [("active", 10, 1)], [], "0", True),
+    ("a run due in 19 minutes", [("active", 19, 1)], [], "0", True),
+    ("a run due in 25 minutes", [("active", 25, 1)], [], "0", False),
+    ("a run already overdue", [("active", -40, 1)], [], "0", True),
+    ("a paused campaign's run", [("paused", 5, 1)], [], "0", False),
+    ("a finished campaign", [("finished", 5, 1)], [], "0", False),
+    ("a campaign with nobody to call", [("active", 5, 0)], [], "0", False),
+    ("a call waiting to go out", [], [("pending", -1, None)], "0", True),
+    ("a call deferred to 15 minutes from now", [], [("deferred", 15, None)], "0", True),
+    ("a call deferred to tomorrow", [], [("deferred", 600, None)], "0", False),
+    ("a call on the line", [], [("dialing", -3, None)], "0", True),
+    ("a finished call", [], [("done", -3, None)], "0", False),
+    ("a held call in a paused campaign", [("paused", 999, 1)], [("pending", -1, 1)], "0", False),
+    ("a run due, but calling paused", [("active", 5, 1)], [], "1", False),
+    ("nothing at all", [], [], "0", False),
+)
 
-    section("keeping the host awake, over real HTTP")
-    hits: list[tuple[str, str]] = []
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 - the stdlib's name
-            hits.append((self.path, self.headers.get("User-Agent", "")))
-            if self.path == "/slow/healthz":
-                threading.Event().wait(2)
-            code = 200 if self.path.endswith("/healthz") else 404
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok": true}')
+def wake_case_sql(condition: str, campaigns, tasks, paused: str) -> str:
+    def stamp(minutes: int) -> str:
+        return (f"to_char(now() AT TIME ZONE 'UTC' + interval '{minutes} minutes', "
+                "'YYYY-MM-DD HH24:MI:SS')")
+    camp_rows = [f"({i + 1}, '{state}', {stamp(due)})" for i, (state, due, _) in enumerate(campaigns)]
+    contact_rows = [f"({i + 1})" for i, (_, _, n) in enumerate(campaigns) for _ in range(n)]
+    task_rows = [f"('{state}', {stamp(due)}, {cid if cid else 'NULL'}::int)" for state, due, cid in tasks]
+    def cte(name, cols, rows, empty):
+        body = f"VALUES {', '.join(rows)}" if rows else f"SELECT {empty} WHERE false"
+        return f"{name}({cols}) AS ({body})"
+    return ("WITH " + ", ".join([
+        cte("campaigns", "id, state, next_run_at", camp_rows, "0, ''::text, ''::text"),
+        cte("contacts", "campaign_id", contact_rows, "0"),
+        cte("call_tasks", "state, scheduled_for, campaign_id", task_rows, "''::text, ''::text, 0"),
+        f"settings(key, value) AS (VALUES ('dispatch_paused', '{paused}'))",
+    ]) + f" SELECT ({condition}) AS wake")
 
-        def log_message(self, *args):
-            pass
 
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{srv.server_address[1]}"
-    try:
-        check("a real check-in gets a real answer", keepawake._get(f"{base}/healthz") == (True, ""))
-        check("and says who is asking", hits and hits[-1][1] == "RoboCallAI-keepawake", str(hits[-1:]))
-        check("a wrong address is a failure, not a success",
-              keepawake._get(f"{base}/nope") == (False, "HTTP 404"))
-        saved = keepawake.TIMEOUT
-        keepawake.TIMEOUT = 0.3
-        ok, error = keepawake._get(f"{base}/slow/healthz")
-        keepawake.TIMEOUT = saved
-        check("a host that hangs times out instead of stalling the thread",
-              not ok and "Timeout" in error, error)
-        srv_closed = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        dead = f"http://127.0.0.1:{srv_closed.server_address[1]}"
-        srv_closed.server_close()
-        ok, error = keepawake._get(f"{dead}/healthz")
-        check("a host that refuses the connection is reported, not raised", not ok and error, error)
+def test_wake_up_job() -> None:
+    import wakeup
 
-        # The whole check, end to end, against a live socket.
-        cid = fresh_campaign(frequency="daily", call_time="11:00")
-        real_url = keepawake.own_url
-        keepawake.own_url = lambda: base  # the real one refuses loopback, rightly
-        try:
-            hits.clear()
-            keeper = keepawake.KeepAwake()
-            check("with a run scheduled, a full check reaches the server's own /healthz",
-                  keeper.check() and hits and hits[-1][0] == "/healthz", str(hits))
-        finally:
-            keepawake.own_url = real_url
-        db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
-    finally:
-        srv.shutdown()
-        srv.server_close()
-
-    section("keep-awake against hostile settings")
+    section("the wake-up job, against hostile settings")
     for value in ("javascript:alert(1)", "ftp://example.com", "https://", "http://0.0.0.0:8000",
-                  "http://[::1]:8000", "   ", "not a url", "http://127.0.0.1"):
+                  "http://[::1]:8000", "   ", "not a url", "http://127.0.0.1",
+                  "https://evil.example.com/'); DROP TABLE campaigns; --",
+                  "https://x.example.com/$$; SELECT 1; $$", "https://user:pass@x.example.com",
+                  "https://x.example.com/?q=1", "https://x.example.com/#frag",
+                  "https://x.example.com/a b"):
         db.set_setting("public_base_url", value)
-        check(f"{value!r} is never treated as an address to call", keepawake.own_url() == "",
-              keepawake.own_url())
+        check(f"{value!r} never becomes an address the database calls",
+              wakeup.own_url() == "" and wakeup.clean_url(value) == "", wakeup.own_url())
+        try:
+            wakeup.job_sql(value)
+            check(f"and {value!r} can't be written into the job's SQL", False)
+        except ValueError:
+            check(f"and {value!r} can't be written into the job's SQL", True)
     db.set_setting("public_base_url", "")
+    try:
+        wakeup.job_sql("https://x.example.com", "public; DROP TABLE campaigns")
+        check("a schema name can't smuggle SQL either", False)
+    except ValueError:
+        check("a schema name can't smuggle SQL either", True)
+    check("an address with a port and path is kept as given",
+          wakeup.clean_url("https://x.example.com:8443/app/") == "https://x.example.com:8443/app")
 
-    cid = fresh_campaign(frequency="daily", call_time="11:00")
-    db.set_setting("public_base_url", "https://robocaller.example.com")
-
-    def explode(url: str):
-        raise RuntimeError("the network stack fell over")
-
-    keeper = keepawake.KeepAwake(interval=0.02, get=explode)
-    keeper.start()
-    threading.Event().wait(0.25)
-    alive = keeper.is_alive()
-    keeper.stop()
-    keeper.join(2)
-    check("a check-in that throws doesn't kill the keep-awake thread",
-          alive and "fell over" in keeper.last_error, keeper.last_error)
-    db.set_setting("public_base_url", "")
-    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
-
+    if not db.IS_PG:
+        print("  skip the wake condition on real Postgres (set ROBOCALL_TEST_DATABASE_URL)")
+        return
+    section("the wake-up condition, on Postgres")
+    condition = wakeup.wake_condition(None)
+    wrong = []
+    for label, campaigns, tasks, paused, expected in WAKE_CASES:
+        got = db.query_one(wake_case_sql(condition, campaigns, tasks, paused))["wake"]
+        if got is not expected:
+            wrong.append(f"{label}: woke={got}, expected {expected}")
+    check(f"all {len(WAKE_CASES)} cases wake the server exactly when they should",
+          not wrong, "; ".join(wrong))
 
 def main() -> int:
     print(f"scratch database: {db.DB_PATH}")

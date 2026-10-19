@@ -82,13 +82,27 @@ def read_only(client: httpx.Client) -> None:
     if engine.get("paused"):
         warn("calling is paused - nothing will be dialled until it's resumed")
 
-    keep = engine.get("keep_awake")
-    if not check("the deployed build reports keep-awake (the Oct 19 fix is live)", isinstance(keep, dict), str(keep)):
-        keep = {}
-    if keep.get("url"):
-        check("keep-awake knows its own public address", keep["url"].startswith("https://"), keep["url"])
+    wake = engine.get("wake_up")
+    if not check("the deployed build reports its wake-up job", isinstance(wake, dict), str(wake)):
+        wake = {}
+    if wake.get("needed"):
+        # The server sleeps between runs on purpose now; what matters is that the
+        # database is there to wake it, and has been running its check.
+        if check("the database's wake-up job is installed and switched on",
+                 wake.get("installed") and wake.get("active"), str(wake)):
+            check("it calls this server", wake.get("url", "").rstrip("/") == str(client.base_url).rstrip("/"),
+                  f"{wake.get('url')} vs {client.base_url}")
+            last_run = utc(wake.get("last_run"))
+            check("and it ran in the last 6 minutes, successfully",
+                  last_run is not None and now - last_run < timedelta(minutes=6)
+                  and wake.get("last_run_status") == "succeeded",
+                  f"{wake.get('last_run')} {wake.get('last_run_status')} {wake.get('last_run_message', '')}")
+            if wake.get("last_call_status") not in (None, 200):
+                warn(f"its last wake-up call didn't get a 200: {wake.get('last_call_error') or wake.get('last_call_status')}")
     else:
-        warn("no public address, so the server can't keep itself awake - fine on a host that never sleeps")
+        warn("no public address, so nothing needs waking - fine on a host that never sleeps")
+    downtime = engine.get("downtime")
+    check("downtime is being recorded", isinstance(downtime, list), str(downtime))
 
     section("campaigns")
     res = client.get("/api/campaigns")
@@ -105,18 +119,12 @@ def read_only(client: httpx.Client) -> None:
     overdue = [f"{c['name']} (due {c['next_run_at']} UTC)" for c in active
                if utc(c["next_run_at"]) < now - timedelta(minutes=2)]
     check("no active campaign is overdue - the schedule is being worked", not overdue, "; ".join(overdue))
-    # Keep-awake only holds the server up for a campaign with somebody it could call.
-    callable_ = [c for c in active if c["contacts"] and (c["consented"] or not c["require_consent"])]
-    if callable_ and not engine.get("paused"):
-        check("with runs scheduled, keep-awake is holding the server up",
-              bool(keep.get("holding")) or not keep.get("url"), str(keep))
-        check("and its check-ins aren't failing", not keep.get("last_error"), keep.get("last_error", ""))
-        started = utc(engine.get("started_at"))
-        if started and now - started > timedelta(minutes=keep.get("every_minutes", 5) + 1):
-            last_ok = utc(keep.get("last_ok"))
-            check("and the last check-in was recent", last_ok is not None
-                  and now - last_ok < timedelta(minutes=keep.get("every_minutes", 5) * 2 + 1),
-                  str(keep.get("last_ok")))
+    # Sleeping between runs is expected; what downtime is for is spotting a run
+    # that came due inside a spell. Those show up as late or missed runs.
+    if downtime:
+        last = downtime[0]
+        print(f"       (last down {last['down_from']} to {last['down_until']} UTC, "
+              f"{last['seconds'] // 60} min; {len(downtime)} spell(s) this week)")
     for c in campaigns:
         if c.get("missed_runs"):
             warn(f"'{c['name']}' has missed {c['missed_runs']} scheduled run(s) - see Activity")
@@ -144,7 +152,7 @@ def read_only(client: httpx.Client) -> None:
     script = client.get("/app.js")
     check("the dashboard page and its script are served",
           page.status_code == 200 and script.status_code == 200 and client.get("/styles.css").status_code == 200)
-    check("the served script is the current build", "keepAwakeText" in script.text and "missedText" in script.text)
+    check("the served script is the current build", "wakeUpText" in script.text and "downtimeText" in script.text)
 
 
 def round_trip(client: httpx.Client) -> None:

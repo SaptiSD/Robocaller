@@ -9,8 +9,8 @@
 # https://your-app.onrender.com. It is a variable rather than written here
 # because this repository is public and the dashboard has no sign-in yet.
 #
-# This is now only a backup. The server keeps itself awake while a campaign has
-# a run scheduled (keepawake.py), and GitHub alone was never enough: it ran this
+# This is now only a backup. The Supabase database wakes the server before each
+# scheduled run (wakeup.py), and GitHub alone was never enough: it ran this
 # 10-minute schedule about once every three hours. A paid Render instance never
 # sleeps.
 name: Keep the server awake
