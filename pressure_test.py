@@ -983,6 +983,10 @@ def test_sleep_and_wake() -> None:
         {"frequency": "daily", "call_time": "09:30", "timezone": "Europe/London"},
         {"frequency": "daily", "call_time": "23:45", "timezone": "America/Los_Angeles"},
         {"frequency": "weekly", "call_time": "10:00", "weekday": 2, "timezone": "America/New_York"},
+        # Hourly has the shortest grace, so a late wake decides most often whether
+        # a slot is sent or missed - and it used to drift off the hour as well.
+        {"frequency": "hourly", "timezone": "America/New_York"},
+        {"frequency": "daily", "call_time": "01:30", "timezone": "America/Chicago"},  # repeats Nov 1
     )
     trials = 2 if db.IS_PG else 8
     wrong: list[str] = []

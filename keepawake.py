@@ -35,6 +35,9 @@ log = logging.getLogger("robocall.keepawake")
 
 # Comfortably inside Render's 15 idle minutes, with room for one failed check-in.
 INTERVAL_SECONDS = 5 * 60
+# After a failed check-in, try again this soon rather than a full interval later:
+# two misses five minutes apart would already be most of the way to fifteen.
+RETRY_SECONDS = 60
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
@@ -58,11 +61,17 @@ def own_url() -> str:
 def work_scheduled() -> str:
     """Why the server has to stay up right now, in words, or "" when it needn't."""
     # Paused means nothing is dialled; resuming happens from the dashboard, and
-    # opening the dashboard wakes the server anyway.
-    if config.get("dispatch_paused") == "1":
+    # opening the dashboard wakes the server anyway. The same goes for a server
+    # with no Telnyx credentials, which can't dial whatever is queued.
+    if config.get("dispatch_paused") == "1" or config.telephony() is None:
         return ""
+    # Only a campaign with somebody it could call: an empty list, or one where
+    # consent is required and nobody has given it, would hold the host up around
+    # the clock for runs that dial no one.
     campaign = db.query_one(
-        "SELECT name FROM campaigns WHERE state = 'active' AND next_run_at IS NOT NULL "
+        "SELECT name FROM campaigns c WHERE state = 'active' AND next_run_at IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM contacts ct WHERE ct.campaign_id = c.id "
+        "AND (c.require_consent = 0 OR ct.consent = 1)) "
         "ORDER BY next_run_at LIMIT 1")
     if campaign:
         return f"campaign '{campaign['name']}' has a run scheduled"
@@ -73,6 +82,14 @@ def work_scheduled() -> str:
     if waiting:
         return f"{waiting} call(s) still to go out or finish"
     return ""
+
+
+def _note(message: str, level: str = "info") -> None:
+    """Activity, best effort: a database that can't take the note mustn't stop a check-in."""
+    try:
+        db.log_event(message, level)
+    except Exception:  # noqa: BLE001
+        log.warning("couldn't record in Activity: %s", message)
 
 
 def _get(url: str) -> tuple[bool, str]:
@@ -88,11 +105,14 @@ def _get(url: str) -> tuple[bool, str]:
 
 class KeepAwake(threading.Thread):
     def __init__(self, interval: float = INTERVAL_SECONDS,
-                 get: Callable[[str], tuple[bool, str]] = _get) -> None:
+                 get: Callable[[str], tuple[bool, str]] = _get,
+                 retry: float = RETRY_SECONDS) -> None:
         super().__init__(name="keepawake", daemon=True)
         self._stop = threading.Event()
         self.interval = interval
+        self.retry = min(retry, interval)
         self._get = get
+        self.url = ""
         self.reason = ""
         self.last_ok: datetime | None = None
         self.last_error = ""
@@ -100,12 +120,19 @@ class KeepAwake(threading.Thread):
     def run(self) -> None:
         # The first check waits a full interval: whatever started the server -
         # a deploy, or a visitor waking it - has already bought it 15 minutes.
-        while not self._stop.wait(self.interval):
+        wait = self.interval
+        while not self._stop.wait(wait):
             try:
-                self.check()
-            except Exception as exc:  # noqa: BLE001 - must outlive a database blip
-                self.last_error = str(exc)
+                ok = self.check()
+            except Exception as exc:  # noqa: BLE001 - must outlive anything
+                self.last_error = str(exc) or type(exc).__name__
                 log.exception("keep-awake check failed")
+                ok = False
+            wait = self.next_wait(ok)
+
+    def next_wait(self, ok: bool) -> float:
+        """Seconds until the next check: sooner while holding the server up and failing."""
+        return self.retry if self.reason and not ok else self.interval
 
     def stop(self) -> None:
         self._stop.set()
@@ -117,29 +144,38 @@ class KeepAwake(threading.Thread):
         change - starting to hold the server up, letting go, losing contact -
         and not about every five-minute check-in.
         """
-        url = own_url()
-        reason = work_scheduled() if url else ""
+        try:
+            url = own_url()
+            reason = work_scheduled() if url else ""
+        except Exception as exc:  # noqa: BLE001
+            # The database is unreachable. That is no reason to let the host
+            # sleep: when the database came back there would be nothing awake to
+            # notice, which is exactly how scheduled runs went missing. Keep doing
+            # whatever the last answer said.
+            if not (self.url and self.reason):
+                raise
+            log.warning("keep-awake couldn't check for scheduled work (%s); checking in anyway", exc)
+            url, reason = self.url, self.reason
         if reason and not self.reason:
-            db.log_event(f"Keeping the server awake: {reason}. It checks in with itself every "
-                         f"{INTERVAL_SECONDS // 60} minutes so the host doesn't put it to sleep.")
+            _note(f"Keeping the server awake: {reason}. It checks in with itself every "
+                  f"{INTERVAL_SECONDS // 60} minutes so the host doesn't put it to sleep.")
         elif self.reason and not reason:
-            db.log_event("Nothing left to call, so the server no longer keeps itself awake. "
-                         "Opening the dashboard wakes it.")
-        self.reason = reason
+            _note("Nothing left to call, so the server no longer keeps itself awake. "
+                  "Opening the dashboard wakes it.")
+        self.url, self.reason = url, reason
         if not reason:
             return False
 
         ok, error = self._get(f"{url}/healthz")
         if ok:
             if self.last_error:
-                db.log_event(f"The server is reaching itself at {url} again.")
+                _note(f"The server is reaching itself at {url} again.")
             self.last_ok, self.last_error = db.utcnow(), ""
             return True
         if not self.last_error:
-            db.log_event(
-                f"The server couldn't reach itself at {url} to stay awake ({error}). If the "
-                "host puts it to sleep, scheduled calls won't go out until someone opens the "
-                "dashboard.", "error")
+            _note(f"The server couldn't reach itself at {url} to stay awake ({error}). If the "
+                  "host puts it to sleep, scheduled calls won't go out until someone opens the "
+                  "dashboard.", "error")
         log.warning("keep-awake check-in to %s failed: %s", url, error)
         self.last_error = error or "no answer"
         return False

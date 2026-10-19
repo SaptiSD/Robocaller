@@ -1453,8 +1453,123 @@ def test_sleeping_server() -> None:
     check("and counts the ten before it as missed", h["missed_runs"] == 10, str(dict(h)))
     db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (hourly,))
 
+    test_schedule_edges()
     test_ring_floor(fake)
     test_keep_awake()
+
+
+def test_schedule_edges() -> None:
+    print("\nlate wakes, clock changes and end dates")
+
+    def campaign(name: str, next_run: str, **fields) -> int:
+        cid = make_campaign(name=name, **fields)
+        db.execute("UPDATE campaigns SET next_run_at = ? WHERE id = ?", (next_run, cid))
+        add_contact(cid, f"617-555-{900 + cid % 100:04d}")
+        return cid
+
+    def row(cid: int) -> dict:
+        return db.query_one("SELECT * FROM campaigns WHERE id = ?", (cid,))
+
+    def calls(cid: int) -> int:
+        return db.query_one("SELECT COUNT(*) AS n FROM call_tasks WHERE campaign_id = ?", (cid,))["n"]
+
+    def settle(cid: int) -> None:
+        db.execute("UPDATE call_tasks SET state = 'done' WHERE campaign_id = ?", (cid,))
+
+    # Hourly, woken late: the next run stays on the hour.
+    cid = campaign("Hourly, 25 min late", "2026-10-20 10:00:00", frequency="hourly")
+    dispatcher.materialize_due_campaigns(_utc(2026, 10, 20, 10, 25))
+    check("an hourly run picked up 25 minutes late goes out", calls(cid) == 1)
+    check("and the next is still 11:00, not 11:25", row(cid)["next_run_at"] == "2026-10-20 11:00:00",
+          row(cid)["next_run_at"])
+    cid = campaign("Hourly, 45 min late", "2026-10-20 10:00:00", frequency="hourly")
+    dispatcher.materialize_due_campaigns(_utc(2026, 10, 20, 10, 45))
+    check("one picked up 45 minutes late is missed, and the next is still 11:00",
+          calls(cid) == 0 and row(cid)["missed_runs"] == 1
+          and row(cid)["next_run_at"] == "2026-10-20 11:00:00", str(dict(row(cid))))
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE name LIKE 'Hourly, __ min late'")
+
+    # Hourly, awake, ticks landing a few seconds after each hour: no drift.
+    cid = campaign("Hourly, two days", "2026-10-21 00:00:00", frequency="hourly")
+    tick, fired = _utc(2026, 10, 21, 0, 0, 3), []
+    while tick < _utc(2026, 10, 23):
+        before = row(cid)["runs"]
+        dispatcher.materialize_due_campaigns(tick)
+        if row(cid)["runs"] > before:
+            fired.append(tick)
+            settle(cid)
+        tick += timedelta(seconds=37)
+    check("an hourly campaign over two days runs 48 times",
+          len(fired) == 48, str(len(fired)))
+    check("every one within a tick of the hour - the schedule doesn't creep",
+          all(f.minute == 0 and f.second < 40 for f in fired), str([f.time() for f in fired[-3:]]))
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
+
+    # The night the clocks go back, 01:30 happens twice.
+    cid = campaign("Chicago 01:30", "2026-11-01 06:30:00", frequency="daily", call_time="01:30",
+                   timezone="America/Chicago")
+    dispatcher.materialize_due_campaigns(_utc(2026, 11, 1, 7, 10))  # 01:10 CST, the second time round
+    settle(cid)
+    dispatcher.materialize_due_campaigns(_utc(2026, 11, 1, 7, 30))  # 01:30 CST
+    check("the night the clocks go back, a 01:30 campaign woken in the repeated hour runs once",
+          calls(cid) == 1 and row(cid)["runs"] == 1, str(dict(row(cid))))
+    check("and next runs at 01:30 the following night",
+          row(cid)["next_run_at"] == "2026-11-02 07:30:00", row(cid)["next_run_at"])
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
+    cid = campaign("London 01:30", "2026-10-25 00:30:00", frequency="daily", call_time="01:30",
+                   timezone="Europe/London")
+    dispatcher.materialize_due_campaigns(_utc(2026, 10, 25, 1, 10))
+    settle(cid)
+    dispatcher.materialize_due_campaigns(_utc(2026, 10, 25, 1, 30))
+    check("so does London's, a week earlier", calls(cid) == 1, str(dict(row(cid))))
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
+
+    # The end date: exclusive, and never called past.
+    cid = campaign("Ends on a slot", "2026-10-30 16:00:00", frequency="daily", call_time="11:00",
+                   timezone="America/Chicago")
+    db.execute("UPDATE campaigns SET ends_at = ? WHERE id = ?", ("2026-10-31 16:00:00", cid))
+    dispatcher.materialize_due_campaigns(_utc(2026, 10, 30, 16, 0, 3))
+    check("a run landing exactly on the end isn't promised - the one before it is the last",
+          calls(cid) == 1 and row(cid)["state"] == "finished" and row(cid)["next_run_at"] is None,
+          str(dict(row(cid))))
+
+    cid = campaign("Slept past its end", "2026-10-30 16:00:00", frequency="daily", call_time="11:00",
+                   timezone="America/Chicago")
+    db.execute("UPDATE campaigns SET ends_at = ? WHERE id = ?", ("2026-10-31 18:00:00", cid))
+    dispatcher.materialize_due_campaigns(_utc(2026, 11, 2, 9, 0))
+    r = row(cid)
+    check("a campaign that ended while the server slept is retired without calling anyone",
+          calls(cid) == 0 and r["state"] == "finished", str(dict(r)))
+    check("and its two unmade runs are counted", r["missed_runs"] == 2, str(r["missed_runs"]))
+    check("and named in Activity", "missed its 2 runs" in db.recent_events(1)[0]["message"],
+          db.recent_events(1)[0]["message"])
+
+    cid = campaign("Woken just after its end", "2026-10-31 16:00:00", frequency="daily",
+                   call_time="11:00", timezone="America/Chicago")
+    db.execute("UPDATE campaigns SET ends_at = ? WHERE id = ?", ("2026-10-31 17:00:00", cid))
+    dispatcher.materialize_due_campaigns(_utc(2026, 10, 31, 17, 30))
+    check("a run still inside its grace period isn't sent once the campaign has ended",
+          calls(cid) == 0 and row(cid)["missed_runs"] == 1 and row(cid)["state"] == "finished",
+          str(dict(row(cid))))
+
+    from fastapi.testclient import TestClient
+    import server
+    res = TestClient(server.app).post("/api/campaigns", json={
+        "name": "Only slot is the end", "message": "Hello.", "frequency": "daily",
+        "call_time": "11:00", "timezone": "America/Chicago",
+        "starts_at": "2099-03-02 10:00", "ends_at": "2099-03-02 11:00"})
+    check("a campaign whose only slot is its end time is refused, not saved to never run",
+          res.status_code == 400, res.text[:160])
+
+    # A schedule stale past the walk's limit says so, rather than a wrong date.
+    cid = campaign("Stale since 2020", "2020-01-01 00:00:00", frequency="hourly")
+    dispatcher.materialize_due_campaigns(_utc(2026, 10, 19, 13, 0))
+    event = db.recent_events(1)[0]["message"]
+    check("a schedule six years stale reports 'more than 10,000' missed runs",
+          "more than 10,000" in event and calls(cid) == 0, event)
+    check("and moves on to the next hour",
+          row(cid)["next_run_at"] == "2026-10-19 14:00:00", row(cid)["next_run_at"])
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
 
 
 def test_ring_floor(fake) -> None:
@@ -1473,7 +1588,8 @@ def test_ring_floor(fake) -> None:
 
     check("a message that waits for the beep rings at least 45s", ring_on("voicemail") == 45)
     check("'hang up on voicemail' keeps the setting - it doesn't want one", ring_on("live_only") == 30)
-    check("so does detection off", ring_on("off") == 30)
+    check("so does one that starts talking straight away - it may still reach voicemail",
+          ring_on("off") == 45)
     db.set_setting("ring_seconds", "70")
     check("a longer setting is never shortened", ring_on("voicemail") == 70)
     db.set_setting("ring_seconds", "30")
@@ -1484,6 +1600,7 @@ def test_ring_floor(fake) -> None:
           fake.placed and fake.placed[-1]["ring"] == 30)
     check("the AI agent, which leaves voicemails by ear, gets the floor too",
           dispatcher.ring_for(30, "agent", "off") == 45)
+    check("but not on a test call", dispatcher.ring_for(30, "agent", "off", test=True) == 30)
     db.set_setting("ring_seconds", "")
 
     from fastapi.testclient import TestClient
@@ -1551,6 +1668,51 @@ def test_keep_awake() -> None:
     check("and recovery is reported too", "again" in db.recent_events(1)[0]["message"]
           and keeper.status()["last_error"] == "")
 
+    check("a failed check-in is retried within a minute, not five",
+          keeper.next_wait(False) == keepawake.RETRY_SECONDS == 60)
+    check("a good one waits the full five", keeper.next_wait(True) == keepawake.INTERVAL_SECONDS)
+
+    # The database going away must not stop the check-ins: if the host slept
+    # through the outage, nothing would be awake to notice it had ended.
+    real_scheduled = keepawake.work_scheduled
+
+    def outage() -> str:
+        raise RuntimeError("could not connect to the database")
+
+    keepawake.work_scheduled = outage
+    pinged.clear()
+    try:
+        check("while the database is down it keeps checking in", keeper.check() and len(pinged) == 1,
+              str(pinged))
+    finally:
+        keepawake.work_scheduled = real_scheduled
+    cold = keepawake.KeepAwake(get=fake_get)
+    keepawake.work_scheduled = outage
+    try:
+        cold.check()
+        check("but a server that never knew of any work doesn't invent some", False)
+    except RuntimeError:
+        check("but a server that never knew of any work doesn't invent some", True)
+    finally:
+        keepawake.work_scheduled = real_scheduled
+
+    # Work it can never do is no reason to stay up.
+    empty = make_campaign(name="No contacts yet", frequency="daily", call_time="11:00")
+    db.execute("UPDATE campaigns SET state = 'paused' WHERE id = ?", (cid,))
+    check("a campaign with nobody on its list doesn't hold the server up",
+          keepawake.work_scheduled() == "", keepawake.work_scheduled())
+    add_contact(empty, "617-555-0803", consent=0)
+    check("nor one whose only contacts haven't consented", keepawake.work_scheduled() == "",
+          keepawake.work_scheduled())
+    db.execute("UPDATE campaigns SET require_consent = 0 WHERE id = ?", (empty,))
+    check("unless it doesn't require consent", "No contacts yet" in keepawake.work_scheduled())
+    real_phone = config.telephony
+    config.telephony = lambda: None  # type: ignore[assignment]
+    check("and nothing holds it up while Telnyx isn't set up to dial", keepawake.work_scheduled() == "")
+    config.telephony = real_phone  # type: ignore[assignment]
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (empty,))
+    db.execute("UPDATE campaigns SET state = 'active' WHERE id = ?", (cid,))
+
     db.set_setting("dispatch_paused", "1")
     check("while calling is paused there is nothing to stay up for", keepawake.work_scheduled() == "")
     db.set_setting("dispatch_paused", "0")
@@ -1571,6 +1733,7 @@ def test_keep_awake() -> None:
     # The real thread, on a short fuse.
     pinged.clear()
     cid = make_campaign(name="Threaded", frequency="daily", call_time="11:00")
+    add_contact(cid, "617-555-0802")
     fast = keepawake.KeepAwake(interval=0.02, get=fake_get)
     fast.start()
     import time as _time

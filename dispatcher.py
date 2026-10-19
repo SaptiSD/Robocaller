@@ -50,7 +50,7 @@ AGENT_RETRY = timedelta(minutes=5)
 # however late - there is no next slot to wait for.
 MISSED_RUN_GRACE = {"hourly": timedelta(minutes=30), "daily": timedelta(hours=3),
                     "weekly": timedelta(hours=3)}
-# A call meant to leave a voicemail must ring long enough for one to answer.
+# A campaign call that could leave a voicemail must ring long enough for one to answer.
 # Carriers send an unanswered call to voicemail after 20-35 seconds of ringing,
 # and Telnyx's ring timeout also counts the few seconds before the first ring.
 # At 30 a real campaign call rang out at 30.0s and was cancelled moments before
@@ -106,13 +106,16 @@ def compute_next_run(campaign: dict, after: datetime) -> datetime | None:
     own timezone, so a 10:00 campaign stays at 10:00 across a DST change.
 
     Returns None when there is no next run, which is what retires a campaign:
-    either it was a one-off, or the next occurrence would fall past `ends_at`.
+    either it was a one-off, or the next occurrence would land at or past
+    `ends_at`. The end is exclusive - "daily for 7 days" is 7 runs - and it has
+    to be here, not just in the retire sweep: a slot exactly on the end used to
+    show as the next run on the dashboard and then never go out.
     """
     candidate = _raw_next_run(campaign, after)
     if candidate is None:
         return None
     ends_at = db.from_utc(campaign.get("ends_at"))
-    if ends_at and candidate > ends_at:
+    if ends_at and candidate >= ends_at:
         return None
     return candidate
 
@@ -183,7 +186,7 @@ def first_run_at(campaign: dict, start_now: bool, now: datetime) -> datetime | N
     else:
         first = _raw_next_run(campaign, anchor, inclusive=on_the_mark) or anchor
 
-    if ends_at and first > ends_at:
+    if ends_at and first >= ends_at:
         return None
     return first
 
@@ -307,6 +310,20 @@ def materialize_due_campaigns(now: datetime | None = None) -> int:
     # can be edited after the fact, so this cannot be left to compute_next_run
     # alone - a campaign whose window was shortened still has a next_run_at
     # sitting in the table, and without this sweep it would fire once more.
+    #
+    # A campaign whose end passed while the server was asleep still has runs it
+    # never made. They are counted as missed on the way out - not sent after the
+    # end - and the WHERE pins the slot read, so two servers count them once.
+    for ended in db.query(
+            "SELECT * FROM campaigns WHERE state = 'active' AND ends_at IS NOT NULL "
+            "AND ends_at <= ? AND next_run_at IS NOT NULL AND next_run_at < ends_at", (stamp,)):
+        slots = _slots_before_end(ended)
+        retired = db.execute(
+            "UPDATE campaigns SET state = 'finished', next_run_at = NULL, "
+            "missed_runs = missed_runs + ? WHERE id = ? AND state = 'active' AND next_run_at = ?",
+            (len(slots), ended["id"], ended["next_run_at"]))
+        if retired == 1 and slots:
+            _log_missed(ended, slots, now)
     db.execute(
         "UPDATE campaigns SET state = 'finished', next_run_at = NULL "
         "WHERE state = 'active' AND ends_at IS NOT NULL AND ends_at <= ?",
@@ -346,7 +363,13 @@ def materialize_due_campaigns(now: datetime | None = None) -> int:
         missed = late > MISSED_RUN_GRACE.get(frequency, timedelta.max)
         if missed:
             passed.append(due_at)
-        next_run = compute_next_run(campaign, now)
+        # Roll on from the slot being settled, not from now. From now, an hourly
+        # 10:00 run picked up at 10:25 moved the next one to 11:25 and 11:00 was
+        # never made, and a daily run in the hour that repeats when the clocks go
+        # back came round a second time that same night.
+        next_run = compute_next_run(campaign, due_at)
+        if next_run is not None and next_run <= now:
+            next_run = compute_next_run(campaign, now)  # the walk stopped at its cap
         # Roll the schedule forward BEFORE queueing, and only if no one else has
         # (the WHERE pins the slot we read). Two servers on one database - a
         # deploy overlapping the old instance, or a laptop pointed at production
@@ -404,8 +427,26 @@ def latest_due_slot(campaign: dict, now: datetime) -> tuple[datetime, list[datet
     return slot, passed
 
 
+def _slots_before_end(campaign: dict) -> list[datetime]:
+    """Every run from the stored next one up to (not including) the campaign's end."""
+    slot = db.from_utc(campaign.get("next_run_at"))
+    slots: list[datetime] = []
+    while slot is not None and len(slots) <= _MAX_SLOTS_WALKED:
+        slots.append(slot)
+        slot = compute_next_run(campaign, slot)
+    return slots
+
+
 def _log_missed(campaign: dict, slots: list[datetime], now: datetime) -> None:
     tz = campaign.get("timezone")
+    if len(slots) > _MAX_SLOTS_WALKED:
+        # The walk gave up before reaching the present, so the last slot it
+        # reached says nothing about how late anything is.
+        db.log_event(
+            f"Campaign '{campaign['name']}' missed more than {_MAX_SLOTS_WALKED:,} runs since "
+            f"{_local_slot(slots[0], tz)} - nothing was running to make them. Its schedule "
+            "has been moved on to the next run.", "error")
+        return
     if len(slots) == 1:
         what = f"its {_local_slot(slots[0], tz)} run"
     else:
@@ -576,7 +617,7 @@ def dispatch_pending(
         amd = default_amd if test else (task["amd"] or default_amd)
         if not phone.supports(amd):
             amd = default_amd
-        ring = ring_for(ring_seconds, mode, amd)
+        ring = ring_for(ring_seconds, mode, amd, test)
 
         try:
             if mode == "agent":
@@ -646,17 +687,18 @@ def dispatch_pending(
     return placed
 
 
-def ring_for(ring_seconds: int, mode: str, amd: str) -> int:
+def ring_for(ring_seconds: int, mode: str, amd: str, test: bool = False) -> int:
     """How long to let a call ring before giving up on it.
 
-    The Ring-for setting, raised to VOICEMAIL_RING_SECONDS for any call whose job
-    includes leaving a voicemail: a recorded message waiting for the beep, or the
-    AI agent, which leaves one by ear. "Hang up on voicemail" and plain "off"
-    calls keep the setting as it is.
+    The Ring-for setting, raised to VOICEMAIL_RING_SECONDS for any campaign call
+    that would be glad of a voicemail: a recorded message waiting for the beep or
+    starting straight away, and the AI agent, which leaves one by ear. Two keep
+    the setting as it is: "hang up on voicemail", which doesn't want one, and a
+    test call, where the operator is holding the phone.
     """
-    if mode == "agent" or amd == "voicemail":
-        return max(ring_seconds, VOICEMAIL_RING_SECONDS)
-    return ring_seconds
+    if test or (mode != "agent" and amd == "live_only"):
+        return ring_seconds
+    return max(ring_seconds, VOICEMAIL_RING_SECONDS)
 
 
 def _line_full(error: str) -> bool:

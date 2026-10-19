@@ -34,9 +34,14 @@ os.environ["ROBOCALL_DB"] = str(_tmp / "freq.db")
 for _leak in (
     "TELNYX_API_KEY", "TELNYX_TEXML_APP_ID", "TELNYX_FROM_NUMBER",
     "TELNYX_PUBLIC_KEY", "TEST_DESTINATION_NUMBER", "PUBLIC_BASE_URL",
-    "ANTHROPIC_API_KEY", "BUSINESS_NAME", "CALLBACK_NUMBER",
+    "ANTHROPIC_API_KEY", "BUSINESS_NAME", "CALLBACK_NUMBER", "RENDER_EXTERNAL_URL",
 ):
     os.environ[_leak] = ""
+# And never the hosted database. This dispatches and settles every queued call it
+# finds, so run from a shell where DATABASE_URL points at production it would
+# mark real calls in progress as finished and leave its scenarios in the live
+# campaign list. The SQLite file above is the only database it should touch.
+os.environ["DATABASE_URL"] = ""
 
 import config  # noqa: E402
 import db  # noqa: E402
