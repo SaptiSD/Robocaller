@@ -33,6 +33,9 @@ for _leak in (
     "ANTHROPIC_API_KEY", "PERPLEXITY_API_KEY", "SCRIPT_PROVIDER",
     "AGENT_PROXY_TOKEN", "AGENT_MODEL", "AGENT_VOICE", "TELNYX_ASSISTANT_ID",
     "BUSINESS_NAME", "CALLBACK_NUMBER",
+    # Render sets this to the service's own address, and the keep-awake check-in
+    # would aim real requests at it.
+    "RENDER_EXTERNAL_URL",
 ):
     os.environ[_leak] = ""
 
@@ -522,6 +525,7 @@ def test_schema_migration() -> None:
             state TEXT NOT NULL DEFAULT 'pending', scheduled_for TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
         INSERT INTO call_tasks (phone) VALUES ('+16175550000');
+        INSERT INTO campaigns (name, message) VALUES ('Old', 'Hello.');
     """)
     conn.commit(); conn.close()
 
@@ -537,6 +541,9 @@ def test_schema_migration() -> None:
           db2.query_one("SELECT COUNT(*) AS n FROM call_tasks")["n"] == 1)
     check("the new columns are queryable",
           db2.query_one("SELECT script_override FROM call_tasks")["script_override"] in ("", None))
+    check("a campaign from before missed runs were counted starts at zero, not NULL",
+          "campaigns.missed_runs" in migrated
+          and db2.query_one("SELECT missed_runs FROM campaigns")["missed_runs"] == 0, str(migrated))
 
     os.environ["ROBOCALL_DB"] = saved
     importlib.reload(db)
@@ -952,6 +959,218 @@ def test_api_guards() -> None:
             db.set_setting(key, "")
 
 
+# --- 11. a host that sleeps ---------------------------------------------------
+#
+# Render's free tier stops the server after 15 idle minutes, and the dispatcher
+# stops with it. A daily campaign went four days without a call that way, and a
+# server woken 20 minutes after a run skipped it anyway. These try every shape of
+# sleeping and waking against an oracle, and race two servers on one database.
+
+def test_sleep_and_wake() -> None:
+    import bisect
+    import random
+
+    section("a host that sleeps")
+    install(FakeTelephony())
+    db.set_setting("dispatch_paused", "0")
+    rng = random.Random(20261019)
+    start = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    # Crosses the end of British summer time (Oct 25) and of US daylight time (Nov 1).
+    end = start + timedelta(days=20)
+    step = timedelta(minutes=15)
+    shapes = (
+        {"frequency": "daily", "call_time": "11:00", "timezone": "America/Chicago"},
+        {"frequency": "daily", "call_time": "09:30", "timezone": "Europe/London"},
+        {"frequency": "daily", "call_time": "23:45", "timezone": "America/Los_Angeles"},
+        {"frequency": "weekly", "call_time": "10:00", "weekday": 2, "timezone": "America/New_York"},
+    )
+    trials = 2 if db.IS_PG else 8
+    wrong: list[str] = []
+    accounted = late_ok = True
+    for trial in range(trials):
+        db.execute("UPDATE campaigns SET state = 'finished', next_run_at = NULL WHERE state = 'active'")
+        db.execute("UPDATE call_tasks SET state = 'done' WHERE state IN ('pending', 'deferred', 'dialing')")
+        # Awake and asleep spells from 15 minutes to two days, then awake at the end
+        # so every slot has been settled one way or the other.
+        ticks, t, up = [], start, rng.random() < 0.5
+        while t < end:
+            spell_ends = min(end, t + step * rng.choice((1, 2, 3, 6, 12, 20, 40, 96, 192)))
+            while up and t < spell_ends:
+                ticks.append(t)
+                t += step
+            t, up = spell_ends, not up
+        ticks.append(end)
+
+        campaigns = {}
+        for shape in shapes:
+            cid = fresh_campaign(**shape)
+            row = db.query_one("SELECT * FROM campaigns WHERE id = ?", (cid,))
+            first = dispatcher.first_run_at(row, False, start)
+            db.execute("UPDATE campaigns SET next_run_at = ? WHERE id = ?", (db.to_utc(first), cid))
+            slots, s = [], first
+            while s is not None and s <= end:
+                slots.append(s)
+                s = dispatcher.compute_next_run(row, s)
+            grace = dispatcher.MISSED_RUN_GRACE[shape["frequency"]]
+            # The oracle: a slot goes out at the first tick at or after it, if that
+            # tick is within the grace period; otherwise it is missed.
+            expected = []
+            for s in slots:
+                first_tick = ticks[bisect.bisect_left(ticks, s)]
+                if first_tick - s <= grace:
+                    expected.append(first_tick)
+            campaigns[cid] = (shape, slots, expected)
+
+        for tick in ticks:
+            dispatcher.materialize_due_campaigns(tick)
+            db.execute("UPDATE call_tasks SET state = 'done' WHERE state = 'pending'")
+
+        for cid, (shape, slots, expected) in campaigns.items():
+            fired = [db.from_utc(r["created_at"]) for r in db.query(
+                "SELECT created_at FROM call_tasks WHERE campaign_id = ? ORDER BY id", (cid,))]
+            row = db.query_one("SELECT runs, missed_runs FROM campaigns WHERE id = ?", (cid,))
+            if fired != expected:
+                wrong.append(f"trial {trial} {shape['frequency']} {shape['timezone']}: "
+                             f"fired {len(fired)}, expected {len(expected)}")
+            if row["runs"] + row["missed_runs"] != len(slots):
+                accounted = False
+                wrong.append(f"trial {trial} {shape['timezone']}: {row['runs']} sent + "
+                             f"{row['missed_runs']} missed != {len(slots)} slots")
+            for f in fired:
+                s = max(x for x in slots if x <= f)
+                if f - s > dispatcher.MISSED_RUN_GRACE[shape["frequency"]]:
+                    late_ok = False
+    check(f"{trials} random sleep schedules x {len(shapes)} campaigns: every run goes out exactly "
+          "when it should - the first moment the server is up, if that's within the grace period",
+          not wrong, "; ".join(wrong[:4]))
+    check("every scheduled slot ends up counted once, as sent or as missed", accounted)
+    check("nothing is ever sent later than its grace period allows", late_ok)
+
+    # Two servers on one database (a deploy overlapping the old instance) both
+    # wake to the same stale campaign.
+    now = datetime(2026, 10, 18, 16, 20, tzinfo=timezone.utc)  # 11:20 CDT
+    doubled = []
+    for _ in range(10):
+        cid = fresh_campaign(frequency="daily", call_time="11:00", timezone="America/Chicago")
+        db.execute("UPDATE campaigns SET next_run_at = ? WHERE id = ?", ("2026-10-15 16:00:00", cid))
+        gate = threading.Barrier(2)
+
+        def wake() -> None:
+            gate.wait()
+            dispatcher.materialize_due_campaigns(now)
+
+        racers = [threading.Thread(target=wake) for _ in range(2)]
+        for r in racers:
+            r.start()
+        for r in racers:
+            r.join(10)
+        row = db.query_one("SELECT runs, missed_runs FROM campaigns WHERE id = ?", (cid,))
+        sent = db.query_one("SELECT COUNT(*) AS n FROM call_tasks WHERE campaign_id = ?", (cid,))["n"]
+        if (sent, row["runs"], row["missed_runs"]) != (1, 1, 3):
+            doubled.append((sent, row["runs"], row["missed_runs"]))
+        db.execute("UPDATE call_tasks SET state = 'done' WHERE campaign_id = ?", (cid,))
+        db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
+    check("two servers waking together send the day's run once and count the misses once",
+          not doubled, str(doubled[:3]))
+
+    # A schedule that was never run since long ago is walked, not looped on forever.
+    cid = fresh_campaign(frequency="hourly")
+    db.execute("UPDATE campaigns SET next_run_at = ? WHERE id = ?", ("2020-01-01 00:00:00", cid))
+    import time as _time
+    began = _time.monotonic()
+    dispatcher.materialize_due_campaigns(datetime(2026, 10, 19, 13, 0, tzinfo=timezone.utc))
+    row = db.query_one("SELECT state, next_run_at FROM campaigns WHERE id = ?", (cid,))
+    check("an hourly campaign six years stale is settled in one tick, without hanging",
+          _time.monotonic() - began < 5 and db.from_utc(row["next_run_at"]) >
+          datetime(2026, 10, 19, 13, 0, tzinfo=timezone.utc), str(dict(row)))
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
+
+    test_keep_awake_for_real()
+
+
+def test_keep_awake_for_real() -> None:
+    import keepawake
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    section("keeping the host awake, over real HTTP")
+    hits: list[tuple[str, str]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - the stdlib's name
+            hits.append((self.path, self.headers.get("User-Agent", "")))
+            if self.path == "/slow/healthz":
+                threading.Event().wait(2)
+            code = 200 if self.path.endswith("/healthz") else 404
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        check("a real check-in gets a real answer", keepawake._get(f"{base}/healthz") == (True, ""))
+        check("and says who is asking", hits and hits[-1][1] == "RoboCallAI-keepawake", str(hits[-1:]))
+        check("a wrong address is a failure, not a success",
+              keepawake._get(f"{base}/nope") == (False, "HTTP 404"))
+        saved = keepawake.TIMEOUT
+        keepawake.TIMEOUT = 0.3
+        ok, error = keepawake._get(f"{base}/slow/healthz")
+        keepawake.TIMEOUT = saved
+        check("a host that hangs times out instead of stalling the thread",
+              not ok and "Timeout" in error, error)
+        srv_closed = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        dead = f"http://127.0.0.1:{srv_closed.server_address[1]}"
+        srv_closed.server_close()
+        ok, error = keepawake._get(f"{dead}/healthz")
+        check("a host that refuses the connection is reported, not raised", not ok and error, error)
+
+        # The whole check, end to end, against a live socket.
+        cid = fresh_campaign(frequency="daily", call_time="11:00")
+        real_url = keepawake.own_url
+        keepawake.own_url = lambda: base  # the real one refuses loopback, rightly
+        try:
+            hits.clear()
+            keeper = keepawake.KeepAwake()
+            check("with a run scheduled, a full check reaches the server's own /healthz",
+                  keeper.check() and hits and hits[-1][0] == "/healthz", str(hits))
+        finally:
+            keepawake.own_url = real_url
+        db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    section("keep-awake against hostile settings")
+    for value in ("javascript:alert(1)", "ftp://example.com", "https://", "http://0.0.0.0:8000",
+                  "http://[::1]:8000", "   ", "not a url", "http://127.0.0.1"):
+        db.set_setting("public_base_url", value)
+        check(f"{value!r} is never treated as an address to call", keepawake.own_url() == "",
+              keepawake.own_url())
+    db.set_setting("public_base_url", "")
+
+    cid = fresh_campaign(frequency="daily", call_time="11:00")
+    db.set_setting("public_base_url", "https://robocaller.example.com")
+
+    def explode(url: str):
+        raise RuntimeError("the network stack fell over")
+
+    keeper = keepawake.KeepAwake(interval=0.02, get=explode)
+    keeper.start()
+    threading.Event().wait(0.25)
+    alive = keeper.is_alive()
+    keeper.stop()
+    keeper.join(2)
+    check("a check-in that throws doesn't kill the keep-awake thread",
+          alive and "fell over" in keeper.last_error, keeper.last_error)
+    db.set_setting("public_base_url", "")
+    db.execute("UPDATE campaigns SET state = 'finished' WHERE id = ?", (cid,))
+
+
 def main() -> int:
     print(f"scratch database: {db.DB_PATH}")
     db.init()
@@ -966,6 +1185,7 @@ def main() -> int:
     test_campaign_window()
     test_documents()
     test_api_guards()
+    test_sleep_and_wake()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

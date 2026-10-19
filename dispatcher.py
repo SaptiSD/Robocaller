@@ -50,6 +50,13 @@ AGENT_RETRY = timedelta(minutes=5)
 # however late - there is no next slot to wait for.
 MISSED_RUN_GRACE = {"hourly": timedelta(minutes=30), "daily": timedelta(hours=3),
                     "weekly": timedelta(hours=3)}
+# A call meant to leave a voicemail must ring long enough for one to answer.
+# Carriers send an unanswered call to voicemail after 20-35 seconds of ringing,
+# and Telnyx's ring timeout also counts the few seconds before the first ring.
+# At 30 a real campaign call rang out at 30.0s and was cancelled moments before
+# voicemail picked up - "No answer", nothing left. A Ring-for value saved before
+# the default went up must not be able to do that again, so this is a floor.
+VOICEMAIL_RING_SECONDS = 45
 # Statuses set on purpose mid-call that a later "completed" must not erase.
 STICKY_STATUSES = ("opted-out", "machine-skipped")
 
@@ -329,10 +336,16 @@ def materialize_due_campaigns(now: datetime | None = None) -> int:
     )
     fired = 0
     for campaign in due:
-        due_at = db.from_utc(campaign["next_run_at"]) or now
+        # A server that slept through several runs wakes with next_run_at still
+        # pointing at the oldest of them. Lateness is judged from the most recent
+        # slot that has come due, not that one: waking at 11:20 used to skip that
+        # morning's 11:00 run as "24 hours late", because yesterday's was stored.
+        due_at, passed = latest_due_slot(campaign, now)
         late = now - due_at
         frequency = (campaign.get("frequency") or "once").lower()
         missed = late > MISSED_RUN_GRACE.get(frequency, timedelta.max)
+        if missed:
+            passed.append(due_at)
         next_run = compute_next_run(campaign, now)
         # Roll the schedule forward BEFORE queueing, and only if no one else has
         # (the WHERE pins the slot we read). Two servers on one database - a
@@ -354,19 +367,54 @@ def materialize_due_campaigns(now: datetime | None = None) -> int:
             )
         if claimed != 1:
             continue
-        slot = _local_slot(due_at, campaign.get("timezone"))
+        if passed:
+            db.execute("UPDATE campaigns SET missed_runs = missed_runs + ? WHERE id = ?",
+                       (len(passed), campaign["id"]))
+            _log_missed(campaign, passed, now)
         if missed:
-            db.log_event(
-                f"Campaign '{campaign['name']}' missed its {slot} run - nothing was running "
-                f"at that time (the server was asleep, or calling was paused). It was skipped "
-                f"rather than sent {_ago(late)} late; use Run now to send it anyway.", "error")
             continue
         enqueue_campaign(campaign["id"], now)
         fired += 1
         if late > timedelta(minutes=10):
+            slot = _local_slot(due_at, campaign.get("timezone"))
             db.log_event(f"Campaign '{campaign['name']}' ran {_ago(late)} late - its {slot} run "
                          "found the server asleep or calling paused.", "warn")
     return fired
+
+
+# Enough for an hourly campaign to have slept through more than a year.
+_MAX_SLOTS_WALKED = 10_000
+
+
+def latest_due_slot(campaign: dict, now: datetime) -> tuple[datetime, list[datetime]]:
+    """(the most recent run that has come due, the earlier ones it supersedes).
+
+    Starts from the stored next_run_at and walks the schedule forward while the
+    following slot is also already due. A one-off has no following slot, so it
+    is always its own stored run.
+    """
+    slot = db.from_utc(campaign.get("next_run_at")) or now
+    passed: list[datetime] = []
+    for _ in range(_MAX_SLOTS_WALKED):
+        following = compute_next_run(campaign, slot)
+        if following is None or following > now:
+            break
+        passed.append(slot)
+        slot = following
+    return slot, passed
+
+
+def _log_missed(campaign: dict, slots: list[datetime], now: datetime) -> None:
+    tz = campaign.get("timezone")
+    if len(slots) == 1:
+        what = f"its {_local_slot(slots[0], tz)} run"
+    else:
+        what = (f"its {len(slots)} runs from {_local_slot(slots[0], tz)} "
+                f"to {_local_slot(slots[-1], tz)}")
+    db.log_event(
+        f"Campaign '{campaign['name']}' missed {what} - nothing was running at that time "
+        f"(the server was asleep, or calling was paused). Skipped rather than sent "
+        f"{_ago(now - slots[-1])} late; use Run now to send it anyway.", "error")
 
 
 def _local_slot(moment: datetime, tz_name: str | None) -> str:
@@ -528,6 +576,7 @@ def dispatch_pending(
         amd = default_amd if test else (task["amd"] or default_amd)
         if not phone.supports(amd):
             amd = default_amd
+        ring = ring_for(ring_seconds, mode, amd)
 
         try:
             if mode == "agent":
@@ -543,7 +592,7 @@ def dispatch_pending(
                         extra_info=task.get("agent_info") or "",
                     ),
                     token=task["token"],
-                    ring_seconds=ring_seconds,
+                    ring_seconds=ring,
                 )
             else:
                 result = phone.place_call(
@@ -552,7 +601,7 @@ def dispatch_pending(
                     voice=task["voice_override"] or task["voice"] or "",
                     amd=amd,
                     token=task["token"],
-                    ring_seconds=ring_seconds,
+                    ring_seconds=ring,
                 )
         except Exception as exc:  # noqa: BLE001
             # The task is already claimed. Letting this escape would abandon it in
@@ -595,6 +644,19 @@ def dispatch_pending(
             db.log_event(f"Call to {task['phone']} failed: {result.error}", "error")
 
     return placed
+
+
+def ring_for(ring_seconds: int, mode: str, amd: str) -> int:
+    """How long to let a call ring before giving up on it.
+
+    The Ring-for setting, raised to VOICEMAIL_RING_SECONDS for any call whose job
+    includes leaving a voicemail: a recorded message waiting for the beep, or the
+    AI agent, which leaves one by ear. "Hang up on voicemail" and plain "off"
+    calls keep the setting as it is.
+    """
+    if mode == "agent" or amd == "voicemail":
+        return max(ring_seconds, VOICEMAIL_RING_SECONDS)
+    return ring_seconds
 
 
 def _line_full(error: str) -> bool:

@@ -344,6 +344,22 @@ function awakeFor(startedUtc) {
   return `up ${Math.round(mins / 60)} h`;
 }
 
+// Whether the server is holding itself awake for scheduled calls. On a host that
+// sleeps when idle, this is the difference between a schedule that fires and one
+// that only fires when someone happens to have this page open.
+function keepAwakeText(k) {
+  if (!k || !k.url) return "";
+  if (!k.holding) {
+    return `<div class="hint">Nothing scheduled, so the host may let the server sleep - opening this page wakes it.</div>`;
+  }
+  if (k.last_error) {
+    return `<div class="hint" style="color:var(--critical)">Can't keep itself awake: checking in with
+      ${esc(k.url)} failed (${esc(k.last_error)}). If the host puts it to sleep, scheduled calls won't go out.</div>`;
+  }
+  return `<div class="hint">Staying awake for scheduled calls (${esc(k.holding)}) &middot; ${k.last_ok
+    ? `last checked in ${esc(fmtWhen(k.last_ok))}` : `checks in every ${k.every_minutes} min`}.</div>`;
+}
+
 async function loadDashboard() {
   const data = await api("/overview");
   SETTINGS = data.settings;
@@ -372,6 +388,7 @@ async function loadDashboard() {
           : "Scripts ride along with each call; nothing needs to be internet-reachable."}</div>
       <div class="hint">Calling window ${esc(data.settings.window_start)}&ndash;${esc(data.settings.window_end)}
         local to each recipient, ${esc(data.settings.calls_per_minute)} calls/minute.</div>
+      ${keepAwakeText(e.keep_awake)}
       ${e.last_error ? `<div class="hint" style="color:var(--critical)">${esc(e.last_error)}</div>` : ""}
     </div>`);
 
@@ -436,6 +453,14 @@ function campaignWarning(c) {
   return "";
 }
 
+// Runs that came due while nothing was running. Without this a schedule that
+// stopped firing looks exactly like one that simply has nothing to report.
+function missedText(c) {
+  if (!c.missed_runs) return "";
+  return `${plural(c.missed_runs, "scheduled run")} missed - the server was asleep or calling was `
+    + "paused when it came due. Activity on the dashboard has the dates; Run now sends one by hand.";
+}
+
 function stateActions(c, small = true) {
   const cls = small ? "small" : "";
   const toggle = c.state === "finished" ? ""
@@ -466,6 +491,7 @@ function campaignCard(c) {
       ${esc(nextRunText(c))}${c.business_name ? ` &middot; from ${esc(c.business_name)}` : ""}
     </div>
     ${warning ? `<div class="campaign-meta" style="color:var(--warning-ink)">&#9888; ${esc(warning)}</div>` : ""}
+    ${missedText(c) ? `<div class="campaign-meta" style="color:var(--warning-ink)">&#9888; ${esc(missedText(c))}</div>` : ""}
     <div class="campaign-msg">${esc(c.message || "No message set.")}</div>
     ${c.calls_total ? `<div class="progress"><div style="width:${done}%"></div></div>
       <div class="campaign-meta">${esc(statsText(c))}</div>` : ""}
@@ -573,7 +599,8 @@ async function refreshCampaign(id) {
      <b>${esc(business || "(no business name set)")}</b>${c.business_name ? "" : " (from Settings)"} &middot;
      callback ${esc(c.callback_number || SETTINGS.callback_number || "the caller-ID number")}
      ${c.calls_total ? `<br>${esc(statsText(c))}` : ""}
-     ${campaignWarning(c) ? `<br><span style="color:var(--warning-ink)">&#9888; ${esc(campaignWarning(c))}</span>` : ""}`;
+     ${campaignWarning(c) ? `<br><span style="color:var(--warning-ink)">&#9888; ${esc(campaignWarning(c))}</span>` : ""}
+     ${missedText(c) ? `<br><span style="color:var(--warning-ink)">&#9888; ${esc(missedText(c))}</span>` : ""}`;
   setHtml($("#detail-actions"), stateActions(c, false));
 
   $("#detail-consent-count").textContent = `${c.consented} of ${c.contacts} consented`;
@@ -761,7 +788,7 @@ async function loadSettings() {
   $("#s-window-start").value = data.settings.window_start || "09:00";
   $("#s-window-end").value = data.settings.window_end || "20:00";
   $("#s-cpm").value = data.settings.calls_per_minute || "12";
-  $("#s-ring").value = data.settings.ring_seconds || "30";
+  $("#s-ring").value = data.settings.ring_seconds || "50";
   $("#s-base-url").value = data.settings.public_base_url || "";
   $("#s-anthropic").placeholder = data.settings.anthropic_api_key_set
     ? "saved — leave blank to keep it" : "sk-ant-...";

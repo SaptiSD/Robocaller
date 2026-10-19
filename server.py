@@ -35,6 +35,7 @@ import compliance
 import config
 import db
 import dispatcher
+import keepawake
 import llm_proxy
 import scriptwriter
 import telephony
@@ -45,6 +46,9 @@ log = logging.getLogger("robocall")
 WEB_DIR = Path(__file__).parent / "web"
 DOCS_DIR = Path(__file__).parent / "docs"
 _engine: dispatcher.Dispatcher | None = None
+# The running KeepAwake, if any. A list rather than a global so overlapping
+# lifespans (the test suites open several) each remove only their own.
+_keepers: list[keepawake.KeepAwake] = []
 
 
 @asynccontextmanager
@@ -65,7 +69,12 @@ async def lifespan(app: FastAPI):
         )
     _engine = dispatcher.Dispatcher()
     _engine.start()
+    _awake = keepawake.KeepAwake()
+    _awake.start()
+    _keepers.append(_awake)
     yield
+    _awake.stop()
+    _keepers.remove(_awake)
     if _engine:
         _engine.stop()
 
@@ -355,7 +364,8 @@ def overview() -> dict:
         "campaigns": {k: (v or 0) for k, v in campaigns.items()},
         "upcoming": upcoming,
         "suppressed": len(db.suppression_set()),
-        "engine": _engine.health() if _engine else {"running": False},
+        "engine": {**(_engine.health() if _engine else {"running": False}),
+                   "keep_awake": _keepers[-1].status() if _keepers else None},
         "settings": config.public_view(),
         "events": db.recent_events(12),
         "server_time": db.now_str(),
@@ -872,7 +882,8 @@ def _validate_settings(values: dict[str, str]) -> dict[str, str]:
         raise HTTPException(400, f"The calling window {start}-{end} is empty: 'Don't call before' has "
                                  "to be earlier than 'Don't call after', or nothing is ever dialled.")
     for key, label, low, high in (("calls_per_minute", "Calls per minute", 1, 120),
-                                  ("ring_seconds", "Ring for", 10, 60)):
+                                  # Telnyx refuses a ring timeout over 120.
+                                  ("ring_seconds", "Ring for", 10, 120)):
         if key in values:
             try:
                 number = int(str(values[key]).strip())

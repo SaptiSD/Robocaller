@@ -25,7 +25,7 @@ is Phase 3, and it is a different architecture (see *Roadmap*).
 | **Voice** | **AWS Polly** neural voices through Telnyx, with Telnyx's own engines as the cheaper option | Polly does not sound like a 2005 IVR. |
 | **Script writer** | **Claude** (`anthropic`), optional | Drafts a compliant script from a one-line brief. Everything else works without it. |
 | **Reports** | **ReportLab** | The PDFs in `docs/` are generated from code, so they can be rebuilt. |
-| **Tests** | Two plain Python scripts, no framework | 456 checks against a fake Telnyx. No credentials, no real calls, no cost. |
+| **Tests** | Two plain Python scripts, no framework | 526 checks against a fake Telnyx. No credentials, no real calls, no cost. |
 
 Dependencies are deliberately few: FastAPI, uvicorn, httpx, pydantic and
 python-dotenv, plus `anthropic` and `reportlab` for the two optional pieces.
@@ -46,21 +46,27 @@ Verify the whole engine without touching Telnyx:
 python smoke_test.py && python pressure_test.py
 ```
 
-**456 checks against a fake Telnyx.** No credentials, no real calls, no cost.
+**526 checks against a fake Telnyx.** No credentials, no real calls, no cost.
 
-`smoke_test.py` (248) walks the happy path: phone parsing, timezone resolution,
+`smoke_test.py` (297) walks the happy path: phone parsing, timezone resolution,
 calling windows, schedule arithmetic across a DST change, consent and
 do-not-call screening, pacing, and the HTTP API - plus the operator's controls:
 that Pause holds calls already queued, that removing a contact or withdrawing
 consent cancels their call, that missed runs are skipped rather than sent hours
-late, that an opt-out stays in the call log, and the callback line.
+late, that an opt-out stays in the call log, and the callback line. It also
+replays the week in October 2026 when a sleeping server sent one call in five
+days, checking every run now lands as sent or as counted-and-missed, that calls
+meant for voicemail ring long enough to reach it, and the keep-awake check-in.
 
-`pressure_test.py` (208) tries to break it: eight threads racing the same queue,
+`pressure_test.py` (229) tries to break it: eight threads racing the same queue,
 the exact parameter names sent to Telnyx's TeXML endpoint, every failure that
 strands a first-run account (bad API key, wrong application ID, empty balance,
 missing outbound voice profile), forged and replayed Ed25519 webhook signatures,
 a provider that throws mid-dial, schema drift from an older database, malformed
-phone numbers and times, TeXML injection, and the API's rejection paths.
+phone numbers and times, TeXML injection, and the API's rejection paths - and a
+host that sleeps: random sleep/wake schedules across two DST changes checked
+against an oracle, two servers waking to the same stale campaign, and the
+keep-awake check-in over real HTTP against hung, refusing and wrong addresses.
 
 ---
 
@@ -312,16 +318,30 @@ Two things must be settled before this is on a public URL:
    Render and Fly.io reset the disk when the container restarts. Either attach a
    persistent volume and point `ROBOCALL_DB` at it, or move to Postgres.
 3. **A free Render instance sleeps after 15 minutes without a request**, and the
-   dispatcher sleeps with it: nothing scheduled goes out until someone opens the
-   site, which then takes about 30 seconds to wake. A run found up to 3 hours late
-   (30 minutes for hourly) still goes out and is flagged in Activity; one later
-   than that is skipped and flagged, rather than calling people at 6pm about an
-   11am message. The real fix is a paid instance (Render Starter, about $7 a
-   month). The free stopgap is `.github/workflows/keepalive.yml`, which pings
-   `/healthz` every 10 minutes once you add a repository variable named
-   `KEEPALIVE_URL` (Settings > Secrets and variables > Actions > Variables) set to
-   the site's address. GitHub's schedule can lag at busy times, so it narrows the
-   gaps rather than closing them.
+   dispatcher sleeps with it. In October 2026 that cost a daily campaign four
+   days of calls: each 11:00 run came due with nobody on the dashboard.
+
+   So the server now keeps itself awake while it has work: whenever a campaign
+   has a run scheduled, or a call is still waiting to go out, `keepawake.py`
+   requests its own public `/healthz` every 5 minutes (Render's own
+   `RENDER_EXTERNAL_URL`, else `PUBLIC_BASE_URL`). That request comes back in
+   through Render's proxy, which is what Render counts as traffic. With nothing
+   scheduled it stops, and the host may sleep again. The dashboard's Engine card
+   shows which it is doing, and Activity reports it if a check-in fails.
+
+   Two costs to know about. Staying up uses Render's free instance hours - 750
+   per workspace per month, which one always-on service fits inside but two do
+   not. And it only works while the server is up: if it is ever down when a run
+   comes due, a run found up to 3 hours late (30 minutes for hourly) still goes
+   out and is flagged; one later than that is skipped, flagged in Activity, and
+   counted on the campaign as missed, rather than calling people at 6pm about an
+   11am message. The fix that removes both is a paid instance (Render Starter,
+   about $7 a month), which never sleeps.
+
+   `.github/workflows/keepalive.yml` is an optional outside backup (set a
+   repository variable named `KEEPALIVE_URL` to the site's address). On its own
+   it is not enough: GitHub ran its 10-minute schedule about once every three
+   hours.
 
 The upside of deploying is real, though: a public HTTPS URL is exactly what
 **webhook mode** needs. Set `PUBLIC_BASE_URL` to the deployed origin and the
@@ -344,14 +364,15 @@ carry no per-call token and the signature is the only proof they came from Telny
 |---|---|
 | `server.py` | FastAPI — dashboard, JSON API, Telnyx webhooks |
 | `dispatcher.py` | The call engine: materialize → dispatch → sync |
+| `keepawake.py` | Keeps a sleeping host up while calls are scheduled |
 | `telephony.py` | Telnyx provider (TeXML), document construction, voices |
 | `compliance.py` | Numbers, area-code timezones, calling windows, script hygiene |
 | `scriptwriter.py` | Claude-backed script drafting (optional) |
 | `db.py` | SQLite persistence |
 | `config.py` | Settings resolution (database over environment) |
 | `web/` | The dashboard — plain HTML/CSS/JS, no build step |
-| `smoke_test.py` | 248 happy-path checks against a fake Telnyx |
-| `pressure_test.py` | 208 adversarial checks - concurrency, Telnyx errors, forged webhooks |
+| `smoke_test.py` | 297 happy-path checks against a fake Telnyx |
+| `pressure_test.py` | 229 adversarial checks - concurrency, Telnyx errors, forged webhooks, a sleeping host |
 | `docs/` | Generated PDF reports and the code that builds them, plus `frequency_check.py` and `capture_screens.py` |
 | `_legacy_streamlit/` | The previous Streamlit prototype, kept for reference |
 

@@ -119,7 +119,11 @@ CREATE TABLE IF NOT EXISTS campaigns (
     ends_at      TEXT,
     next_run_at  TEXT,
     last_run_at  TEXT,
-    runs         INTEGER NOT NULL DEFAULT 0
+    runs         INTEGER NOT NULL DEFAULT 0,
+    -- Scheduled runs skipped because nothing was running when they came due
+    -- (a host asleep, calling paused). Shown on the campaign, so a schedule
+    -- that silently stopped firing can't look like one that simply went quiet.
+    missed_runs  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS contacts (
