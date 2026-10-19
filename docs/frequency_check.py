@@ -86,20 +86,35 @@ def make_campaign(frequency: str, recipients: int, ends_at: datetime | None,
     return cid
 
 
+def settle(clock: datetime, recipients: int) -> int:
+    """Place this run's calls and let them finish before the next run is due.
+
+    The dispatcher won't queue someone who is still waiting to be called, so a
+    run left sitting in the queue makes every later run skip its whole list.
+    Live, the calls go out within minutes of the run; here they go out on the
+    same tick and the carrier reports them completed straight away.
+
+    Quiet hours are left out on purpose: this prices the schedule, so a run
+    that falls overnight is placed rather than held to the morning.
+    """
+    placed = dispatcher.dispatch_pending(clock, budget=recipients, ignore_window=True)
+    dispatcher.sync_open_calls(clock)
+    return placed
+
+
 def run_scenario(label: str, frequency: str, span: timedelta, recipients: int,
                  bounded: bool, step: timedelta) -> dict:
     """Advance a simulated clock across `span` and count what actually fired."""
     ends_at = START + span if bounded else None
     cid = make_campaign(frequency, recipients, ends_at)
 
-    runs, clock = 0, START
+    runs, calls, clock = 0, 0, START
     horizon = START + span + step * 3  # keep ticking past the end, to prove it stops
     while clock <= horizon:
         runs += dispatcher.materialize_due_campaigns(clock)
+        calls += settle(clock, recipients)
         clock += step
 
-    queued = db.query_one(
-        "SELECT COUNT(*) AS n FROM call_tasks WHERE campaign_id = ?", (cid,))["n"]
     state = db.query_one("SELECT state FROM campaigns WHERE id = ?", (cid,))["state"]
     return {
         "label": label,
@@ -107,8 +122,8 @@ def run_scenario(label: str, frequency: str, span: timedelta, recipients: int,
         "window": "open-ended" if not bounded else _span(span),
         "recipients": recipients,
         "runs": runs,
-        "calls": queued,
-        "cost": round(queued * COST_PER_CALL, 2),
+        "calls": calls,
+        "cost": round(calls * COST_PER_CALL, 2),
         "final_state": state,
         "stopped_on_its_own": state == "finished",
     }
@@ -160,6 +175,12 @@ def main() -> int:
            and r["window"] != "open-ended"]
     if bad:
         print(f"\n  FAIL: bounded campaigns that did not stop: {bad}")
+        return 1
+    # Every run calls every recipient once. Anything else means runs were
+    # skipped or doubled, and the cost column is wrong.
+    short = [r["label"] for r in rows if r["calls"] != r["runs"] * r["recipients"]]
+    if short:
+        print(f"\n  FAIL: calls != runs x recipients for: {short}")
         return 1
     print("  All bounded campaigns retired themselves on schedule.")
     return 0
