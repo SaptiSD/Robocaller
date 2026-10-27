@@ -25,7 +25,7 @@ is Phase 3, and it is a different architecture (see *Roadmap*).
 | **Voice** | **AWS Polly** neural voices through Telnyx, with Telnyx's own engines as the cheaper option | Polly does not sound like a 2005 IVR. |
 | **Script writer** | **Claude** (`anthropic`), optional | Drafts a compliant script from a one-line brief. Everything else works without it. |
 | **Reports** | **ReportLab** | The PDFs in `docs/` are generated from code, so they can be rebuilt. |
-| **Tests** | Two plain Python scripts, no framework | 562 checks against a fake Telnyx. No credentials, no real calls, no cost. |
+| **Tests** | Two plain Python scripts, no framework | 607 checks against a fake Telnyx. No credentials, no real calls, no cost. |
 
 Dependencies are deliberately few: FastAPI, uvicorn, httpx, pydantic and
 python-dotenv, plus `anthropic` and `reportlab` for the two optional pieces.
@@ -46,9 +46,9 @@ Verify the whole engine without touching Telnyx:
 python smoke_test.py && python pressure_test.py
 ```
 
-**562 checks against a fake Telnyx.** No credentials, no real calls, no cost.
+**607 checks against a fake Telnyx.** No credentials, no real calls, no cost.
 
-`smoke_test.py` (318) walks the happy path: phone parsing, timezone resolution,
+`smoke_test.py` (355) walks the happy path: phone parsing, timezone resolution,
 calling windows, schedule arithmetic across a DST change, consent and
 do-not-call screening, pacing, and the HTTP API - plus the operator's controls:
 that Pause holds calls already queued, that removing a contact or withdrawing
@@ -59,7 +59,7 @@ days, checking every run now lands as sent or as counted-and-missed, that calls
 meant for voicemail ring long enough to reach it, late wakes on hourly schedules,
 the night the clocks go back, end dates, the wake-up job and the downtime record.
 
-`pressure_test.py` (244) tries to break it: eight threads racing the same queue,
+`pressure_test.py` (252) tries to break it: eight threads racing the same queue,
 the exact parameter names sent to Telnyx's TeXML endpoint, every failure that
 strands a first-run account (bad API key, wrong application ID, empty balance,
 missing outbound voice profile), forged and replayed Ed25519 webhook signatures,
@@ -251,6 +251,34 @@ python docs/frequency_check.py
 That drives the real dispatcher on a simulated clock — no calls, no cost — and
 writes the table that appears in the project report.
 
+### Rolling calls
+
+Every call normally goes out from the **primary** number (Settings > *Call from
+this number*). Add more numbers under it — each one a voice number on the same
+Telnyx account, assigned to the same TeXML application — and switch on **Rolling
+calls** in a campaign's *When to call* section. The box that opens is filled with
+every number in Settings; delete any that campaign shouldn't use.
+
+- Each call picks one of the campaign's numbers **at random**.
+- When a call ends with SIP **607** (the person marked it unwanted), **608**
+  (a carrier's call filter blocked it) or **603** (declined - and the code US
+  carriers now send, as "603+", when their analytics block a call), that number
+  isn't used for that person again: their **next** call comes from a different
+  one. It doesn't redial straight away from another number - call-analytics
+  engines watch for exactly that, and it tends to get the new number labelled
+  too (the User Guide, section 4, has the reasoning). Telnyx's status webhook
+  doesn't always carry the SIP code, so a call that didn't connect is looked up
+  once afterwards to find out.
+- Someone who has blocked **two** of your numbers isn't called again, rolling or
+  not. Switching to a third would be getting round their block, not reaching
+  them. The call log shows them as *Blocked 2 of your numbers*.
+- Settings shows each number's calls and blocks over the last 30 days. A number
+  many people block is flagged as spam somewhere; swap it out. *Test connection*
+  checks every rolling number is on the account and on the right application.
+
+The call log's *From* column and the CSV's `from_number` / `hangup_cause` columns
+show which number each call used and how it ended.
+
 ---
 
 ## The dispatch queue
@@ -401,8 +429,8 @@ carry no per-call token and the signature is the only proof they came from Telny
 | `db.py` | SQLite persistence |
 | `config.py` | Settings resolution (database over environment) |
 | `web/` | The dashboard — plain HTML/CSS/JS, no build step |
-| `smoke_test.py` | 318 happy-path checks against a fake Telnyx |
-| `pressure_test.py` | 244 adversarial checks - concurrency, Telnyx errors, forged webhooks, a sleeping host |
+| `smoke_test.py` | 355 happy-path checks against a fake Telnyx |
+| `pressure_test.py` | 252 adversarial checks - concurrency, Telnyx errors, forged webhooks, a sleeping host |
 | `live_check.py` | Checks a deployed server end to end, without placing a call |
 | `docs/` | Generated PDF reports and the code that builds them, plus `frequency_check.py` and `capture_screens.py` |
 | `_legacy_streamlit/` | The previous Streamlit prototype, kept for reference |

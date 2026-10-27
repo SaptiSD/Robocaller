@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import math
+import random
+import re
 import secrets
 import threading
 from datetime import datetime, timedelta
@@ -59,6 +61,17 @@ MISSED_RUN_GRACE = {"hourly": timedelta(minutes=30), "daily": timedelta(hours=3)
 VOICEMAIL_RING_SECONDS = 45
 # Statuses set on purpose mid-call that a later "completed" must not erase.
 STICKY_STATUSES = ("opted-out", "machine-skipped")
+# Rolling calls. The SIP codes a call ends on when the recipient's phone or
+# carrier turned it away: 607 marked unwanted by the person, 608 rejected by a
+# carrier's call filter, and 603 - a plain decline, but also what the FCC now has
+# carriers send ("603+") when their analytics block a call. A number that has
+# been turned away by someone isn't used for them again.
+BLOCK_CAUSES = {"603": "declined, or blocked by their carrier's call filter",
+                "607": "marked as unwanted", "608": "blocked by their carrier's call filter"}
+BLOCKED_SQL = "hangup_cause IN (" + ", ".join(f"'{c}'" for c in BLOCK_CAUSES) + ")"
+# Rolling switches number after a block - once. Someone whose phone has turned
+# away two different numbers has said no, and a third would be dodging that.
+MAX_BLOCKED_NUMBERS = 2
 
 # Schedule timezones offered in the UI. Kept here so the server can reject
 # anything else rather than silently falling back to Eastern.
@@ -300,6 +313,91 @@ def is_test(task: dict) -> bool:
     return task.get("campaign_id") is None or task.get("run_key") in ("manual", "test")
 
 
+# --- rolling calls ----------------------------------------------------------
+
+def parse_caller_list(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """A campaign's numbers to call from: one per line, "number" or "number, label".
+
+    Returns ([(number, label)], the lines that aren't a phone number).
+    """
+    good: list[tuple[str, str]] = []
+    bad: list[str] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, _, label = line.partition(",")
+        number = compliance.normalize(head)
+        if not number:
+            bad.append(line)
+        elif number not in seen:
+            seen.add(number)
+            good.append((number, label.strip()[:40]))
+    return good, bad
+
+
+def blocked_numbers(phone: str) -> set[str]:
+    """Our caller IDs whose calls this person's phone or carrier has turned away."""
+    return {r["from_number"] for r in db.query(
+        "SELECT DISTINCT from_number FROM call_tasks "
+        f"WHERE phone = ? AND from_number <> '' AND {BLOCKED_SQL}", (phone,))}
+
+
+def choose_caller(task: dict, primary: str, blocked: set[str],
+                  configured: dict[str, str], rng: random.Random | None = None) -> str:
+    """The caller ID for one call.
+
+    Without rolling calls, the primary. With it, one of the campaign's numbers at
+    random - leaving out any this person has blocked, unless that leaves none.
+    Only numbers still listed in Settings count: one removed there since the
+    campaign was saved may no longer be on the account.
+    """
+    if not task.get("rolling"):
+        return primary
+    pool = [n for n, _ in parse_caller_list(task.get("caller_numbers") or "")[0] if n in configured]
+    fresh = [n for n in pool if n not in blocked]
+    return (rng or random).choice(fresh or pool) if pool else primary
+
+
+def hangup_code(raw: object) -> str:
+    """Telnyx's sip_hangup_cause as a bare code - "608" - or the word it sent."""
+    text = str(raw or "").strip().lower()
+    match = re.match(r"\d{3}", text)
+    return match.group(0) if match else text[:40]
+
+
+def note_hangup(task_id: int, raw_cause: object) -> None:
+    """Record how a call ended, and say so the first time it was a block."""
+    cause = hangup_code(raw_cause)
+    if not cause or db.execute(
+            "UPDATE call_tasks SET hangup_cause = ? WHERE id = ? AND hangup_cause <> ?",
+            (cause, task_id, cause)) != 1 or cause not in BLOCK_CAUSES:
+        return
+    task = db.query_one(
+        "SELECT t.phone, t.from_number, c.rolling FROM call_tasks t "
+        "LEFT JOIN campaigns c ON c.id = t.campaign_id WHERE t.id = ?", (task_id,))
+    if not task or not task["from_number"]:
+        return
+    count = len(blocked_numbers(task["phone"]))
+    then = (f" That's {count} of your numbers, so they won't be called again." if count >= MAX_BLOCKED_NUMBERS
+            else " Rolling calls will use a different number for them next time." if task["rolling"]
+            else "")
+    db.log_event(f"{compliance.pretty(task['phone'])} turned away a call from "
+                 f"{compliance.pretty(task['from_number'])} - {BLOCK_CAUSES[cause]} (SIP {cause}).{then}",
+                 "warn")
+
+
+def caller_stats(since: datetime) -> dict[str, dict[str, int]]:
+    """Per caller ID since `since`: calls placed and calls blocked."""
+    rows = db.query(
+        "SELECT from_number, COUNT(*) AS calls, "
+        f"SUM(CASE WHEN {BLOCKED_SQL} THEN 1 ELSE 0 END) AS blocked FROM call_tasks "
+        "WHERE from_number <> '' AND attempts > 0 AND updated_at >= ? GROUP BY from_number",
+        (db.to_utc(since),))
+    return {r["from_number"]: {"calls": r["calls"] or 0, "blocked": r["blocked"] or 0} for r in rows}
+
+
 # --- the three phases -------------------------------------------------------
 
 def materialize_due_campaigns(now: datetime | None = None) -> int:
@@ -515,7 +613,7 @@ def dispatch_pending(
     select = (
         "SELECT t.*, c.message, c.voice, c.amd, c.mode, c.agent_info, c.state AS campaign_state, "
         "c.business_name AS campaign_business, c.callback_number AS campaign_callback, "
-        "c.require_consent, ct.consent AS contact_consent, "
+        "c.require_consent, ct.consent AS contact_consent, c.rolling, c.caller_numbers, "
         "c.name AS campaign_name, ct.name AS contact_name, ct.id AS contact_row FROM call_tasks t "
         "LEFT JOIN campaigns c ON c.id = t.campaign_id "
         "LEFT JOIN contacts ct ON ct.id = t.contact_id "
@@ -539,6 +637,7 @@ def dispatch_pending(
     default_business = config.get("business_name")
     default_callback = config.get("callback_number")
     agent_ready: bool | None = None  # looked up once, and only if an AI call is in the batch
+    configured: dict[str, str] | None = None  # likewise, the numbers in Settings
     placed = 0
 
     for task in tasks:
@@ -555,6 +654,14 @@ def dispatch_pending(
         # for the same reason as the do-not-call list.
         if task["contact_row"] is not None and task["require_consent"] and not task["contact_consent"]:
             _finish(task["id"], "skipped", "no-consent")
+            continue
+        # Or turned away two of our numbers already. Rolling on to a third would
+        # be getting round their block rather than reaching them.
+        blocked = set() if test else blocked_numbers(task["phone"])
+        if len(blocked) >= MAX_BLOCKED_NUMBERS:
+            _finish(task["id"], "skipped", "blocked-us",
+                    f"Their phone has turned away calls from {len(blocked)} of your numbers, so "
+                    "they aren't called again. Call them yourself if you think that's a mistake.")
             continue
         if test and only_task_id is None and \
                 now - (db.from_utc(task["created_at"]) or now) > TEST_CALL_TTL:
@@ -618,6 +725,9 @@ def dispatch_pending(
         if not phone.supports(amd):
             amd = default_amd
         ring = ring_for(ring_seconds, mode, amd, test)
+        if task.get("rolling") and configured is None:
+            configured = config.all_caller_numbers()
+        caller = choose_caller(task, getattr(phone, "from_number", ""), blocked, configured or {})
 
         try:
             if mode == "agent":
@@ -634,6 +744,7 @@ def dispatch_pending(
                     ),
                     token=task["token"],
                     ring_seconds=ring,
+                    from_number=caller,
                 )
             else:
                 result = phone.place_call(
@@ -643,6 +754,7 @@ def dispatch_pending(
                     amd=amd,
                     token=task["token"],
                     ring_seconds=ring,
+                    from_number=caller,
                 )
         except Exception as exc:  # noqa: BLE001
             # The task is already claimed. Letting this escape would abandon it in
@@ -656,9 +768,9 @@ def dispatch_pending(
             # that fetch can fail; until it happens the message hasn't played.
             fetched_later = mode != "agent" and getattr(phone, "mode", "direct") == "webhook"
             db.execute(
-                "UPDATE call_tasks SET status = 'queued', sid = ?, played = ?, "
+                "UPDATE call_tasks SET status = 'queued', sid = ?, played = ?, from_number = ?, "
                 "attempts = attempts + 1, error = '', updated_at = ? WHERE id = ?",
-                (result.sid, 0 if fetched_later else 1, db.to_utc(now), task["id"]),
+                (result.sid, 0 if fetched_later else 1, caller, db.to_utc(now), task["id"]),
             )
             placed += 1
         elif _line_full(result.error) and only_task_id is not None:
@@ -678,11 +790,13 @@ def dispatch_pending(
             break  # every line is busy - the rest of this batch would bounce too
         else:
             db.execute(
-                "UPDATE call_tasks SET state = 'done', status = 'failed', error = ?, "
+                "UPDATE call_tasks SET state = 'done', status = 'failed', error = ?, from_number = ?, "
                 "attempts = attempts + 1, updated_at = ? WHERE id = ?",
-                (result.error, db.to_utc(now), task["id"]),
+                (result.error, caller, db.to_utc(now), task["id"]),
             )
-            db.log_event(f"Call to {task['phone']} failed: {result.error}", "error")
+            db.log_event(f"Call to {task['phone']} from {caller} failed: {result.error}"
+                         if caller != getattr(phone, "from_number", "") else
+                         f"Call to {task['phone']} failed: {result.error}", "error")
 
     return placed
 
@@ -741,8 +855,20 @@ def sync_open_calls(now: datetime | None = None) -> int:
             fields.get("status", ""),
             fields.get("answered_by", ""),
             fields.get("duration", 0),
+            fields.get("hangup_cause", ""),
         )
         updated += 1
+
+    # A call settled by a status webhook never went through the poll above, and
+    # the webhook may not say which SIP code it ended on. One that didn't connect
+    # is looked up once more to find out whether it was blocked - which is what
+    # rolling calls need to know. "none" marks it as looked up either way.
+    for task in db.query(
+            "SELECT id, sid FROM call_tasks WHERE state = 'done' AND sid <> '' AND hangup_cause = '' "
+            "AND status IN ('busy', 'failed', 'no-answer', 'canceled') AND updated_at >= ? LIMIT 20",
+            (cutoff,)):
+        fields, error = phone.fetch_call(task["sid"])
+        note_hangup(task["id"], ("" if error else fields.get("hangup_cause")) or "none")
 
     # A call Telnyx never told us about (or that we lost track of) shouldn't sit
     # in 'dialing' forever.
@@ -755,7 +881,8 @@ def sync_open_calls(now: datetime | None = None) -> int:
     return updated
 
 
-def record_status(task_id: int, status: str, answered_by: str = "", duration: int = 0) -> None:
+def record_status(task_id: int, status: str, answered_by: str = "", duration: int = 0,
+                  hangup_cause: str = "") -> None:
     """Apply a Telnyx call status, from either polling or a webhook."""
     from telephony import FINAL_STATUSES
 
@@ -783,6 +910,8 @@ def record_status(task_id: int, status: str, answered_by: str = "", duration: in
         (state, 1 if final else 0, status, answered_by, duration, duration,
          db.to_utc(db.utcnow()), task_id),
     )
+    if final and hangup_cause:
+        note_hangup(task_id, hangup_cause)
 
 
 def _finish(task_id: int, state: str, status: str, error: str = "") -> None:

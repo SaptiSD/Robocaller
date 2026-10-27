@@ -101,6 +101,8 @@ class CampaignIn(BaseModel):
     timezone: str = "America/New_York"
     amd: str = "voicemail"
     require_consent: bool = True
+    rolling: bool = False
+    caller_numbers: str = ""
     starts_at: str = ""
     ends_at: str = ""
     start_now: bool = False
@@ -122,6 +124,8 @@ class CampaignPatch(BaseModel):
     timezone: str | None = None
     amd: str | None = None
     require_consent: bool | None = None
+    rolling: bool | None = None
+    caller_numbers: str | None = None
     starts_at: str | None = None
     ends_at: str | None = None
     state: str | None = None
@@ -240,6 +244,10 @@ def campaign_row(row: dict) -> dict:
         "calls_waiting": stats.get("waiting") or 0,
         "calls_in_flight": stats.get("in_flight") or 0,
         "calls_skipped": stats.get("skipped") or 0,
+        # Rolling calls: the numbers this campaign calls from, as the page shows them.
+        "caller_list": [{"number": n, "pretty": compliance.pretty(n), "label": label}
+                        for n, label in dispatcher.parse_caller_list(row.get("caller_numbers") or "")[0]]
+                       if row.get("rolling") else [],
     }
 
 
@@ -294,6 +302,26 @@ def _check_agent_info(info: str) -> None:
         raise HTTPException(400, f"The extra info for the AI is {len(info):,} characters - keep it "
                                  f"under {agent.AGENT_INFO_MAX:,}. It's sent with every reply, so "
                                  "length adds cost and delay to each call.")
+
+
+def _caller_list(raw: str) -> str:
+    """A rolling campaign's numbers to call from, checked and tidied for storage.
+
+    Every one has to be a number in Settings: Telnyx only places a call from a
+    number on the account, so anything else would fail on whichever call picked it.
+    """
+    numbers, bad = dispatcher.parse_caller_list(raw)
+    if bad:
+        raise HTTPException(400, f"Not a phone number in the numbers to call from: {'; '.join(bad[:3])}.")
+    if not numbers:
+        raise HTTPException(400, "Rolling calls needs at least one number to call from - or turn it off.")
+    known = config.all_caller_numbers()
+    unknown = [compliance.pretty(n) for n, _ in numbers if n not in known]
+    if unknown:
+        raise HTTPException(400, f"{', '.join(unknown)} isn't one of your numbers in Settings. Add it "
+                                 "under Settings > Call from this number first - calls can only go "
+                                 "out from numbers on your Telnyx account.")
+    return "\n".join(f"{n}, {label or known[n]}".rstrip(", ") for n, label in numbers)
 
 
 def require_campaign(campaign_id: int) -> dict:
@@ -417,6 +445,7 @@ def create_campaign(body: CampaignIn) -> dict:
         raise HTTPException(400, "Weekday must be 0 (Monday) through 6 (Sunday).")
     business = _business_field(body.business_name)
     callback = _phone_field(body.callback_number, "The campaign's callback number")
+    callers = _caller_list(body.caller_numbers) if body.rolling else ""
 
     starts_at = _campaign_moment(body.starts_at, "Start", body.timezone)
     ends_at = _campaign_moment(body.ends_at, "End", body.timezone)
@@ -435,13 +464,13 @@ def create_campaign(body: CampaignIn) -> dict:
     campaign_id = db.insert(
         "INSERT INTO campaigns (name, message, voice, mode, agent_info, business_name, "
         "callback_number, frequency, call_time, weekday, timezone, state, amd, require_consent, "
-        "created_at, starts_at, ends_at, next_run_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+        "rolling, caller_numbers, created_at, starts_at, ends_at, next_run_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             body.name.strip(), body.message.strip(), body.voice, body.mode,
             body.agent_info.strip() if body.mode == "agent" else "", business, callback,
             body.frequency, body.call_time, body.weekday, body.timezone, body.amd,
-            1 if body.require_consent else 0, db.to_utc(now),
+            1 if body.require_consent else 0, 1 if body.rolling else 0, callers, db.to_utc(now),
             starts_at, ends_at, db.to_utc(first) if first else None,
         ),
     )
@@ -478,6 +507,13 @@ def patch_campaign(campaign_id: int, body: CampaignPatch) -> dict:
 
     if "require_consent" in fields:
         fields["require_consent"] = 1 if fields["require_consent"] else 0
+    if "rolling" in fields:
+        fields["rolling"] = 1 if fields["rolling"] else 0
+    if fields.get("rolling", campaign["rolling"]):
+        if "caller_numbers" in fields or not campaign["caller_numbers"]:
+            fields["caller_numbers"] = _caller_list(fields.get("caller_numbers", campaign["caller_numbers"]))
+    elif "caller_numbers" in fields:
+        fields["caller_numbers"] = ""
     if fields.get("state") not in (None, *db.CAMPAIGN_STATES):
         raise HTTPException(400, f"State must be one of {db.CAMPAIGN_STATES}.")
     if "frequency" in fields and fields["frequency"] not in db.FREQUENCIES:
@@ -696,6 +732,7 @@ CALL_OUTCOMES = {
     "waiting": "state IN ('pending', 'deferred', 'dialing')",
     "skipped": "state = 'skipped'",
     "opted-out": "status = 'opted-out'",
+    "blocked": f"({dispatcher.BLOCKED_SQL} OR status = 'blocked-us')",
 }
 
 
@@ -726,6 +763,7 @@ def _calls(campaign_id: int | None, outcome: str, q: str, before_id: int | None,
     )
     for row in rows:
         row["pretty"] = compliance.pretty(row["phone"])
+        row["from_pretty"] = compliance.pretty(row["from_number"]) if row.get("from_number") else ""
         # So the dashboard can show a scheduled call in the recipient's own time.
         row["recipient_tz"] = compliance.timezone_for(row["phone"]) or ""
         row["is_test"] = dispatcher.is_test(row)
@@ -744,13 +782,13 @@ def export_calls(campaign_id: int | None = None, outcome: str = "", q: str = "")
     rows = _calls(campaign_id, outcome, q, None, 100_000)
     out = io.StringIO()
     writer = csv.writer(out)
-    writer.writerow(["id", "updated_utc", "scheduled_utc", "campaign", "phone", "state", "status",
-                     "answered_by", "duration_s", "telnyx_sid", "error"])
+    writer.writerow(["id", "updated_utc", "scheduled_utc", "campaign", "phone", "from_number", "state",
+                     "status", "answered_by", "duration_s", "hangup_cause", "telnyx_sid", "error"])
     for r in rows:
         campaign = r["campaign_name"] or ("Test call" if r["is_test"] else "Deleted campaign")
         writer.writerow([r["id"], r["updated_at"], r["scheduled_for"], campaign, r["phone"],
-                         r["state"], r["status"], r["answered_by"], r["duration"], r["sid"],
-                         r["error"]])
+                         r["from_number"], r["state"], r["status"], r["answered_by"], r["duration"],
+                         r["hangup_cause"], r["sid"], r["error"]])
     stamp = db.utcnow().strftime("%Y%m%d-%H%M")
     return Response(out.getvalue(), media_type="text/csv", headers={
         "Content-Disposition": f'attachment; filename="call-log-{stamp}.csv"'})
@@ -855,6 +893,15 @@ def get_settings() -> dict:
     }
 
 
+@app.get("/api/caller-numbers")
+def caller_numbers() -> list[dict]:
+    """Each number calls go out from, with its last 30 days: calls placed, calls blocked."""
+    stats = dispatcher.caller_stats(db.utcnow() - timedelta(days=30))
+    return [{"number": n, "pretty": compliance.pretty(n), "label": label,
+             **stats.get(n, {"calls": 0, "blocked": 0})}
+            for n, label in config.all_caller_numbers().items()]
+
+
 @app.post("/api/agent/setup")
 def setup_agent() -> dict:
     """Create or update the Telnyx assistant. Writes to the Telnyx account."""
@@ -912,7 +959,37 @@ def _validate_settings(values: dict[str, str]) -> dict[str, str]:
         raise HTTPException(400, "Scripts can be written by 'anthropic' or 'perplexity'.")
     if values.get("dispatch_paused") not in (None, "0", "1"):
         raise HTTPException(400, "dispatch_paused must be 0 or 1.")
+    if "caller_numbers" in values:
+        values["caller_numbers"] = _caller_numbers_setting(
+            values["caller_numbers"], values.get("telnyx_from_number", config.get("telnyx_from_number")))
     return values
+
+
+MAX_CALLER_NUMBERS = 50
+
+
+def _caller_numbers_setting(raw: str, primary: str) -> str:
+    """The extra caller numbers from the Settings page, as stored JSON.
+
+    Blank rows are dropped, as is a repeat of the primary: it is always in the
+    rotation already.
+    """
+    try:
+        rows = json.loads(raw or "[]")
+    except ValueError:
+        rows = None
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise HTTPException(400, "The caller numbers didn't arrive as a list - reload the page.")
+    clean, seen = [], {compliance.normalize(primary)}
+    for row in rows:
+        number = _phone_field(str(row.get("number") or ""), "The caller number")
+        if not number or number in seen:
+            continue
+        seen.add(number)
+        clean.append({"number": number, "label": str(row.get("label") or "").strip()[:40]})
+    if len(clean) > MAX_CALLER_NUMBERS:
+        raise HTTPException(400, f"That's {len(clean)} caller numbers - keep it to {MAX_CALLER_NUMBERS}.")
+    return json.dumps(clean)
 
 
 @app.post("/api/settings")
@@ -949,11 +1026,20 @@ def verify_settings(body: VerifyIn | None = None) -> dict:
     ok, detail = phone.verify()
     numbers, error = phone.owned_numbers() if ok else ([], "")
     from_ok, from_detail = phone.check_from_number() if ok else (False, "")
+    # The rolling numbers too - as typed, if the page sent them. Tidied the way
+    # Save would, so "(737) 241-5152" doesn't read as an unsaved change.
+    if "caller_numbers" in typed:
+        typed["caller_numbers"] = _caller_numbers_setting(typed["caller_numbers"], from_number)
+        extra = [r["number"] for r in json.loads(typed["caller_numbers"])]
+    else:
+        extra = [r["number"] for r in config.caller_numbers()]
+    callers = phone.check_caller_numbers([from_number, *extra]) if ok else []
     limits = phone.account_limits() if ok else {}
     expected = (pick("public_base_url").rstrip("/") + "/telnyx/inbound") if pick("public_base_url") else ""
     return {
         "ok": ok, "detail": detail, "numbers": numbers, "error": error,
         "mode": phone.mode, "from_ok": from_ok, "from_detail": from_detail,
+        "callers": [{**c, "pretty": compliance.pretty(c["number"])} for c in callers],
         "limits": limits,
         "inbound_ready": bool(expected) and limits.get("inbound_url") == expected,
         "unsaved": sorted(k for k, v in typed.items() if v and v != config.get(k)),
@@ -1352,6 +1438,9 @@ async def handle_status(token: str, request: Request) -> Response:
         str(form.get("CallStatus", "")),
         str(form.get("AnsweredBy", "")),
         int(form.get("CallDuration") or 0),
+        # Whichever spelling Telnyx uses; without one, the dispatcher looks it up.
+        next((str(form[k]) for k in ("SipResponseCode", "SipHangupCause", "sip_hangup_cause",
+                                     "HangupCause") if form.get(k)), ""),
     )
     return PlainTextResponse("", status_code=204)
 

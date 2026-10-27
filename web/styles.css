@@ -245,6 +245,14 @@ textarea { resize: vertical; min-height: 90px; font-family: inherit; }
 textarea.mono { font-family: var(--mono); font-size: 12.5px; }
 .field { margin-bottom: 14px; }
 .field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+/* Settings > more numbers to call from: number, label, its record, remove. */
+.caller-row { display: grid; grid-template-columns: minmax(0, 14em) minmax(0, 12em) 1fr auto; gap: 8px;
+              align-items: center; margin-bottom: 8px; }
+.caller-row .hint { margin: 0; }
+@media (max-width: 600px) {
+  .caller-row { grid-template-columns: 1fr 1fr; }
+  .caller-row .hint { grid-column: 1; }
+}
 .check { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--ink); font-weight: 400; }
 .check input { margin-top: 2px; flex: none; }
 

@@ -23,6 +23,13 @@ const STATUS_LABELS = {
   "campaign deleted": "Campaign deleted", "contact removed": "Contact removed",
   "expired": "Test call dropped", "unknown local time": "Unknown local time",
   "claimed": "Dialing", "machine-skipped": "Voicemail - hung up", "opted-out": "Opted out",
+  "blocked-us": "Blocked 2 of your numbers",
+};
+
+// The SIP codes a call ends on when the recipient's phone or carrier turned it
+// away. Rolling calls switch number for that person next time.
+const BLOCK_LABELS = {
+  "603": "Declined or blocked", "607": "Blocked - marked unwanted", "608": "Blocked by their carrier",
 };
 
 let SETTINGS = {};
@@ -160,7 +167,8 @@ function statusPill(task) {
   const s = task.status || task.state;
   let cls = "muted", label = STATUS_LABELS[s] || s || "—";
   const waiting = ["pending", "deferred"].includes(task.state);
-  if (task.state === "skipped") { cls = "muted"; }
+  if (task.state === "skipped") { cls = s === "blocked-us" ? "critical" : "muted"; }
+  else if (task.state === "done" && BLOCK_LABELS[task.hangup_cause]) { cls = "critical"; label = BLOCK_LABELS[task.hangup_cause]; }
   else if (s === "opted-out") { cls = "warning"; label = "Opted out"; }
   else if (s === "machine-skipped") { cls = "muted"; }
   else if (s === "completed" && task.played === 0) { cls = "critical"; label = "Answered, message not played"; }
@@ -505,6 +513,7 @@ function campaignCard(c) {
       ${esc(scheduleText(c))} &middot; ${esc(c.timezone)} &middot;
       ${plural(c.contacts, "contact")} (${c.consented} consented) &middot;
       ${esc(nextRunText(c))}${c.business_name ? ` &middot; from ${esc(c.business_name)}` : ""}
+      ${c.rolling ? ` &middot; rolling calls from ${plural(c.caller_list.length, "number")}` : ""}
     </div>
     ${warning ? `<div class="campaign-meta" style="color:var(--warning-ink)">&#9888; ${esc(warning)}</div>` : ""}
     ${missedText(c) ? `<div class="campaign-meta" style="color:var(--warning-ink)">&#9888; ${esc(missedText(c))}</div>` : ""}
@@ -614,6 +623,10 @@ async function refreshCampaign(id) {
     `${c.mode === "agent" ? "AI conversation" : "Recorded message"} &middot; calling on behalf of
      <b>${esc(business || "(no business name set)")}</b>${c.business_name ? "" : " (from Settings)"} &middot;
      callback ${esc(c.callback_number || SETTINGS.callback_number || "the caller-ID number")}
+     <br>${c.rolling
+       ? `<b>Rolling calls</b> &mdash; each call from one of: ${c.caller_list.map((n) =>
+           `${esc(n.pretty)}${n.label ? ` (${esc(n.label)})` : ""}`).join(", ")}`
+       : `Calls from ${esc(SETTINGS.telnyx_from_number || "the primary number")} (rolling calls off)`}
      ${c.calls_total ? `<br>${esc(statsText(c))}` : ""}
      ${campaignWarning(c) ? `<br><span style="color:var(--warning-ink)">&#9888; ${esc(campaignWarning(c))}</span>` : ""}
      ${missedText(c) ? `<br><span style="color:var(--warning-ink)">&#9888; ${esc(missedText(c))}</span>` : ""}`;
@@ -711,7 +724,7 @@ function callsTable(rows, withCampaign = true, withSchedule = false) {
   return `<table>
     <thead><tr>
       <th>When</th>${withSchedule ? "<th>Scheduled for</th>" : ""}${withCampaign ? "<th>Campaign</th>" : ""}<th>Number</th>
-      <th>Status</th><th>Length</th><th>Telnyx SID</th><th>Detail</th>
+      <th>From</th><th>Status</th><th>Length</th><th>Telnyx SID</th><th>Detail</th>
     </tr></thead>
     <tbody>${rows.map((r) => {
       // A missing name means either a test call (never had a campaign) or a
@@ -725,6 +738,7 @@ function callsTable(rows, withCampaign = true, withSchedule = false) {
         ${withCampaign ? `<td class="name" title="${esc(campaign)}">${r.campaign_name && r.campaign_id
           ? `<button class="link" data-open="${r.campaign_id}" style="padding:0">${esc(campaign)}</button>` : esc(campaign)}</td>` : ""}
         <td class="phone">${esc(r.pretty)}</td>
+        <td class="phone hint">${esc(r.from_pretty || "—")}</td>
         <td>${statusPill(r)}</td>
         <td class="num">${r.duration ? r.duration + "s" : "—"}</td>
         <td class="hint" style="font-family:var(--mono);font-size:11px">${esc(r.sid || "—")}</td>
@@ -798,6 +812,7 @@ async function loadSettings() {
     ? "saved — leave blank to keep it" : "paste your Telnyx API key";
   $("#s-app-id").value = data.settings.telnyx_app_id || "";
   $("#s-from").value = data.settings.telnyx_from_number || "";
+  renderCallerRows(data.settings.caller_numbers);
   $("#s-test").value = data.settings.test_number || "";
   $("#s-business").value = data.settings.business_name || "";
   $("#s-callback").value = data.settings.callback_number || "";
@@ -844,6 +859,52 @@ async function loadSettings() {
   loadInbound().catch(() => {});
 }
 
+// More numbers to call from, for rolling calls. Four rows are always offered,
+// so there's room to add numbers without hunting for a button.
+const CALLER_SLOTS = 4;
+
+function callerRow(n = {}) {
+  return `<div class="caller-row">
+    <input type="text" class="caller-number" placeholder="+1 512 555 0100" aria-label="Caller number" value="${esc(n.number || "")}">
+    <input type="text" class="caller-label" placeholder="Label, e.g. Austin" maxlength="40" aria-label="Label for this number" value="${esc(n.label || "")}">
+    <span class="hint caller-stats"></span>
+    <button type="button" class="link small" data-remove-caller>remove</button>
+  </div>`;
+}
+
+function renderCallerRows(list) {
+  const rows = [...(list || [])];
+  while (rows.length < CALLER_SLOTS) rows.push({});
+  $("#caller-rows").innerHTML = rows.map(callerRow).join("");
+  loadCallerStats().catch(() => {});
+}
+
+function callerRowsValue() {
+  return $$("#caller-rows .caller-row")
+    .map((row) => ({ number: $(".caller-number", row).value.trim(), label: $(".caller-label", row).value.trim() }))
+    .filter((n) => n.number);
+}
+
+function addCallerRow(number = "") {
+  const empty = $$("#caller-rows .caller-number").find((input) => !input.value.trim());
+  if (!empty) $("#caller-rows").insertAdjacentHTML("beforeend", callerRow());
+  const input = empty || $$("#caller-rows .caller-number").pop();
+  input.value = number;
+  if (!number) input.focus();
+  settingsDirty = true;
+}
+
+// How each number has been doing: a number many people block is worth swapping out.
+async function loadCallerStats() {
+  const stats = new Map((await api("/caller-numbers")).map((s) => [s.number, s]));
+  const text = (s) => !s ? "" : !s.calls ? "No calls in 30 days"
+    : `${plural(s.calls, "call")} in 30 days` + (s.blocked ? ` · <span style="color:var(--critical)">blocked ${s.blocked}×</span>` : "");
+  for (const row of $$("#caller-rows .caller-row")) {
+    $(".caller-stats", row).innerHTML = text(stats.get(normalizePhone($(".caller-number", row).value)));
+  }
+  $("#from-stats").innerHTML = text(stats.get(normalizePhone($("#s-from").value)));
+}
+
 function fillVoices() {
   for (const select of [$("#c-voice"), $("#test-voice")]) {
     if (!META.voices || !META.voices.length || select.options.length) continue;
@@ -857,6 +918,7 @@ function settingsValues() {
     telnyx_api_key: $("#s-api-key").value.trim(),
     telnyx_app_id: $("#s-app-id").value.trim(),
     telnyx_from_number: $("#s-from").value.trim(),
+    caller_numbers: JSON.stringify(callerRowsValue()),
     test_number: $("#s-test").value.trim(),
     business_name: $("#s-business").value.trim(),
     callback_number: $("#s-callback").value.trim(),
@@ -901,6 +963,44 @@ function refreshScheduleFields() {
   refreshWindowWarning();
 }
 
+// Rolling calls: the box starts with every number in Settings, primary first.
+function allCallerLines() {
+  const lines = SETTINGS.telnyx_from_number ? [`${SETTINGS.telnyx_from_number}, Primary`] : [];
+  for (const n of SETTINGS.caller_numbers || []) lines.push(n.label ? `${n.number}, ${n.label}` : n.number);
+  return lines.join("\n");
+}
+
+function refreshRolling() {
+  const on = $("#c-rolling").checked;
+  $("#wrap-rolling").hidden = !on;
+  if (on && !$("#c-caller-numbers").value.trim()) $("#c-caller-numbers").value = allCallerLines();
+  countCallers();
+}
+
+// Same rules as the server: one number per line, and only numbers in Settings.
+function countCallers() {
+  const meter = $("#caller-numbers-meter");
+  if (!$("#c-rolling").checked) return (meter.textContent = "");
+  const known = new Set([SETTINGS.telnyx_from_number, ...(SETTINGS.caller_numbers || []).map((n) => n.number)]
+    .map(normalizePhone).filter(Boolean));
+  const seen = new Set();
+  let unknown = 0, bad = 0;
+  for (let line of $("#c-caller-numbers").value.split("\n")) {
+    line = line.trim();
+    if (!line || line.startsWith("#")) continue;
+    const number = normalizePhone(line.split(",")[0]);
+    if (!number) { bad++; continue; }
+    if (seen.has(number)) continue;
+    seen.add(number);
+    if (!known.has(number)) unknown++;
+  }
+  const parts = [`<b>${plural(seen.size, "number")}</b> in the rotation`];
+  if (seen.size === 1) parts.push("add more under Settings &rsaquo; Call from this number to rotate");
+  if (unknown) parts.push(`<span style="color:var(--critical)">${unknown} not in Settings &mdash; calls can only come from numbers there</span>`);
+  if (bad) parts.push(`<span style="color:var(--critical)">${notNumbers(bad)}</span>`);
+  meter.innerHTML = parts.join(" · ");
+}
+
 function identityHints() {
   $("#c-business").placeholder = SETTINGS.business_name ? `${SETTINGS.business_name} (from Settings)` : "No default set in Settings";
   $("#c-callback").placeholder = SETTINGS.callback_number ? `${SETTINGS.callback_number} (from Settings)` : "The caller-ID number";
@@ -917,6 +1017,7 @@ function resetCampaignForm() {
   refreshScheduleFields();
   refreshModeHint();
   refreshConsentWarning();
+  refreshRolling();
   $("#c-agent-info").dispatchEvent(new Event("input"));
 }
 
@@ -951,6 +1052,9 @@ async function openEditor(id) {
   $("#c-starts-at").value = toLocalInput(c.starts_at, c.timezone);
   $("#c-ends-at").value = toLocalInput(c.ends_at, c.timezone);
   $("#c-require-consent").checked = Boolean(c.require_consent);
+  $("#c-rolling").checked = Boolean(c.rolling);
+  $("#c-caller-numbers").value = c.rolling ? c.caller_numbers || "" : "";
+  refreshRolling();
   refreshScheduleFields();
   refreshModeHint();
   $("#c-agent-info").dispatchEvent(new Event("input"));
@@ -1098,6 +1202,8 @@ function campaignBody() {
     weekday: Number($("#c-weekday").value || 0),
     timezone: $("#c-timezone").value,
     require_consent: $("#c-require-consent").checked,
+    rolling: $("#c-rolling").checked,
+    caller_numbers: $("#c-rolling").checked ? $("#c-caller-numbers").value : "",
     starts_at: $("#c-starts-at").value,
     ends_at: $("#c-ends-at").value,
   };
@@ -1403,10 +1509,15 @@ async function verifyTelnyx() {
     const v = settingsValues();
     const r = await api("/settings/verify", { method: "POST", body: { values: {
       telnyx_api_key: v.telnyx_api_key, telnyx_app_id: v.telnyx_app_id,
-      telnyx_from_number: v.telnyx_from_number, public_base_url: v.public_base_url } } });
+      telnyx_from_number: v.telnyx_from_number, public_base_url: v.public_base_url,
+      caller_numbers: v.caller_numbers } } });
+    // The primary first, then each rolling number - a bought number left
+    // unassigned would otherwise only show up as failed calls.
     const fromNote = r.ok && r.from_detail
       ? `<div style="color:${r.from_ok ? "var(--ink-2)" : "var(--critical)"};margin-top:4px">
            ${r.from_ok ? "✓" : "✗"} ${esc(r.from_detail)}</div>`
+        + (r.callers || []).slice(1).map((c) => `<div style="color:${c.ok ? "var(--ink-2)" : "var(--critical)"};margin-top:4px">
+           ${c.ok ? "✓" : "✗"} Rolling number ${esc(c.pretty)}: ${esc(c.detail)}.</div>`).join("")
       : "";
     const limits = r.limits || {};
     const limitNotes = [];
@@ -1419,10 +1530,14 @@ async function verifyTelnyx() {
       + limitNotes.map((n) => `<div style="margin-top:4px">${n}</div>`).join("")
       + (r.unsaved && r.unsaved.length ? `<div style="margin-top:4px;color:var(--warning-ink)">Checked what's typed, which isn't saved yet &mdash; press Save settings to keep it.</div>` : "");
     const voiceNumbers = (r.numbers || []).filter((n) => n.voice);
+    const inUse = new Set([v.telnyx_from_number, ...callerRowsValue().map((n) => n.number)].map(normalizePhone));
+    const spare = voiceNumbers.filter((n) => !inUse.has(n.phone_number));
     $("#from-options").innerHTML = voiceNumbers.length
       ? "Voice-capable numbers on this account: " +
         voiceNumbers.map((n) =>
           `<button type="button" class="link small" data-pick="${esc(n.phone_number)}">${esc(n.phone_number)}</button>`).join(" ")
+        + (spare.length ? `<br>Not used yet: ${spare.map((n) =>
+          `<button type="button" class="link small" data-add-caller="${esc(n.phone_number)}">+ add ${esc(n.phone_number)} to rolling</button>`).join(" ")}` : "")
       : r.ok ? "No voice-capable numbers on this account yet - buy one in the Telnyx portal." : "";
   } catch (err) {
     $("#verify-status").innerHTML = `<span style="color:var(--critical)">${esc(err.message)}</span>`;
@@ -1447,7 +1562,16 @@ document.addEventListener("click", (event) => {
 document.addEventListener("click", (e) => {
   const pick = e.target.closest("[data-pick]");
   if (pick) { $("#s-from").value = pick.dataset.pick; settingsDirty = true; toast("From number set - save to keep it."); }
+  const add = e.target.closest("[data-add-caller]");
+  if (add) { addCallerRow(add.dataset.addCaller); add.remove(); toast("Added to rolling numbers - save to keep it."); }
+  const remove = e.target.closest("[data-remove-caller]");
+  if (remove) {
+    remove.closest(".caller-row").remove();
+    if ($$("#caller-rows .caller-row").length < CALLER_SLOTS) $("#caller-rows").insertAdjacentHTML("beforeend", callerRow());
+    settingsDirty = true;
+  }
 });
+$("#btn-add-caller").addEventListener("click", () => addCallerRow());
 
 $("#theme-toggle").addEventListener("click", () => {
   const now = document.documentElement.dataset.theme || "";
@@ -1531,6 +1655,12 @@ function refreshWindowWarning() {
 }
 
 $("#c-frequency").addEventListener("change", refreshScheduleFields);
+$("#c-rolling").addEventListener("change", refreshRolling);
+$("#c-caller-numbers").addEventListener("input", countCallers);
+$("#btn-refill-callers").addEventListener("click", () => {
+  $("#c-caller-numbers").value = allCallerLines();
+  countCallers();
+});
 $("#c-ends-at").addEventListener("input", refreshWindowWarning);
 
 $("#btn-pause").addEventListener("click", () => {

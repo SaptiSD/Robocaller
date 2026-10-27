@@ -21,7 +21,7 @@ def build_story(ctx):
     s.append(P("User guide &#8212; setting it up, sending a campaign, "
                "reading the results", "subtitle"))
     s.append(Spacer(1, 4))
-    s.append(P("24 September 2026 &nbsp;&#183;&nbsp; Covers the dashboard as it "
+    s.append(P("27 October 2026 &nbsp;&#183;&nbsp; Covers the dashboard as it "
                "currently ships", "meta"))
     s.append(rule(6, 11))
 
@@ -78,13 +78,19 @@ def build_story(ctx):
         ["TeXML application ID",
          "The long numeric ID of the TeXML application, not its name."],
         ["Call from this number",
-         "Your Telnyx number in +1XXXXXXXXXX form. This is the caller ID recipients see."],
+         "Your <b>primary</b> Telnyx number in +1XXXXXXXXXX form. Without rolling calls, this is "
+         "the caller ID every call shows."],
+        ["More numbers to call from",
+         "Extra Telnyx numbers for <b>rolling calls</b> (section 4), each with an optional label "
+         "such as <i>Austin</i>. Four rows are offered and <b>+ Add another caller number</b> adds "
+         "more. Each must be a voice number on the same account, assigned to the same TeXML "
+         "application. Each row shows its calls and blocks over the last 30 days."],
         ["My test number",
          "Your own mobile, so the <i>Call me now</i> button has a default target."],
         ["<b>Test connection</b>",
          "Press this before anything else. It reports the account, <b>the balance</b>, and whether "
-         "the From number is usable &mdash; an empty balance is the most common reason a correct "
-         "setup still will not dial."],
+         "the From number and every rolling number are usable &mdash; an empty balance is the most "
+         "common reason a correct setup still will not dial."],
     ], [1.45 * inch, BODY_W - 1.45 * inch]))
 
     s.append(P("Caller identity", "h2"))
@@ -109,9 +115,10 @@ def build_story(ctx):
         ["Calls per minute", "12",
          "Pace, not a speed limit to max out. Bursts are how a number gets labelled <i>Spam "
          "Likely</i>."],
-        ["Ring for (seconds)", "30",
-         "How long to let it ring before giving up. Telnyx enforces 5&#8211;120 and the app clamps "
-         "to that range."],
+        ["Ring for (seconds)", "50",
+         "How long to let it ring before giving up. Voicemail usually answers after 25&#8211;35 "
+         "seconds, so calls meant to leave a voicemail always ring for at least 45. Telnyx enforces "
+         "5&#8211;120 and the app clamps to that range."],
     ], [1.35 * inch, 0.62 * inch, BODY_W - 1.97 * inch]))
 
     s.append(P("Delivery mode", "h2"))
@@ -211,6 +218,78 @@ def build_story(ctx):
         "come round, is rejected when you save it rather than created as something that can never "
         "fire.", "caption"))
 
+    s.append(P("Rolling calls", "h2"))
+    s.append(P(
+        "Switch on <b>Rolling calls</b> at the bottom of <i>When to call</i> and a box opens, filled "
+        "with every number in Settings &mdash; the primary and the extra ones. Delete any this "
+        "campaign shouldn't use. From then on each call goes out from one of those numbers, picked "
+        "at random, and the app keeps track of which numbers each person has blocked."))
+    s.append(table([
+        ["When this happens", "What the app does"],
+        ["A call goes out", "Picks one of the campaign's numbers at random."],
+        ["The call is blocked",
+         "Reads the code the call ended on: <b>607</b> (the person marked it unwanted), <b>608</b> "
+         "(a carrier's call filter blocked it) or <b>603</b> (declined &mdash; and the code US "
+         "carriers now send, as <i>603+</i>, when their analytics block a call). That number is "
+         "never used for that person again. Their <b>next</b> call &mdash; the next scheduled run, "
+         "or <i>Run now</i> &mdash; comes from a different one."],
+        ["They block a second number",
+         "They are not called again, by any campaign, from any number. The call log says "
+         "<i>Blocked 2 of your numbers</i>."],
+        ["Many people block the same number",
+         "Its block count climbs in Settings. That number is labelled as spam somewhere; replace it, "
+         "and see below before you do."],
+    ], [1.55 * inch, BODY_W - 1.55 * inch]))
+    s.append(Spacer(1, 5))
+    s.append(P(
+        "Two kinds of block can't be seen. An iPhone set to block you, or to silence unknown "
+        "callers, sends the call quietly to voicemail &mdash; it looks like an ordinary voicemail. A "
+        "<i>Spam Likely</i> label that still lets the phone ring isn't a block either.", "caption"))
+
+    s.append(P("Why it doesn't call straight back from another number", "h2"))
+    s.append(P(
+        "The obvious move after a block is to ring the person again at once from a different number. "
+        "Rolling calls deliberately doesn't. Carriers' spam filters are built to catch exactly that, "
+        "and doing it tends to get the new number labelled as well &mdash; so you lose two numbers "
+        "instead of one, and still don't reach the person."))
+    s.extend(bullets([
+        "<b>The carriers' filters judge the caller, not one number.</b> Calls to US mobiles are "
+        "scored before the phone rings by call-analytics companies &mdash; Hiya for AT&amp;T, First "
+        "Orion for T-Mobile, TNS for Verizon. They look at behaviour: how many calls, how short, "
+        "how often people reject them, and where they come from.",
+        "<b>Switching numbers is a known spammer signature.</b> Hiya reports that more than half of "
+        "the illegal robocall campaigns it observes rotate numbers, and a large share of unwanted "
+        "calls come from numbers it has never seen before. A fresh number therefore starts with "
+        "little trust, and <i>new number, same network, same calling pattern</i> is precisely the "
+        "pattern these engines look for.",
+        "<b>Your numbers are easy to link.</b> Every call is signed by Telnyx under STIR/SHAKEN "
+        "and arrives from the same network with the same script and timing. A call from a new "
+        "number, to someone who rejected your other number minutes earlier, ties the two together "
+        "&mdash; it doesn't look like a different caller, it looks like the same one hiding.",
+        "<b>A block is evidence they collect.</b> When a person marks a call as unwanted (SIP 607), "
+        "the network can pass that to the analytics engine as a report against the caller. A second "
+        "call straight after adds a second report, now against both numbers.",
+        "<b>Wrongly blocked numbers have a proper fix.</b> A carrier that blocks a call by analytics "
+        "has to tell the caller &mdash; that is the 608 or 603+ code the app reads &mdash; and the "
+        "notice carries a contact for disputing it. Redress clears the number; a replacement "
+        "usually buys only a short reprieve before it is labelled too.",
+    ]))
+    s.append(Spacer(1, 3))
+    s.append(P(
+        "So the app waits for the next scheduled call before using a different number, switches "
+        "once per person, and stops if a second number is blocked too. Someone who blocks two of "
+        "your numbers has made themselves clear &mdash; and since the FCC lets people withdraw "
+        "consent by any reasonable means, they may also have withdrawn it. Spreading ordinary calls "
+        "across several numbers is still worth doing: each number carries less volume, which is "
+        "one of the things the filters count."))
+    s.append(Spacer(1, 3))
+    s.append(callout(
+        "<b>If a number keeps getting blocked</b>, slow the pace and check consent first. Then "
+        "register every number you call from, free, at <b>FreeCallerRegistry.com</b> &mdash; one "
+        "form that sends them to Hiya, First Orion and TNS together &mdash; and dispute the label "
+        "through the contact in the carrier's block notice. Buying more numbers to replace blocked "
+        "ones is the slowest way out.", border=BAD))
+
     # ---------------- 5 ----------------
     s.append(P("5 &nbsp; Watching it run", "h1"))
     s.append(P(
@@ -230,8 +309,9 @@ def build_story(ctx):
 
     # ---------------- 6 ----------------
     s.append(P("6 &nbsp; Reading the call log", "h1"))
-    s.append(P("Every attempt, with the carrier's own call ID so it can be traced in the "
-               "Telnyx portal."))
+    s.append(P("Every attempt, with the number it came from (<b>From</b>) and the carrier's own "
+               "call ID so it can be traced in the Telnyx portal. <i>Blocked by the recipient</i> in "
+               "the outcome filter shows only the calls that were turned away."))
     s.append(table([
         ["Status", "Meaning"],
         ["<b>Delivered</b>", "Connected and the script played."],
@@ -243,6 +323,12 @@ def build_story(ctx):
         ["suppressed", "On the do-not-call list, so it was never dialled."],
         ["machine-skipped", "<i>Hang up</i> mode was set and a machine answered."],
         ["opted-out", "The recipient pressed 9 during the call. Webhook mode only."],
+        ["<b>Blocked by their carrier</b> &#183; <b>Blocked &#8211; marked unwanted</b> &#183; "
+         "<b>Declined or blocked</b>",
+         "The call was turned away (SIP 608, 607 or 603). <b>From</b> shows which number; a "
+         "rolling campaign uses a different one for that person next time."],
+        ["Blocked 2 of your numbers",
+         "Never dialled: this person had already blocked two of your numbers."],
     ], [1.65 * inch, BODY_W - 1.65 * inch]))
 
     # ---------------- 7 ----------------
@@ -288,8 +374,13 @@ def build_story(ctx):
         ["Pressing 9 does nothing",
          "You are in direct mode, which cannot receive a keypress. Set a public base URL."],
         ["Handsets show <i>Spam Likely</i>",
-         "A reputation problem, not a bug. Slow the pace, keep volumes modest, and do not rotate "
-         "through numbers to dodge it &mdash; that makes it worse and is its own legal risk."],
+         "A reputation problem, not a bug. Slow the pace, keep volumes modest, and register your "
+         "numbers at FreeCallerRegistry.com. Rolling calls spreads volume across numbers, but "
+         "switching numbers to get round a label backfires &mdash; the filters watch for exactly "
+         "that (section 4)."],
+        ["Calls from one rolling number all fail",
+         "It isn't assigned to the TeXML application, or isn't on the account. <b>Test "
+         "connection</b> checks every rolling number and says which."],
         ["The database looks empty or reverted",
          "It must not live on a synced drive. Dropbox replaces files underneath a running app. "
          "Settings shows the path in use."],
@@ -298,8 +389,7 @@ def build_story(ctx):
     s.append(Spacer(1, 8))
     s.append(callout(
         "<b>Verify without spending anything.</b> <i>python smoke_test.py</i> and <i>python "
-        "pressure_test.py</i> run 283 checks against a fake carrier in about a second. They need no "
-        "credentials and place no calls, so there is never a reason not to run them after a "
-        "change.", border=GOOD))
+        "pressure_test.py</i> run 607 checks against a fake carrier. They need no credentials and "
+        "place no calls, so there is never a reason not to run them after a change.", border=GOOD))
 
     return s

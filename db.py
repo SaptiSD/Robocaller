@@ -109,6 +109,10 @@ CREATE TABLE IF NOT EXISTS campaigns (
     state        TEXT NOT NULL DEFAULT 'active',
     amd          TEXT NOT NULL DEFAULT 'voicemail',
     require_consent INTEGER NOT NULL DEFAULT 1,
+    -- Rolling calls: each call goes out from one of `caller_numbers` (one per
+    -- line, "number, label"), picked at random, instead of the primary number.
+    rolling        INTEGER NOT NULL DEFAULT 0,
+    caller_numbers TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL,
     -- The window a recurring campaign is allowed to run in, both UTC and both
     -- optional. starts_at holds the first run back until a chosen moment;
@@ -158,6 +162,11 @@ CREATE TABLE IF NOT EXISTS call_tasks (
     sid           TEXT NOT NULL DEFAULT '',
     answered_by   TEXT NOT NULL DEFAULT '',
     duration      INTEGER NOT NULL DEFAULT 0,
+    -- The caller ID this call went out from, and the SIP code it ended with
+    -- ('608' = the recipient's carrier rejected it). Together they are how a
+    -- rolling campaign knows which of its numbers someone has blocked.
+    from_number   TEXT NOT NULL DEFAULT '',
+    hangup_cause  TEXT NOT NULL DEFAULT '',
     error         TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL

@@ -111,7 +111,7 @@ class FakeTelephony:
         return amd != "live_only" or self._mode == "webhook"
 
     def place_call(self, to_number, script, voice="", amd="voicemail", token="",
-                   ring_seconds=30):
+                   ring_seconds=30, from_number=""):
         if self._slow:
             threading.Event().wait(self._slow)
         if self._fail:
@@ -215,6 +215,17 @@ def test_telnyx_contract() -> None:
           "Url" not in direct["json"] and "StatusCallback" not in direct["json"])
     check("the application ID is sent", direct["json"]["ApplicationSid"] == "app-123")
     check("From is the configured number", direct["json"]["From"] == "+15085550100")
+    rolled = capture(new_phone(), to_number="+16175550100", script="Hello",
+                     from_number="+17372415152")
+    check("a rolling call presents the number it was given", rolled["json"]["From"] == "+17372415152")
+    check("the client's own number is left alone for the next call",
+          new_phone().from_number == "+15085550100")
+
+    ai_sent: dict = {}
+    ai_phone = new_phone()
+    ai_phone._call_api = lambda method, path, **kw: (ai_sent.update(kw.get("json", {})) or {"sid": "v3:ai"}, "")
+    ai_phone.place_ai_call("+16175550100", "assistant-1", {}, from_number="+16469048630")
+    check("an AI call presents the rolling number too", ai_sent.get("From") == "+16469048630", str(ai_sent))
     check("voicemail mode waits for the greeting to end",
           direct["json"]["MachineDetection"] == "DetectMessageEnd")
     check("the AMD timeout is sent in milliseconds, as Telnyx expects",
@@ -257,6 +268,28 @@ def test_telnyx_contract() -> None:
     check("a missing application ID is caught before the network",
           telephony.Telephony("KEY-test", "", "+15085550100").place_call(
               "+16175550100", "Hi").ok is False)
+
+    # Rolling numbers: owning one isn't enough, it has to be on this application.
+    checker = new_phone()
+    checker.owned_numbers = lambda: ([
+        {"phone_number": "+15085550100", "voice": True, "connection_id": "app-123", "friendly_name": ""},
+        {"phone_number": "+17372415152", "voice": True, "connection_id": "other-app", "friendly_name": ""},
+        {"phone_number": "+16469048630", "voice": False, "connection_id": "app-123", "friendly_name": ""},
+    ], "")
+    verdicts = {c["number"]: c for c in checker.check_caller_numbers(
+        ["+15085550100", "+17372415152", "+16469048630", "+12135550199"])}
+    check("a number on this application is ready to call from", verdicts["+15085550100"]["ok"])
+    check("a number assigned to another application is caught",
+          not verdicts["+17372415152"]["ok"] and "different application" in verdicts["+17372415152"]["detail"])
+    check("an SMS-only number is caught", not verdicts["+16469048630"]["ok"])
+    check("a number that isn't on the account is caught", not verdicts["+12135550199"]["ok"])
+
+    fetcher = new_phone()
+    fetcher._account_sid = "org-123"
+    fetcher._call_api = lambda method, path, **kw: (
+        {"status": "failed", "sip_hangup_cause": "608", "duration": "0"}, "")
+    check("the SIP code a call ended on is read back",
+          fetcher.fetch_call("v3:x")[0].get("hangup_cause") == "608")
 
     xml = telephony.build_texml("Hello", voice="Polly.Joanna-Neural")
     check("TeXML is a single Response document",

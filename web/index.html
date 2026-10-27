@@ -305,6 +305,27 @@ Telnyx bills each call against your account balance.
               &mdash; and keep billing &mdash; every
               <span id="window-warning-freq">day</span> until you pause it.</span>
           </div>
+          <div class="field">
+            <label class="switch-row" for="c-rolling">
+              <input type="checkbox" role="switch" class="switch" id="c-rolling">
+              <span><b>Rolling calls</b>
+                <span class="hint" style="display:inline">&mdash; each call goes out from one of your numbers, picked
+                  at random, and switches number for anyone who blocks one</span></span>
+            </label>
+          </div>
+          <div class="field" id="wrap-rolling" hidden>
+            <div class="hint" style="margin:0 0 8px">Every call picks one of the numbers below at random. If someone's
+              phone or carrier blocks a number, their next call comes from a different one. Anyone who blocks
+              <b>two</b> of your numbers isn't called again &mdash; that's a clear no. Calling back any of these
+              numbers reaches the same callback line.</div>
+            <label for="c-caller-numbers">Numbers to call from <span class="hint" style="display:inline">&mdash; one
+              per line, filled in from Settings. Delete any this campaign shouldn't use.</span></label>
+            <textarea id="c-caller-numbers" class="mono" rows="5"></textarea>
+            <div class="btn-row" style="margin-top:8px">
+              <button type="button" class="link small" id="btn-refill-callers">Refill with every number in Settings</button>
+              <span class="hint" id="caller-numbers-meter"></span>
+            </div>
+          </div>
           <div class="field" style="margin-bottom:0" id="wrap-start-now">
             <label class="check">
               <input type="checkbox" id="c-start-now">
@@ -343,6 +364,7 @@ Telnyx bills each call against your account balance.
           <option value="unanswered">No answer / busy</option>
           <option value="failed">Failed</option>
           <option value="opted-out">Opted out</option>
+          <option value="blocked">Blocked by the recipient</option>
           <option value="waiting">Waiting or on the line</option>
           <option value="skipped">Screened out</option>
           <option value="test">Test calls</option>
@@ -437,14 +459,24 @@ Telnyx bills each call against your account balance.
         </div>
         <div class="field-row">
           <div class="field">
-            <label for="s-from">Call from this number</label>
+            <label for="s-from">Call from this number <span class="pill muted">primary</span></label>
             <input type="text" id="s-from" placeholder="+1 978 555 0130">
+            <div class="hint">Without rolling calls, this is the default number.</div>
+            <div class="hint" id="from-stats"></div>
             <div class="hint" id="from-options"></div>
           </div>
           <div class="field">
             <label for="s-test">My test number</label>
             <input type="text" id="s-test" placeholder="your own mobile">
           </div>
+        </div>
+        <div class="field">
+          <label>More numbers to call from <span class="hint" style="display:inline">&mdash; for rolling calls</span></label>
+          <div class="hint" style="margin:0 0 8px">Campaigns with <b>Rolling calls</b> on pick one of these, or the
+            primary, at random for each call. Each must be a voice number on this Telnyx account, assigned to the
+            same TeXML application.</div>
+          <div id="caller-rows"></div>
+          <button type="button" class="small" id="btn-add-caller">+ Add another caller number</button>
         </div>
         <div class="btn-row">
           <button id="btn-verify">Test connection</button>

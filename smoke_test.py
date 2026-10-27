@@ -102,10 +102,11 @@ class FakeTelephony:
     def supports(self, amd: str) -> bool:
         return amd != "live_only" or self._mode == "webhook"
 
-    def place_call(self, to_number, script, voice="", amd="voicemail", token="", ring_seconds=30):
+    def place_call(self, to_number, script, voice="", amd="voicemail", token="", ring_seconds=30,
+                   from_number=""):
         self.placed.append(
             {"to": to_number, "script": script, "voice": voice, "amd": amd, "token": token,
-             "ring": ring_seconds}
+             "ring": ring_seconds, "from": from_number or self.from_number}
         )
         return telephony.CallResult(True, sid=f"v3:{len(self.placed):032d}")
 
@@ -1796,6 +1797,219 @@ def test_callback_line() -> None:
         server._warned.clear()
 
 
+# --- 9. rolling calls ----------------------------------------------------------
+#
+# A campaign can call from a pool of numbers, one picked at random per call. A
+# number someone's phone turns away isn't used for them again - and someone who
+# has turned away two isn't called again at all.
+
+PRIMARY, AUSTIN, NYC, CHICAGO = "+15085550100", "+17372415152", "+16469048630", "+17733028758"
+
+
+def rolling_campaign(name: str, numbers: str, contacts: list[str]) -> int:
+    cid = make_campaign(name=name)
+    db.execute("UPDATE campaigns SET rolling = 1, caller_numbers = ? WHERE id = ?", (numbers, cid))
+    for phone in contacts:
+        add_contact(cid, phone)
+    return cid
+
+
+def blocked_call(phone: str, from_number: str, cause: str = "608") -> None:
+    """A finished call from `from_number` that `phone` turned away."""
+    db.insert("INSERT INTO call_tasks (campaign_id, contact_id, phone, run_key, token, state, status, "
+              "attempts, scheduled_for, sid, from_number, hangup_cause, created_at, updated_at) "
+              "VALUES (NULL, NULL, ?, 'history', 'x', 'done', 'failed', 1, ?, 'v3:old', ?, ?, ?, ?)",
+              (phone, db.now_str(), from_number, cause, db.now_str(), db.now_str()))
+
+
+def test_rolling_calls() -> None:
+    print("\nrolling calls")
+    import random
+    from fastapi.testclient import TestClient
+    import server
+
+    random.seed(20261027)
+    # Calls left queued by earlier sections would otherwise be dialled here too.
+    db.execute("UPDATE call_tasks SET state = 'skipped' WHERE state IN ('pending', 'deferred', 'dialing')")
+    midday = datetime(2026, 5, 20, 16, 0, tzinfo=timezone.utc)
+    db.set_setting("telnyx_from_number", PRIMARY)
+    db.set_setting("caller_numbers", json.dumps([{"number": AUSTIN, "label": "Austin"},
+                                                 {"number": NYC, "label": "NYC"}]))
+    try:
+        numbers, bad = dispatcher.parse_caller_list(
+            "+1 737 241 5152, Austin\n(646) 904-8630\n# a note\nnot a number\n737-241-5152, again")
+        check("the caller list reads numbers, labels and leaves out repeats",
+              numbers == [(AUSTIN, "Austin"), (NYC, "")], str(numbers))
+        check("a line that isn't a number is reported", bad == ["not a number"], str(bad))
+        check("every caller number, primary first",
+              list(config.all_caller_numbers().items()) == [(PRIMARY, "Primary"), (AUSTIN, "Austin"), (NYC, "NYC")])
+        db.set_setting("caller_numbers", "{not json")
+        check("a mangled setting reads as no extra numbers, not a crash", config.caller_numbers() == [])
+        db.set_setting("caller_numbers", json.dumps([{"number": AUSTIN, "label": "Austin"},
+                                                     {"number": NYC, "label": "NYC"}]))
+
+        # Rolling off: everything from the primary, as before.
+        fake = install_fake()
+        plain = make_campaign(name="Not rolling")
+        add_contact(plain, "617-555-0901")
+        dispatcher.enqueue_campaign(plain, midday)
+        dispatcher.dispatch_pending(now=midday)
+        check("without rolling calls, the call comes from the primary",
+              fake.placed[-1]["from"] == PRIMARY, str(fake.placed[-1:]))
+        check("the call log records which number it came from",
+              db.query_one("SELECT from_number FROM call_tasks WHERE campaign_id = ?", (plain,))["from_number"]
+              == PRIMARY)
+
+        # Rolling on: a random pick from the campaign's own list, every one in play.
+        fake = install_fake()
+        people = [f"617555{1000 + i:04d}" for i in range(60)]
+        cid = rolling_campaign("Rolling", f"{PRIMARY}, Primary\n{AUSTIN}, Austin\n{NYC}, NYC", people)
+        dispatcher.enqueue_campaign(cid, midday)
+        for _ in range(80):
+            dispatcher.dispatch_pending(now=midday)
+        used = [p["from"] for p in fake.placed]
+        check("every rolling call went out", len(used) == 60, str(len(used)))
+        check("each one came from a number on the campaign's list", set(used) <= {PRIMARY, AUSTIN, NYC}, str(set(used)))
+        check("the pick is spread across all of them", set(used) == {PRIMARY, AUSTIN, NYC}, str(set(used)))
+
+        # A number taken out of Settings since the campaign was saved isn't used.
+        fake = install_fake()
+        gone = rolling_campaign("Stale list", f"{AUSTIN}\n{CHICAGO}", [f"617555{1100 + i:04d}" for i in range(20)])
+        dispatcher.enqueue_campaign(gone, midday)
+        for _ in range(30):
+            dispatcher.dispatch_pending(now=midday)
+        check("a number no longer in Settings is never presented",
+              fake.placed and {p["from"] for p in fake.placed} == {AUSTIN}, str({p["from"] for p in fake.placed}))
+
+        # Someone whose carrier blocked Austin gets their next call from NYC.
+        fake = install_fake()
+        blocked_call("+16175551200", AUSTIN)
+        dodge = rolling_campaign("Dodge", f"{AUSTIN}\n{NYC}", ["617-555-1200"])
+        for minute in range(10):
+            db.execute("UPDATE call_tasks SET state = 'done' WHERE campaign_id = ?", (dodge,))
+            dispatcher.enqueue_campaign(dodge, midday + timedelta(minutes=minute))
+            dispatcher.dispatch_pending(now=midday + timedelta(minutes=minute))
+        check("a number someone blocked isn't used for them again",
+              len(fake.placed) == 10 and {p["from"] for p in fake.placed} == {NYC},
+              str([p["from"] for p in fake.placed]))
+
+        # With every number on the list blocked by them, it falls back to the list.
+        fake = install_fake()
+        only = rolling_campaign("Only Austin", AUSTIN, ["617-555-1200"])
+        dispatcher.enqueue_campaign(only, midday)
+        dispatcher.dispatch_pending(now=midday)
+        check("with nothing else on the list, the call still goes out",
+              [p["from"] for p in fake.placed] == [AUSTIN], str(fake.placed))
+
+        # Two blocked numbers is a no. No third number, and no call.
+        fake = install_fake()
+        blocked_call("+16175551300", AUSTIN)
+        blocked_call("+16175551300", NYC, "607")
+        refused = rolling_campaign("Refused", f"{PRIMARY}\n{AUSTIN}\n{NYC}", ["617-555-1300"])
+        dispatcher.enqueue_campaign(refused, midday)
+        dispatcher.dispatch_pending(now=midday)
+        row = db.query_one("SELECT * FROM call_tasks WHERE campaign_id = ?", (refused,))
+        check("someone who blocked two numbers isn't called from a third",
+              not fake.placed and row["state"] == "skipped" and row["status"] == "blocked-us", str(row["status"]))
+        check("the call log says why", "2 of your numbers" in row["error"], row["error"])
+        plain_again = make_campaign(name="Not rolling either")
+        add_contact(plain_again, "617-555-1300")
+        dispatcher.enqueue_campaign(plain_again, midday)
+        dispatcher.dispatch_pending(now=midday)
+        check("...whether or not the campaign is rolling", not fake.placed)
+        test_id = dispatcher.enqueue_single("+16175551300", "test")
+        dispatcher.dispatch_pending(only_task_id=test_id, ignore_window=True)
+        check("the operator can still ring that number on purpose", len(fake.placed) == 1)
+
+        # Learning about a block: from the poll, the webhook, or a look-up afterwards.
+        fake = install_fake(mode="webhook")
+        db.set_setting("public_base_url", "https://robocaller.example.com")
+        learn = rolling_campaign("Learn", f"{AUSTIN}\n{NYC}", ["617-555-1400", "617-555-1401", "617-555-1402"])
+        dispatcher.enqueue_campaign(learn, midday)
+        for _ in range(5):
+            dispatcher.dispatch_pending(now=midday)
+        tasks = db.query("SELECT * FROM call_tasks WHERE campaign_id = ? ORDER BY id", (learn,))
+        client = TestClient(server.app)  # no lifespan: the app's dispatcher thread would race these checks
+        client.post(f"/telnyx/status/{tasks[0]['token']}", data={"CallStatus": "failed", "SipResponseCode": "608"})
+        first = db.query_one("SELECT * FROM call_tasks WHERE id = ?", (tasks[0]["id"],))
+        check("a SIP code on the status webhook is kept", first["hangup_cause"] == "608", first["hangup_cause"])
+        event = db.recent_events(1)[0]["message"]
+        check("Activity says who blocked which number, and what happens next",
+              "(617) 555-1400 turned away a call from" in event and "different number" in event, event)
+        client.post(f"/telnyx/status/{tasks[0]['token']}", data={"CallStatus": "failed", "SipResponseCode": "608"})
+        check("a repeated webhook doesn't say it twice", db.recent_events(1)[0]["message"] == event)
+
+        client.post(f"/telnyx/status/{tasks[1]['token']}", data={"CallStatus": "busy"})
+        client.post(f"/telnyx/status/{tasks[2]['token']}", data={"CallStatus": "completed"})
+        fake.fetch_call = lambda sid: ({"status": "busy", "answered_by": "", "duration": 0,
+                                         "hangup_cause": "607 Unwanted"}, "")
+        dispatcher.sync_open_calls(now=db.utcnow())
+        second, third = (db.query_one("SELECT * FROM call_tasks WHERE id = ?", (t["id"],)) for t in tasks[1:])
+        check("a call that didn't connect is looked up for its SIP code",
+              second["hangup_cause"] == "607", second["hangup_cause"])
+        check("a delivered call isn't looked up", third["hangup_cause"] == "", third["hangup_cause"])
+        fake.fetch_call = lambda sid: ({}, "Telnyx is down")
+        client.post(f"/telnyx/status/{tasks[2]['token']}", data={"CallStatus": "completed"})
+        db.execute("UPDATE call_tasks SET status = 'no-answer', hangup_cause = '' WHERE id = ?", (tasks[2]["id"],))
+        dispatcher.sync_open_calls(now=db.utcnow())
+        check("a failed look-up is marked, so it isn't retried every 20 seconds",
+              db.query_one("SELECT hangup_cause FROM call_tasks WHERE id = ?", (tasks[2]["id"],))["hangup_cause"]
+              == "none")
+        db.set_setting("public_base_url", "")
+
+        # The API: Settings, campaigns, the call log.
+        install_fake()
+        res = client.post("/api/settings", json={"values": {"caller_numbers": json.dumps([
+            {"number": "(737) 241-5152", "label": " Austin "}, {"number": "", "label": "blank row"},
+            {"number": PRIMARY, "label": "the primary again"}, {"number": "646 904 8630", "label": "NYC"}])}})
+        check("caller numbers save tidied: blank rows and the primary dropped",
+              res.status_code == 200 and res.json()["caller_numbers"] ==
+              [{"number": AUSTIN, "label": "Austin"}, {"number": NYC, "label": "NYC"}], res.text[:300])
+        res = client.post("/api/settings", json={"values": {"caller_numbers": json.dumps([{"number": "12345"}])}})
+        check("a caller number that can't be dialled is refused", res.status_code == 400, res.text[:200])
+        res = client.post("/api/settings", json={"values": {"caller_numbers": "Austin"}})
+        check("caller numbers that aren't a list are refused", res.status_code == 400, res.text[:200])
+
+        base = {"name": "API rolling", "message": "The showroom opens at nine.", "rolling": True}
+        res = client.post("/api/campaigns", json={**base, "caller_numbers": f"{AUSTIN}\n{CHICAGO}"})
+        check("a number that isn't in Settings is refused, by name",
+              res.status_code == 400 and "(773) 302-8758" in res.json()["error"], res.text[:200])
+        res = client.post("/api/campaigns", json={**base, "caller_numbers": "  "})
+        check("rolling with no numbers is refused", res.status_code == 400, res.text[:200])
+        res = client.post("/api/campaigns", json={**base, "caller_numbers": f"(737) 241-5152\n{NYC}, New York"})
+        made = res.json().get("campaign", {})
+        check("a rolling campaign is saved with its numbers and labels",
+              res.status_code == 200 and made["rolling"] == 1
+              and made["caller_numbers"] == f"{AUSTIN}, Austin\n{NYC}, New York", res.text[:300])
+        check("the campaign lists them for the page",
+              [n["pretty"] for n in made["caller_list"]] == ["(737) 241-5152", "(646) 904-8630"])
+        res = client.patch(f"/api/campaigns/{made['id']}", json={"rolling": False, "caller_numbers": ""})
+        check("turning rolling off clears the list", res.json()["rolling"] == 0 and res.json()["caller_list"] == [])
+        res = client.patch(f"/api/campaigns/{made['id']}", json={"rolling": True})
+        check("turning it back on with no numbers is refused", res.status_code == 400, res.text[:200])
+        res = client.patch(f"/api/campaigns/{made['id']}", json={"rolling": True, "caller_numbers": PRIMARY})
+        check("...and accepted with one", res.status_code == 200 and res.json()["caller_numbers"] == f"{PRIMARY}, Primary")
+        res = client.post("/api/campaigns", json={**base, "rolling": False, "caller_numbers": "junk"})
+        check("a campaign without rolling ignores the box", res.status_code == 200
+              and res.json()["campaign"]["caller_numbers"] == "", res.text[:200])
+
+        stats = {s["number"]: s for s in client.get("/api/caller-numbers").json()}
+        check("each number's record counts its calls and blocks",
+              stats[AUSTIN]["calls"] > 0 and stats[AUSTIN]["blocked"] >= 2 and list(stats)[0] == PRIMARY, str(stats))
+        blocked = client.get("/api/calls?outcome=blocked").json()
+        check("the call log can show just the blocked calls",
+              blocked and all(r["hangup_cause"] in dispatcher.BLOCK_CAUSES or r["status"] == "blocked-us"
+                              for r in blocked), str(len(blocked)))
+        check("each row says which number it came from",
+              any(r["from_pretty"] == "(737) 241-5152" for r in blocked))
+        csv_text = client.get("/api/calls.csv").text
+        check("the CSV export has the caller number and SIP code",
+              "from_number" in csv_text.splitlines()[0] and "hangup_cause" in csv_text.splitlines()[0])
+    finally:
+        for key in ("telnyx_from_number", "caller_numbers", "public_base_url"):
+            db.set_setting(key, "")
+
+
 def main() -> int:
     print(f"scratch database: {db.DB_PATH}")
     test_numbers()
@@ -1819,6 +2033,7 @@ def main() -> int:
     test_sleeping_server()
     test_call_records()
     test_callback_line()
+    test_rolling_calls()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

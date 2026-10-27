@@ -6,11 +6,13 @@ source of truth once you have used it; env vars are the deployment escape hatch.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 from dotenv import load_dotenv
 
+import compliance
 import db
 
 load_dotenv()
@@ -23,6 +25,9 @@ DEFAULTS: dict[str, tuple[str, str]] = {
     "telnyx_api_key": ("TELNYX_API_KEY", ""),
     "telnyx_app_id": ("TELNYX_TEXML_APP_ID", ""),
     "telnyx_from_number": ("TELNYX_FROM_NUMBER", ""),
+    # More caller IDs for rolling calls, as JSON: [{"number": "+1...", "label": "Austin"}].
+    # The primary above stays the number every other call goes out from.
+    "caller_numbers": ("", "[]"),
     "telnyx_public_key": ("TELNYX_PUBLIC_KEY", ""),
     "public_base_url": ("PUBLIC_BASE_URL", ""),
     "anthropic_api_key": ("ANTHROPIC_API_KEY", ""),
@@ -77,6 +82,35 @@ def script_provider() -> str:
     return next((name for name, key in keys.items() if key), "")
 
 
+def caller_numbers() -> list[dict[str, str]]:
+    """The extra numbers rolling calls rotate through, as [{number, label}].
+
+    Read defensively: this is parsed on every dial, and a hand-edited setting
+    that isn't valid JSON must not take the dispatcher down with it.
+    """
+    try:
+        rows = json.loads(get("caller_numbers") or "[]")
+    except ValueError:
+        return []
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        number = compliance.normalize(str(row.get("number") or "")) if isinstance(row, dict) else ""
+        if number:
+            out.append({"number": number, "label": str(row.get("label") or "")})
+    return out
+
+
+def all_caller_numbers() -> dict[str, str]:
+    """Every number calls may go out from, primary first: {number: label}."""
+    out: dict[str, str] = {}
+    primary = compliance.normalize(get("telnyx_from_number"))
+    if primary:
+        out[primary] = "Primary"
+    for row in caller_numbers():
+        out.setdefault(row["number"], row["label"])
+    return out
+
+
 def get_int(key: str, fallback: int) -> int:
     try:
         return int(float(get(key)))
@@ -108,6 +142,7 @@ def public_view() -> dict[str, object]:
             out[f"{key}_set"] = bool(value)
         else:
             out[key] = value
+    out["caller_numbers"] = caller_numbers()
     # key -> environment variable name, for the settings currently coming from one.
     out["from_environment"] = sources
     out["telnyx_ready"] = bool(

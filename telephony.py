@@ -252,7 +252,10 @@ class Telephony:
         amd: str = "voicemail",
         token: str = "",
         ring_seconds: int = 30,
+        from_number: str = "",
     ) -> CallResult:
+        """Dial and read `script`. `from_number` overrides the caller ID for this
+        one call (rolling calls); it must be a number on the same account."""
         if not (script or "").strip():
             return CallResult(False, error="The message is empty - nothing to read.")
         if not self.application_id:
@@ -269,7 +272,7 @@ class Telephony:
         params: dict[str, object] = {
             "ApplicationSid": self.application_id,
             "To": to_number,
-            "From": self.from_number,
+            "From": from_number or self.from_number,
             # Telnyx enforces 5..120 here and rejects anything outside it, where
             # Twilio quietly clamped. The dashboard allows a wider range.
             "Timeout": max(5, min(int(ring_seconds), 120)),
@@ -331,6 +334,7 @@ class Telephony:
         variables: dict[str, str],
         token: str = "",
         ring_seconds: int = 30,
+        from_number: str = "",
     ) -> CallResult:
         """Dial a number and hand the call to the Telnyx AI Assistant.
 
@@ -345,7 +349,7 @@ class Telephony:
             return CallResult(False, error="No Telnyx TeXML application ID is set.")
 
         params: dict[str, object] = {
-            "From": self.from_number,
+            "From": from_number or self.from_number,
             "To": to_number,
             "AIAssistantId": assistant_id,
             "AIAssistantDynamicVariables": {k: str(v) for k, v in variables.items()},
@@ -389,6 +393,9 @@ class Telephony:
                 "status": str(data.get("status") or ""),
                 "answered_by": str(data.get("answered_by") or ""),
                 "duration": duration,
+                # The SIP code the call ended on - "608" when the recipient's
+                # carrier rejected it as unwanted. How rolling calls see a block.
+                "hangup_cause": str(data.get("sip_hangup_cause") or ""),
             },
             "",
         )
@@ -449,6 +456,32 @@ class Telephony:
             "Twilio, Telnyx has no 'verified caller ID' route - buy the number "
             "under Numbers -> Search & Buy, or change the 'call from' number."
         )
+
+    def check_caller_numbers(self, numbers: list[str]) -> list[dict]:
+        """Can each of these be a caller ID? [{number, ok, detail}].
+
+        Owning a number isn't enough: a call presenting it only goes out if the
+        number is assigned to this TeXML application. A number bought for
+        rolling calls and left unassigned fails on whichever call picks it.
+        """
+        owned, error = self.owned_numbers()
+        if error:
+            return [{"number": n, "ok": False, "detail": error} for n in numbers]
+        by_number = {o["phone_number"]: o for o in owned}
+        out = []
+        for number in numbers:
+            row = by_number.get(number)
+            if row is None:
+                ok, detail = False, "not a number on this Telnyx account"
+            elif not row["voice"]:
+                ok, detail = False, "on this account, but it can't make voice calls"
+            elif row["connection_id"] and row["connection_id"] != str(self.application_id):
+                ok, detail = False, ("on this account, but assigned to a different application - "
+                                     "assign it to this TeXML application in the Telnyx portal")
+            else:
+                ok, detail = True, "ready to call from"
+            out.append({"number": number, "ok": ok, "detail": detail})
+        return out
 
     def account_limits(self) -> dict:
         """The account settings that quietly cap what a campaign can do.
@@ -522,6 +555,7 @@ class Telephony:
                 {
                     "phone_number": n.get("phone_number", ""),
                     "friendly_name": n.get("tags") and ", ".join(n["tags"]) or "",
+                    "connection_id": str(n.get("connection_id") or ""),
                     # An empty feature list means Telnyx did not report features
                     # on this record, not that the number is voice-less.
                     "voice": ("voice" in names) or not names,
